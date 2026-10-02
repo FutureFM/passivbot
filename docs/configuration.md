@@ -10,6 +10,12 @@ For the recommended user workflow, examples, and best practices, see [Config Wor
 
 ## Backtest Settings
 
+- **organillo_mode**: Enable daily historical coin eligibility for backtest/optimizer (default `false`).
+- **organillo_carton_path**: CSV or CSV.GZ daily binary matrix, required when Organillo is enabled.
+  Rows take effect at 00:00 UTC; excluded coins use existing graceful stop. See [Organillo](organillo.md).
+- **organillo_carton_hash**: Derived SHA256 of decompressed CSV content for reproducibility and resume.
+  Leave unset for new experiments.
+
 - **base_dir**: Location to save backtest results.
 - **compress_cache**: Set to `true` to save disk space. Set to `false` for faster loading.
 - **end_date**: End date of backtest, e.g., `2024-06-23`. Set to `'now'` to use today's date as the end date.

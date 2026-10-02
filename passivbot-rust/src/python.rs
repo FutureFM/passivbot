@@ -34,7 +34,10 @@ use crate::types::{
     StrategyParamsPairValue, TrailingPriceBundle, TwelEnforcerPolicy, WeExcessAllowanceMode,
 };
 use ndarray::Array2;
-use numpy::{IntoPyArray, PyArray1, PyArray3, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray3};
+use numpy::{
+    IntoPyArray, PyArray1, PyArray2, PyArray3, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2,
+    PyReadonlyArray3,
+};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyList};
@@ -177,18 +180,22 @@ pub struct EquityHardStopRuntimePy {
 #[pymethods]
 impl HlcvsBundlePy {
     #[new]
-    #[pyo3(signature = (hlcvs, btc_usd, timestamps, meta))]
+    #[pyo3(signature = (hlcvs, btc_usd, timestamps, meta, eligibility=None, eligibility_row_indices=None))]
     pub fn new(
         hlcvs: Py<PyArray3<f64>>,
         btc_usd: Py<PyArray1<f64>>,
         timestamps: Py<PyArray1<i64>>,
         meta: &Bound<'_, PyAny>,
+        eligibility: Option<Py<PyArray2<u8>>>,
+        eligibility_row_indices: Option<Py<PyArray1<i32>>>,
     ) -> PyResult<Self> {
         let parsed_meta = hlcvs_meta_from_py(meta)?;
         let bundle = HlcvsBundle {
             hlcvs,
             btc_usd,
             timestamps,
+            eligibility,
+            eligibility_row_indices,
             meta: parsed_meta,
         };
         Python::with_gil(|py| bundle.validate_shapes(py))?;
@@ -208,6 +215,22 @@ impl HlcvsBundlePy {
     #[getter]
     pub fn timestamps<'py>(&self, py: Python<'py>) -> PyObject {
         self.inner.timestamps.clone_ref(py).into_py(py)
+    }
+
+    #[getter]
+    pub fn eligibility(&self, py: Python<'_>) -> Option<PyObject> {
+        self.inner
+            .eligibility
+            .as_ref()
+            .map(|a| a.clone_ref(py).into_py(py))
+    }
+
+    #[getter]
+    pub fn eligibility_row_indices(&self, py: Python<'_>) -> Option<PyObject> {
+        self.inner
+            .eligibility_row_indices
+            .as_ref()
+            .map(|a| a.clone_ref(py).into_py(py))
     }
 
     #[getter]
@@ -1408,6 +1431,8 @@ pub fn run_backtest(
         strategy_params,
         exchange_params_list,
         backtest_params_dict,
+        None,
+        None,
     )
 }
 
@@ -1420,6 +1445,7 @@ pub fn run_backtest_bundle(
     backtest_params_dict: &Bound<'_, PyDict>,
 ) -> PyResult<BacktestPyResult> {
     let py = bot_params.py();
+    bundle.inner.validate_shapes(py)?;
     let hlcvs = bundle.inner.hlcvs.bind(py).readonly();
     let btc = bundle.inner.btc_usd.bind(py).readonly();
     run_backtest_core(
@@ -1429,6 +1455,16 @@ pub fn run_backtest_bundle(
         strategy_params,
         exchange_params_list,
         backtest_params_dict,
+        bundle
+            .inner
+            .eligibility
+            .as_ref()
+            .map(|a| a.bind(py).readonly()),
+        bundle
+            .inner
+            .eligibility_row_indices
+            .as_ref()
+            .map(|a| a.bind(py).readonly()),
     )
 }
 
@@ -1439,6 +1475,8 @@ fn run_backtest_core<'py>(
     strategy_params: &Bound<'py, PyAny>,
     exchange_params_list: &Bound<'py, PyAny>,
     backtest_params_dict: &Bound<'py, PyDict>,
+    eligibility: Option<PyReadonlyArray2<'py, u8>>,
+    eligibility_row_indices: Option<PyReadonlyArray1<'py, i32>>,
 ) -> PyResult<BacktestPyResult> {
     let profile_enabled = rust_profile_enabled();
     let profile_total_start = profile_start(profile_enabled);
@@ -1538,6 +1576,10 @@ fn run_backtest_core<'py>(
         &backtest_params,
     );
     profile_add(&mut rust_profile, "rust_backtest_init_ms", init_start);
+
+    if let (Some(mask), Some(rows)) = (eligibility.as_ref(), eligibility_row_indices.as_ref()) {
+        backtest.set_historical_selection(mask.as_array(), rows.as_array());
+    }
 
     // Run the backtest and process results
     Python::with_gil(move |py| {

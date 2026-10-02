@@ -130,6 +130,10 @@ from warmup_utils import (
     compute_backtest_warmup_minutes,
     compute_per_coin_warmup_minutes,
 )
+from historical_selection import (
+    prepare_config as prepare_organillo_config,
+    prepare_arrays as prepare_organillo_arrays,
+)
 from backtest_universe import (
     POSITION_SIDES,
     effective_backtest_approved_coins_by_side,
@@ -629,6 +633,7 @@ def _build_hlcvs_bundle(
     bundle_meta_base: dict,
     *,
     coin_indices: list[int] | None = None,
+    historical_selection=None,
 ) -> pbr.HlcvsBundle:
     active_coin_indices = None
     if coin_indices is not None:
@@ -695,7 +700,12 @@ def _build_hlcvs_bundle(
             os.getpid(),
             f"{rss_after:.1f}" if rss_after is not None else "na",
         )
-    return pbr.HlcvsBundle(hlcvs_arr, btc_arr, timestamps_arr, bundle_meta)
+    if historical_selection is None:
+        return pbr.HlcvsBundle(hlcvs_arr, btc_arr, timestamps_arr, bundle_meta)
+    return pbr.HlcvsBundle(
+        hlcvs_arr, btc_arr, timestamps_arr, bundle_meta,
+        historical_selection.eligible, historical_selection.row_indices,
+    )
 
 
 def _validate_hlcvs_valid_windows(
@@ -811,6 +821,7 @@ def build_backtest_payload(
     skip_btc_analysis: bool = False,
     runtime_config: dict | None = None,
     execution_settings: BacktestExecutionSettings | None = None,
+    historical_selection=None,
 ) -> BacktestPayload:
     """
     Assemble the bundle, bot params, and metadata needed to execute a backtest.
@@ -1028,6 +1039,19 @@ def build_backtest_payload(
         "warmup_minutes_provided": warmup_provided,
     }
 
+    if runtime_config["backtest"].get("organillo_mode", False) and historical_selection is None:
+        historical_selection = prepare_organillo_arrays(
+            runtime_config, coins_order, timestamps,
+            column_indices=coin_indices, n_columns=hlcvs.shape[1],
+        )
+
+    if historical_selection is not None:
+        if not runtime_config["backtest"].get("organillo_mode", False):
+            raise ValueError("Historical selection supplied while Organillo mode is disabled")
+        expected_hash = runtime_config["backtest"].get("organillo_carton_hash")
+        if expected_hash and expected_hash != historical_selection.content_hash:
+            raise ValueError("Prepared Organillo selection does not match the configured carton hash")
+
     bundle = _build_hlcvs_bundle(
         hlcvs,
         btc_usd_prices,
@@ -1041,6 +1065,7 @@ def build_backtest_payload(
         trade_start_indices,
         bundle_meta_base,
         coin_indices=coin_indices,
+        historical_selection=historical_selection,
     )
 
     if coin_indices is not None:
@@ -1199,7 +1224,15 @@ def subset_backtest_payload(
         coin_entry["index"] = new_idx
         new_meta["coins"].append(coin_entry)
 
-    new_bundle = pbr.HlcvsBundle(subset_hlcvs, btc_np, ts_np, new_meta)
+    mask = getattr(payload.bundle, "eligibility", None)
+    if mask is None:
+        new_bundle = pbr.HlcvsBundle(subset_hlcvs, btc_np, ts_np, new_meta)
+    else:
+        new_bundle = pbr.HlcvsBundle(
+            subset_hlcvs, btc_np, ts_np, new_meta,
+            np.ascontiguousarray(np.asarray(mask)[:, source_columns], dtype=np.uint8),
+            payload.bundle.eligibility_row_indices,
+        )
 
     def _select(seq):
         return [seq[pos] for pos in selected_positions]
@@ -2998,6 +3031,7 @@ async def main():
         )
         return
 
+    config = prepare_organillo_config(config)
     for ex in backtest_exchanges:
         await load_markets(ex)
     await format_approved_ignored_coins(

@@ -26,6 +26,7 @@ from config.param_paths import require_existing_config_path
 from config.parse import load_raw_config
 from config.shared_bot import canonicalize_shared_bot_side
 from config_transform import ConfigTransformTracker, record_transform
+from historical_selection import prepare_suite as prepare_organillo_suite
 from logging_setup import configure_logging
 from materialized_cache import release_materialized_payload
 from backtest_universe import normalize_backtest_coin
@@ -1907,7 +1908,9 @@ async def run_backtest_suite_async(
     base_ignored = _flatten_coin_list(require_live_value(config, "ignored_coins"))
 
     scenarios, aggregate_cfg = build_scenarios(suite_cfg, base_exchanges=base_exchanges)
+    config, scenarios = prepare_organillo_suite(config, scenarios)
 
+    base_coins = _flatten_coin_list(require_live_value(config, "approved_coins"))
     # Determine which individual exchange datasets are needed for single-exchange scenarios
     needed_individual = _determine_needed_individual_exchanges(scenarios, base_exchanges)
 

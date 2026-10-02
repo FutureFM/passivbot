@@ -1,6 +1,6 @@
 use core::str::FromStr;
 use num_enum::{IntoPrimitive, TryFromPrimitive};
-use numpy::{PyArray1, PyArray3, PyUntypedArrayMethods};
+use numpy::{PyArray1, PyArray2, PyArray3, PyArrayMethods, PyUntypedArrayMethods};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::{Py, PyResult, Python};
 use serde::{Deserialize, Serialize};
@@ -72,6 +72,8 @@ pub struct HlcvsBundle {
     pub hlcvs: Py<PyArray3<f64>>,
     pub btc_usd: Py<PyArray1<f64>>,
     pub timestamps: Py<PyArray1<i64>>,
+    pub eligibility: Option<Py<PyArray2<u8>>>,
+    pub eligibility_row_indices: Option<Py<PyArray1<i32>>>,
     pub meta: HlcvsMeta,
 }
 
@@ -177,6 +179,35 @@ impl HlcvsBundle {
                 timestamps_ref.len(),
                 n_timesteps
             )));
+        }
+
+        match (&self.eligibility, &self.eligibility_row_indices) {
+            (None, None) => {}
+            (Some(eligible), Some(rows)) => {
+                let eligible = eligible.bind(py).readonly();
+                let rows = rows.bind(py).readonly();
+                let mask = eligible.as_array();
+                if mask.shape()[0] == 0 || mask.shape()[1] != n_coins || rows.len() != n_timesteps {
+                    return Err(PyValueError::new_err(
+                        "Organillo eligibility dimensions do not match HLCV",
+                    ));
+                }
+                if mask.iter().any(|v| *v > 1)
+                    || rows
+                        .as_array()
+                        .iter()
+                        .any(|r| *r < -1 || *r >= mask.shape()[0] as i32)
+                {
+                    return Err(PyValueError::new_err(
+                        "Invalid Organillo eligibility value or row index",
+                    ));
+                }
+            }
+            _ => {
+                return Err(PyValueError::new_err(
+                    "Organillo eligibility and row indices must be provided together",
+                ))
+            }
         }
 
         let btc_ref = self.btc_usd.bind(py);

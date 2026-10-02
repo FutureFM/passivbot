@@ -50,7 +50,7 @@ const DEBUG_UNSTUCK_COIN_FILTER: Option<&str> = None;
 const DEBUG_TRACE_WINDOW: Option<(usize, usize)> = None;
 // Optional coin filter for balance trace debug (by coin name, e.g. Some("SOL")); None dumps all.
 const DEBUG_TRACE_COIN_FILTER: Option<&str> = None;
-use ndarray::{ArrayView1, ArrayView3};
+use ndarray::{ArrayView1, ArrayView2, ArrayView3};
 use serde_json;
 use std::collections::VecDeque;
 use std::fs::{create_dir_all, File};
@@ -570,6 +570,7 @@ struct OrderFillExecution {
 // RollingSum (SMA) removed — volume & log range are now tracked via EMAs in `EMAs`.
 
 pub struct Backtest<'a> {
+    historical_selection: Option<(ArrayView2<'a, u8>, ArrayView1<'a, i32>)>,
     hlcvs: ArrayView3<'a, f64>,
     btc_usd_prices: ArrayView1<'a, f64>, // Change to ArrayView1 (1D view)
     active_coin_indices: Vec<usize>,
@@ -1284,6 +1285,31 @@ impl<'a> Backtest<'a> {
         writer.write_record(&record);
     }
 
+    pub fn set_historical_selection(
+        &mut self,
+        eligible: ArrayView2<'a, u8>,
+        rows: ArrayView1<'a, i32>,
+    ) {
+        self.historical_selection = Some((eligible, rows));
+    }
+
+    fn historical_mode(
+        &self,
+        idx: usize,
+        pside: usize,
+        k: usize,
+    ) -> Option<orchestrator::TradingMode> {
+        if let Some((mask, rows)) = &self.historical_selection {
+            // Orders computed from candle k's close can fill in candle k+1.
+            // Use the selection effective at that execution boundary (00:00 UTC).
+            let row = rows[(k + 1).min(rows.len() - 1)];
+            if row < 0 || mask[[row as usize, self.col(idx)]] == 0 {
+                return Some(orchestrator::TradingMode::GracefulStop);
+            }
+        }
+        self.forced_normal_mode(idx, pside)
+    }
+
     fn forced_normal_mode(&self, idx: usize, pside: usize) -> Option<orchestrator::TradingMode> {
         let side = match pside {
             LONG => &self.bot_params[idx].long,
@@ -1377,9 +1403,9 @@ impl<'a> Backtest<'a> {
                 let pos_short = self.positions.short[idx];
 
                 let mut mode_long: Option<orchestrator::TradingMode> =
-                    self.forced_normal_mode(idx, LONG);
+                    self.historical_mode(idx, LONG, k);
                 let mut mode_short: Option<orchestrator::TradingMode> =
-                    self.forced_normal_mode(idx, SHORT);
+                    self.historical_mode(idx, SHORT, k);
 
                 if let Some(delist_timestamp) = self.last_valid_timestamps[idx] {
                     if k >= delist_timestamp {
@@ -1673,9 +1699,9 @@ impl<'a> Backtest<'a> {
 
             let valid_now = self.coin_is_valid_at(idx, k);
             let mut mode_long: Option<orchestrator::TradingMode> =
-                self.forced_normal_mode(idx, LONG);
+                self.historical_mode(idx, LONG, k);
             let mut mode_short: Option<orchestrator::TradingMode> =
-                self.forced_normal_mode(idx, SHORT);
+                self.historical_mode(idx, SHORT, k);
 
             if let Some(delist_timestamp) = self.last_valid_timestamps[idx] {
                 if k >= delist_timestamp {
@@ -2084,6 +2110,7 @@ impl<'a> Backtest<'a> {
 
         Backtest {
             hlcvs,
+            historical_selection: None,
             btc_usd_prices,
             active_coin_indices,
             interval_ms: backtest_params.candle_interval_minutes * 60_000,
@@ -6347,6 +6374,99 @@ mod tests {
             Some(orchestrator::TradingMode::Normal)
         );
         assert_eq!(input.symbols[0].short.mode, None);
+    }
+
+    #[test]
+    fn organillo_uses_graceful_stop_in_both_orchestrator_paths() {
+        let hlcvs = Array3::from_shape_vec((4, 1, 4), vec![1.0; 4 * 1 * 4]).unwrap();
+        let btc_usd_prices = Array1::from_vec(vec![20_000.0; 4]);
+
+        let mut bp_pair = BotParamsPair::default();
+        bp_pair.long.n_positions = 1;
+        bp_pair.long.total_wallet_exposure_limit = 1.0;
+        bp_pair.long.wallet_exposure_limit = 1.0;
+        bp_pair.long.ema_span_0 = 10.0;
+        bp_pair.long.ema_span_1 = 20.0;
+        bp_pair.long.is_forced_active = true;
+        bp_pair.short.n_positions = 1;
+        bp_pair.short.total_wallet_exposure_limit = 1.0;
+        bp_pair.short.wallet_exposure_limit = 1.0;
+        bp_pair.short.ema_span_0 = 10.0;
+        bp_pair.short.ema_span_1 = 20.0;
+
+        let backtest_params = BacktestParams {
+            starting_balance: 1000.0,
+            maker_fee: 0.0,
+            taker_fee: 0.00055,
+            coins: vec!["TEST".to_string()],
+            active_coin_indices: None,
+            first_timestamp_ms: 0,
+            requested_start_timestamp_ms: 0,
+            first_valid_indices: vec![0],
+            last_valid_indices: vec![3],
+            warmup_minutes: vec![0],
+            trade_start_indices: vec![0],
+            global_warmup_bars: 0,
+            btc_collateral_cap: 0.0,
+            btc_collateral_ltv_cap: None,
+            metrics_only: true,
+            skip_btc_analysis: false,
+            filter_by_min_effective_cost: false,
+            dynamic_wel_by_tradability: true,
+            hedge_mode: true,
+            forager_score_hysteresis_pct: 0.0,
+            max_realized_loss_pct: 1.0,
+            pnls_max_lookback_days: 30.0,
+            liquidation_threshold: 0.05,
+            equity_hard_stop_loss: EquityHardStopLossConfig::default(),
+            market_orders_allowed: false,
+            market_order_near_touch_threshold: 0.001,
+            market_order_slippage_pct: 0.0005,
+            candle_interval_minutes: 1,
+        };
+
+        let mut bt = Backtest::new(
+            hlcvs.view(),
+            btc_usd_prices.view(),
+            vec![bp_pair],
+            vec![ExchangeParams::default()],
+            &backtest_params,
+        );
+
+        let mask = ndarray::array![[1u8], [0u8], [1u8]];
+        let rows = ndarray::array![0i32, 1, 1, 2];
+        bt.set_historical_selection(mask.view(), rows.view());
+        for k in [0, 1] {
+            let fresh = bt.build_orchestrator_input_iter(k, None, None, 0..1);
+            let cached = bt.get_orchestrator_input_cached(k, None, None);
+            for input in [&fresh, &cached] {
+                assert_eq!(
+                    input.symbols[0].long.mode,
+                    Some(orchestrator::TradingMode::GracefulStop)
+                );
+                assert_eq!(
+                    input.symbols[0].short.mode,
+                    Some(orchestrator::TradingMode::GracefulStop)
+                );
+                assert!(input.symbols[0].tradable);
+            }
+        }
+        bt.positions.long[0] = Position {
+            size: 1.0,
+            price: 1.0,
+        };
+        let held = bt.get_orchestrator_input_cached(1, None, None);
+        assert_eq!(held.symbols[0].long.position.size, 1.0);
+        assert_eq!(
+            held.symbols[0].long.mode,
+            Some(orchestrator::TradingMode::GracefulStop)
+        );
+        let enabled = bt.get_orchestrator_input_cached(2, None, None);
+        assert_eq!(
+            enabled.symbols[0].long.mode,
+            Some(orchestrator::TradingMode::Normal)
+        );
+        assert_eq!(enabled.symbols[0].short.mode, None);
     }
 
     #[test]

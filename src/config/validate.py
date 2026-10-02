@@ -53,6 +53,13 @@ def validate_config(
     from analysis_visibility import validate_visible_metrics_config
     from optimization.config_adapter import validate_optimize_bounds_against_bot_config
 
+    bt = require_config_dict(config, "backtest")
+    if not isinstance(bt["organillo_mode"], bool):
+        raise ValueError("backtest.organillo_mode must be a boolean")
+    if bt["organillo_mode"] and not (
+        isinstance(bt["organillo_carton_path"], str) and bt["organillo_carton_path"].strip()
+    ):
+        raise ValueError("backtest.organillo_carton_path is required in Organillo mode")
     require_config_dict(config, "monitor")
     strategy_kind = normalize_strategy_kind(config["live"].get("strategy_kind"))
     optimize_bounds = (

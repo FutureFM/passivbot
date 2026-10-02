@@ -115,7 +115,19 @@ def build_backtest_dataset_metadata(config: dict, exchange: str) -> dict:
             coins_order = loaded_coins
     runtime_side_membership = _runtime_side_membership(config, coins_order)
 
+    selection_metadata = None
+    if config["backtest"].get("organillo_mode", False):
+        from historical_selection import load_selection
+
+        selection = load_selection(config)
+        selection_metadata = {
+            "content_hash": selection.content_hash,
+            "clock": "00:00 UTC",
+            "ineligible_mode": "graceful_stop",
+        }
+
     return {
+        **({"historical_selection": selection_metadata} if selection_metadata is not None else {}),
         "exchange": exchange,
         "dataset_override": bool(get_optional_config_value(config, "backtest.hlcvs_data_dir")),
         "dataset_override_mode": get_optional_config_value(

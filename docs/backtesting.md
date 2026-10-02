@@ -1,5 +1,7 @@
 # Backtesting
 
+Daily historical coin eligibility is available through [Organillo](organillo.md).
+
 Passivbot ships with a backtester that replays historical 1 minute candles. By default,
 the backtester prepares data from the canonical v2 OHLCV store under `caches/ohlcvs/`.
 When data is missing there, it imports any matching legacy daily shards before making
