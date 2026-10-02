@@ -571,6 +571,8 @@ struct OrderFillExecution {
 
 pub struct Backtest<'a> {
     historical_selection: Option<(ArrayView2<'a, u8>, ArrayView1<'a, i32>)>,
+    historical_first_selected_rows: Vec<Option<usize>>,
+    historical_warmup_bars_by_row: Vec<usize>,
     hlcvs: ArrayView3<'a, f64>,
     btc_usd_prices: ArrayView1<'a, f64>, // Change to ArrayView1 (1D view)
     active_coin_indices: Vec<usize>,
@@ -1290,7 +1292,82 @@ impl<'a> Backtest<'a> {
         eligible: ArrayView2<'a, u8>,
         rows: ArrayView1<'a, i32>,
     ) {
+        // The full union is only a data-loading universe. Admit each market to
+        // decision/risk inputs at its first selection within this simulation.
+        // Precompute this cache from the mask; comparisons below never admit a
+        // future selection early, and warmup selections do not count.
+        let first_operational_step = self
+            .backtest_params
+            .requested_start_timestamp_ms
+            .saturating_sub(self.first_timestamp_ms)
+            .div_ceil(self.interval_ms) as usize;
+        let first_row = rows
+            .iter()
+            .skip(first_operational_step)
+            .copied()
+            .find(|&row| row >= 0)
+            .map(|row| row as usize);
+        self.historical_first_selected_rows = (0..self.n_coins)
+            .map(|idx| {
+                first_row.and_then(|start| {
+                    (start..eligible.nrows()).find(|&row| eligible[[row, self.col(idx)]] == 1)
+                })
+            })
+            .collect();
+        // When no explicit global warmup was provided, the legacy fallback
+        // takes the maximum span of every loaded coin. Future-only overrides
+        // must not delay current trading. Cache a prefix maximum of admitted
+        // markets' spans; explicit configured warmup remains unchanged.
+        if self.backtest_params.global_warmup_bars == 0 {
+            self.historical_warmup_bars_by_row = vec![0; eligible.nrows()];
+            for (idx, first) in self.historical_first_selected_rows.iter().enumerate() {
+                if let Some(row) = first {
+                    let warmup = calc_warmup_bars(
+                        std::slice::from_ref(&self.bot_params[idx]),
+                        std::slice::from_ref(&self.strategy_params[idx]),
+                    );
+                    self.historical_warmup_bars_by_row[*row] =
+                        self.historical_warmup_bars_by_row[*row].max(warmup);
+                }
+            }
+            let mut maximum = 0;
+            for warmup in &mut self.historical_warmup_bars_by_row {
+                maximum = maximum.max(*warmup);
+                *warmup = maximum;
+            }
+        }
         self.historical_selection = Some((eligible, rows));
+    }
+
+    fn warmup_bars_at(&self, k: usize) -> usize {
+        if let Some((_, rows)) = &self.historical_selection {
+            if self.backtest_params.global_warmup_bars == 0 {
+                let row = rows[(k + 1).min(rows.len() - 1)];
+                return if row < 0 {
+                    1
+                } else {
+                    self.historical_warmup_bars_by_row[row as usize].max(1)
+                };
+            }
+        }
+        self.warmup_bars.max(1)
+    }
+
+    fn coin_is_in_decision_universe_at(&self, idx: usize, k: usize) -> bool {
+        let Some((_, rows)) = &self.historical_selection else {
+            return true;
+        };
+        // Preserve management of any held position independently of eligibility.
+        if self.positions.long[idx].size != 0.0 || self.positions.short[idx].size != 0.0 {
+            return true;
+        }
+        let row = rows[(k + 1).min(rows.len() - 1)];
+        row >= 0
+            && self.historical_first_selected_rows[idx].is_some_and(|first| first <= row as usize)
+    }
+
+    fn coin_is_decision_tradeable_at(&self, idx: usize, k: usize) -> bool {
+        self.coin_is_tradeable_at(idx, k) && self.coin_is_in_decision_universe_at(idx, k)
     }
 
     fn historical_mode(
@@ -1378,7 +1455,7 @@ impl<'a> Backtest<'a> {
                 let exchange = self.exchange_params_list[idx].clone();
                 let effective_min_cost = calc_effective_min_cost(close_price, &exchange);
 
-                let tradable = self.coin_is_tradeable_at(idx, k);
+                let tradable = self.coin_is_decision_tradeable_at(idx, k);
                 let next_candle = if k + 1 < self.hlcvs.shape()[0] {
                     let tradable_next = self.coin_is_tradeable_at(idx, k + 1);
                     let (low, high) = if tradable_next {
@@ -1660,7 +1737,7 @@ impl<'a> Backtest<'a> {
 
             sym.order_book.bid = close_price;
             sym.order_book.ask = close_price;
-            sym.tradable = self.coin_is_tradeable_at(idx, k);
+            sym.tradable = self.coin_is_decision_tradeable_at(idx, k);
             sym.next_candle = if k + 1 < self.hlcvs.shape()[0] {
                 let tradable_next = self.coin_is_tradeable_at(idx, k + 1);
                 let (low, high) = if tradable_next {
@@ -2111,6 +2188,8 @@ impl<'a> Backtest<'a> {
         Backtest {
             hlcvs,
             historical_selection: None,
+            historical_first_selected_rows: Vec::new(),
+            historical_warmup_bars_by_row: Vec::new(),
             btc_usd_prices,
             active_coin_indices,
             interval_ms: backtest_params.candle_interval_minutes * 60_000,
@@ -2308,7 +2387,6 @@ impl<'a> Backtest<'a> {
             }
         }
 
-        let warmup_bars = self.warmup_bars.max(1);
         let guard_timestamp_ms = self
             .backtest_params
             .requested_start_timestamp_ms
@@ -2348,7 +2426,7 @@ impl<'a> Backtest<'a> {
                 break;
             }
             let current_ts = self.first_timestamp_ms + (k as u64) * self.interval_ms;
-            if k > warmup_bars && current_ts >= guard_timestamp_ms {
+            if k > self.warmup_bars_at(k) && current_ts >= guard_timestamp_ms {
                 if self.update_n_positions_and_wallet_exposure_limits(k) {
                     self.equity_tracking_active = true;
                 }
@@ -2442,7 +2520,7 @@ impl<'a> Backtest<'a> {
 
     fn update_n_positions_and_wallet_exposure_limits(&mut self, k: usize) -> bool {
         let eligible: Vec<usize> = (0..self.n_coins)
-            .filter(|&idx| self.coin_is_tradeable_at(idx, k))
+            .filter(|&idx| self.coin_is_decision_tradeable_at(idx, k))
             .collect();
 
         if eligible.is_empty() {
@@ -3383,7 +3461,9 @@ impl<'a> Backtest<'a> {
                 }
                 self.record_hard_stop_pside_strategy_equity_sample(k, pside)?;
                 for idx in 0..self.n_coins {
-                    if self.hard_stop_coin_should_update(pside, idx)? {
+                    if self.coin_is_in_decision_universe_at(idx, k)
+                        && self.hard_stop_coin_should_update(pside, idx)?
+                    {
                         self.update_hard_stop_state_coin(k, idx, pside)?;
                     }
                 }
@@ -6467,6 +6547,123 @@ mod tests {
             Some(orchestrator::TradingMode::Normal)
         );
         assert_eq!(enabled.symbols[0].short.mode, None);
+    }
+
+    #[test]
+    fn organillo_admits_risk_universe_causally_with_physical_column_mapping() {
+        let hlcvs = Array3::from_shape_vec((6, 3, 4), vec![1.0; 6 * 3 * 4]).unwrap();
+        let btc = Array1::from_vec(vec![20_000.0; 6]);
+        let mut bp = BotParamsPair::default();
+        for side in [&mut bp.long, &mut bp.short] {
+            side.n_positions = 3;
+            side.total_wallet_exposure_limit = 1.5;
+            side.wallet_exposure_limit = -1.0;
+            side.ema_span_0 = 10.0;
+            side.ema_span_1 = 20.0;
+        }
+        let backtest_params = BacktestParams {
+            starting_balance: 1000.0,
+            maker_fee: 0.0,
+            taker_fee: 0.00055,
+            coins: vec!["BTC".to_string(), "ETH".to_string()],
+            active_coin_indices: Some(vec![2, 0]),
+            first_timestamp_ms: 0,
+            requested_start_timestamp_ms: 60_000,
+            first_valid_indices: vec![0, 0],
+            last_valid_indices: vec![5, 5],
+            warmup_minutes: vec![0, 0],
+            trade_start_indices: vec![0, 0],
+            global_warmup_bars: 0,
+            btc_collateral_cap: 0.0,
+            btc_collateral_ltv_cap: None,
+            metrics_only: true,
+            skip_btc_analysis: false,
+            filter_by_min_effective_cost: false,
+            dynamic_wel_by_tradability: true,
+            hedge_mode: true,
+            forager_score_hysteresis_pct: 0.0,
+            max_realized_loss_pct: 1.0,
+            pnls_max_lookback_days: 30.0,
+            liquidation_threshold: 0.05,
+            equity_hard_stop_loss: EquityHardStopLossConfig::default(),
+            market_orders_allowed: false,
+            market_order_near_touch_threshold: 0.001,
+            market_order_slippage_pct: 0.0005,
+            candle_interval_minutes: 1,
+        };
+
+        let mut bt = Backtest::new(
+            hlcvs.view(),
+            btc.view(),
+            vec![bp.clone(), bp],
+            vec![ExchangeParams::default(); 2],
+            &backtest_params,
+        );
+        // Row zero is warmup: ETH was selected before this simulation's start.
+        // BTC is logical 0 / physical 2; ETH is logical 1 / physical 0.
+        let mask = ndarray::array![[1u8, 0, 1], [0, 0, 1], [0, 0, 0], [1, 0, 1]];
+        let rows = ndarray::array![0i32, 1, 1, 2, 3, 3];
+        bt.set_historical_selection(mask.view(), rows.view());
+        assert_eq!(bt.bot_params_master.long.n_positions, 2);
+        assert_eq!(bt.historical_first_selected_rows, vec![Some(1), Some(3)]);
+        assert_eq!(
+            bt.warmup_bars_at(0),
+            calc_warmup_bars(&bt.bot_params[0..1], &bt.strategy_params[0..1]).max(1)
+        );
+        for k in [0, 1, 2] {
+            assert!(bt.update_n_positions_and_wallet_exposure_limits(k));
+            assert_eq!(bt.effective_n_positions.long, 1);
+            assert_eq!(bt.effective_n_positions.short, 1);
+            assert_eq!(
+                bt.runtime_budget[0].long.effective_wallet_exposure_limit,
+                1.5
+            );
+            let fresh = bt.build_orchestrator_input_iter(k, None, None, 0..2);
+            let cached = bt.get_orchestrator_input_cached(k, None, None);
+            for input in [&fresh, &cached] {
+                assert!(input.symbols[0].tradable);
+                assert!(!input.symbols[1].tradable);
+                assert_eq!(
+                    input.symbols[1].long.mode,
+                    Some(orchestrator::TradingMode::GracefulStop)
+                );
+            }
+        }
+        // A zero row does not remove a previously admitted market from risk
+        // counts or interrupt graceful-stop position management.
+        bt.positions.long[0] = Position {
+            size: 1.0,
+            price: 1.0,
+        };
+        let retired = bt.get_orchestrator_input_cached(2, None, None);
+        assert!(retired.symbols[0].tradable);
+        assert_eq!(
+            retired.symbols[0].long.mode,
+            Some(orchestrator::TradingMode::GracefulStop)
+        );
+        assert_eq!(retired.symbols[0].long.position.size, 1.0);
+        // ETH starts counting exactly at its first effective selection.
+        assert!(bt.update_n_positions_and_wallet_exposure_limits(3));
+        assert_eq!(bt.effective_n_positions.long, 2);
+        assert_eq!(bt.effective_n_positions.short, 2);
+        assert_eq!(
+            bt.runtime_budget[0].long.effective_wallet_exposure_limit,
+            0.75
+        );
+        let admitted = bt.get_orchestrator_input_cached(3, None, None);
+        assert!(admitted.symbols[1].tradable);
+        bt.orchestrator_input_cache = None;
+        let rebuilt = bt.get_orchestrator_input_cached(3, None, None);
+        assert!(rebuilt.symbols[1].tradable);
+        assert_eq!(
+            rebuilt.symbols[0]
+                .long
+                .runtime_budget
+                .as_ref()
+                .unwrap()
+                .effective_wallet_exposure_limit,
+            0.75
+        );
     }
 
     #[test]

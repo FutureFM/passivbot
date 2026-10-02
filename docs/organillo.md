@@ -2,7 +2,8 @@
 
 Backtesting and optimization can import a daily coin eligibility matrix produced by an external
 selection tool. PB8 prepares candles for the union of coins selected during the requested period.
-Forager then ranks the eligible coins using its existing parameters and position limits.
+Forager then ranks the eligible coins using its existing parameters and position limits. The
+full data union does not make future selections available to current trading decisions.
 
 Enable these settings in an existing strategy config:
 
@@ -67,9 +68,20 @@ take profit, unstuck and risk actions. No forced liquidation or new fill policy 
 
 The carton replaces the simulation's current `live.approved_coins` with the historical union.
 Disabled sides, ignored coins, market availability, per-coin overrides and configured position
-limits still apply. It does not change `n_positions` or exposure formulas, and it does not enable
-live historical selection. A selected coin may be unavailable on an exchange for part of the
-period; ordinary PB8 candle tradability rules continue to govern that interval.
+limits still apply. A market enters the decision and exposure-counting universe only at its first
+selection within the requested simulation period. Selections before that period are warmup input,
+not prior admission. Once admitted, a market remains subject to ordinary PB8 tradability and
+exposure-counting rules even on a later `0` day; its entry mode becomes graceful stop. This keeps
+held-position management and the existing non-shrinking dynamic exposure denominator intact.
+Future-only markets do not consume Forager slots, change current exposure counts, or receive
+coin-mode HSL updates before admission. When PB8 derives global warmup from strategy spans,
+its maximum includes only markets admitted by that decision time. Future-only EMA overrides cannot
+delay earlier trading; an explicitly configured global warmup retains its normal behavior.
+The configured `n_positions` and exposure formulas are unchanged. This mechanism does not enable
+live historical selection.
+
+A selected coin may be unavailable on an exchange for part of the period; ordinary PB8 candle
+tradability rules continue to govern that interval.
 
 ## Suites and reproducibility
 

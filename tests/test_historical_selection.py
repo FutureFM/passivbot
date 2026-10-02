@@ -523,3 +523,84 @@ def test_duplicate_carton_market_identities_are_rejected(tmp_path, headers):
     path.write_text(f'date,{headers}\n2021-01-01,1,0\n')
     with pytest.raises(ValueError, match='distinct'):
         load_selection(config_for(path))
+
+
+def _run_prepared_universe(cfg, *, narrow_candles=True, future_prices=False):
+    """Exercise the same selected-union preparation as the CLI, without network I/O."""
+    from backtest import build_backtest_payload, execute_backtest
+    cfg = prepare_config(cfg)
+    coins = cfg['live']['approved_coins']['long']
+    cfg['backtest']['coins'] = {'binance': coins}
+    data, mss, btc, ts = dataset()
+    columns = [('BTC', 'ETH').index(coin) for coin in coins]
+    data = np.ascontiguousarray(data[:, columns, :])
+    if narrow_candles:
+        data[:] = [100.05, 99.95, 100.0, 1.0]
+    if future_prices:
+        data[2880:] = [160.0, 140.0, 150.0, 100.0]
+    mss = {key: value for key, value in mss.items() if key.startswith('__') or key in coins}
+    return execute_backtest(build_backtest_payload(data, mss, cfg, 'binance', btc, ts), cfg)
+
+
+@pytest.mark.parametrize('pside', ['long', 'short'])
+@pytest.mark.parametrize('dynamic_wel', [False, True])
+@pytest.mark.parametrize('strategy', ['trailing_martingale', 'ema_anchor'])
+@pytest.mark.parametrize('hsl', [False, True])
+def test_future_selection_cannot_change_past_fills_or_equity(tmp_path, pside, dynamic_wel, strategy, hsl):
+    # ETH is unselected in both inputs until day three. Loading ETH because of a
+    # future selection must not change BTC's earlier sizing, Forager slots or risk.
+    results = []
+    for name, values in [('baseline', ((1, 0),) * 3),
+                         ('future', ((1, 0), (1, 0), (1, 1)))]:
+        cfg = config_for(carton(tmp_path, values, name=name + '.csv'))
+        cfg['backtest']['dynamic_wel_by_tradability'] = dynamic_wel
+        other = 'short' if pside == 'long' else 'long'
+        cfg['bot'][other]['risk']['total_wallet_exposure_limit'] = 0.0
+        cfg['live']['strategy_kind'] = strategy
+        cfg['bot'][pside]['hsl']['enabled'] = hsl
+        if strategy == 'ema_anchor':
+            for side in ('long', 'short'):
+                anchor = cfg['bot'][side]['strategy']['ema_anchor']
+                anchor.update(ema_span_0=1.0, ema_span_1=1.0,
+                    offset_volatility_ema_span_1m=1.0, offset_volatility_ema_span_1h=1.0,
+                    base_qty_pct=0.1, offset=0.0,
+                    offset_psize_weight=0.0, offset_volatility_1m_weight=0.0,
+                    offset_volatility_1h_weight=0.0)
+        results.append(_run_prepared_universe(cfg))
+    cutoff = START + 2 * DAY_MS
+    past_fills = [r[0][np.array([int(row[1]) < cutoff for row in r[0]], dtype=bool)]
+                  for r in results]
+    assert len(past_fills[0]) > 0
+    np.testing.assert_array_equal(past_fills[0], past_fills[1])
+    np.testing.assert_array_equal(results[0][1][results[0][1][:, 0] < cutoff],
+                                  results[1][1][results[1][1][:, 0] < cutoff])
+
+
+def test_future_candles_cannot_change_past_fills_or_equity(tmp_path):
+    cfg = config_for(carton(tmp_path))
+    before = _run_prepared_universe(cfg)
+    after = _run_prepared_universe(cfg, future_prices=True)
+    cutoff = START + 2 * DAY_MS
+    for left, right, time_column in [(before[0], after[0], 1), (before[1], after[1], 0)]:
+        np.testing.assert_array_equal(
+            left[np.asarray(left[:, time_column], dtype=np.int64) < cutoff],
+            right[np.asarray(right[:, time_column], dtype=np.int64) < cutoff])
+
+
+def test_future_coin_indicator_spans_cannot_delay_past_trading(tmp_path):
+    results = []
+    for name, values in [('baseline', ((1, 0),) * 3),
+                         ('future', ((1, 0), (1, 0), (1, 1)))]:
+        cfg = config_for(carton(tmp_path, values, name=name + '.csv'))
+        # The same known config is used in both runs. Only the future selection
+        # changes; a large EMA override on that future market must not delay BTC.
+        cfg['coin_overrides'] = {'ETH': {'bot': {'long': {'strategy': {
+            'trailing_martingale': {'ema_span_0': 600.0, 'ema_span_1': 600.0}}}}}}
+        cfg['bot']['short']['risk']['total_wallet_exposure_limit'] = 0.0
+        results.append(_run_prepared_universe(cfg))
+    cutoff = START + 2 * DAY_MS
+    past_fills = [r[0][np.asarray(r[0][:, 1], dtype=np.int64) < cutoff] for r in results]
+    assert len(past_fills[0]) > 0
+    np.testing.assert_array_equal(past_fills[0], past_fills[1])
+    np.testing.assert_array_equal(results[0][1][results[0][1][:, 0] < cutoff],
+                                  results[1][1][results[1][1][:, 0] < cutoff])
