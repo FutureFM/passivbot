@@ -1023,7 +1023,74 @@ def create_forager_pnl_figure(
     if not return_figures:
         plt.close(fig)
 
+    figures.update(
+        create_forager_pnl_by_coin_figure(
+            fdf,
+            bal_eq,
+            figsize=figsize,
+            autoplot=autoplot,
+            return_figures=return_figures,
+        )
+    )
     return figures if return_figures else {}
+
+
+def create_forager_pnl_by_coin_figure(
+    fdf: pd.DataFrame,
+    bal_eq: pd.DataFrame,
+    figsize=(21, 8),
+    *,
+    autoplot: bool | None = None,
+    return_figures: bool | None = None,
+) -> dict:
+    """One step curve per traded coin: realized PnL plus signed fill fees."""
+    if fdf.empty:
+        return {}
+    autoplot = (_ipy_display is not None) if autoplot is None else autoplot
+    if return_figures is None:
+        return_figures = not autoplot
+
+    start = fdf["timestamp"].min()
+    end = fdf["timestamp"].max()
+    if not bal_eq.empty:
+        start = min(start, bal_eq.index.min())
+        end = max(end, bal_eq.index.max())
+
+    fig, ax = plt.subplots(1, 1, figsize=figsize)
+    groups = fdf.groupby("coin", sort=True)
+    colors = plt.get_cmap("turbo", max(2, len(groups)))
+    for idx, (coin, fills) in enumerate(groups):
+        net_pnl = pd.to_numeric(fills["pnl"], errors="raise") + pd.to_numeric(
+            fills["fee_paid"], errors="raise"
+        )
+        cumulative = net_pnl.groupby(fills["timestamp"]).sum().cumsum()
+        # Duplicate boundary timestamps preserve an initial zero and final plateau.
+        x = [start, *cumulative.index, end]
+        y = [0.0, *cumulative.to_numpy(), float(cumulative.iloc[-1])]
+        ax.step(x, y, where="post", label=str(coin), color=colors(idx), linewidth=1.0)
+
+    ax.axhline(0.0, color="gray", linewidth=0.7, linestyle="--")
+    ax.set_title("Cumulative Realized Net PnL by Coin (USD)")
+    ax.set_ylabel("USD")
+    ax.set_xlabel("Time (UTC)")
+    ax.grid(True, linestyle="--", alpha=0.3)
+    ax.legend(
+        loc="upper left", bbox_to_anchor=(1.01, 1.0),
+        ncol=max(1, int(np.ceil(len(groups) / 30))), fontsize="small",
+    )
+    fig.tight_layout()
+    if autoplot:
+        if _ipy_display is not None:
+            _ipy_display(fig)
+        else:  # pragma: no cover
+            try:
+                fig.show()
+            except Exception:
+                pass
+    if not return_figures:
+        plt.close(fig)
+    return {"pnl_by_coin": fig} if return_figures else {}
+
 
 def create_forager_hard_stop_drawdown_figure(
     bal_eq: pd.DataFrame,

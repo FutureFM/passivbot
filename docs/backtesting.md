@@ -55,6 +55,13 @@ See [Config Workflow](config_workflow.md) for the recommended way to copy and cu
 
 Standalone runs write metrics and plots to `backtests/{exchange}/timestamp/`. Suite runs collect everything under `backtests/suite_runs/<timestamp>/<scenario_label>/` and add a top-level `suite_summary.json`.
 
+With plotting enabled, `pnl_by_coin.png` overlays one cumulative realized net PnL
+curve per traded coin. Each curve combines long and short fills and includes signed
+fees (`pnl + fee_paid`); unrealized PnL is excluded. Curves start at zero and stay
+flat between fills through the end of the run. The plot works with or without
+Organillo and is disabled together with the other PnL plots by `-dp pnl`,
+`-dp summary`, or `-dp`.
+
 Each run also writes `dataset.json`, which points to the exact HLCV cache files used for that
 run. In notebooks or ad-hoc Python analysis you can load the full artifact bundle like this:
 
@@ -124,7 +131,8 @@ the override dataset:
 
 ## Backtest CLI args
 
-- `-dp` to disable individual coin plotting.
+- `-dp` to disable all plotting; `-dp coin_fills` disables only per-coin fill plots,
+  and `-dp pnl` disables both global and per-coin PnL plots.
 - `--suite [y/n]` to override `backtest.suite_enabled` (omit the value to enable, e.g. `--suite`).
 - `--scenarios label1,label2,...` to run only specific scenarios by label (implies `--suite y`).
 - `--suite-config path/to/overrides.json` to merge an additional suite definition onto the base config. Useful when you want to keep suite definitions outside the main config file.

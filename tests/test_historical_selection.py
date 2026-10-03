@@ -353,7 +353,10 @@ async def test_optimizer_suite_contexts_map_cartons_to_master_columns(tmp_path, 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('suite', [False, True])
-async def test_backtest_cli_entrypoint_writes_hash_and_fills(tmp_path, monkeypatch, suite):
+@pytest.mark.parametrize('disable_plotting', ['all', 'coin_fills'])
+async def test_backtest_cli_entrypoint_writes_hash_and_fills(
+    tmp_path, monkeypatch, suite, disable_plotting,
+):
     import backtest
     import sys
     cfg = config_for(carton(tmp_path))
@@ -396,7 +399,7 @@ async def test_backtest_cli_entrypoint_writes_hash_and_fills(tmp_path, monkeypat
         monkeypatch.setattr(suite_runner, 'load_markets', noop)
         monkeypatch.setattr(suite_runner, 'reject_cross_exchange_market_identifier_collisions', noop)
         monkeypatch.setattr(suite_runner, 'prepare_master_datasets', master)
-    monkeypatch.setattr(sys, 'argv', ['backtest.py', str(source), '-dp'])
+    monkeypatch.setattr(sys, 'argv', ['backtest.py', str(source), '-dp', disable_plotting])
     await backtest.main()
     results = list(output.rglob('config.json'))
     assert len(results) == (2 if suite else 1)
@@ -410,6 +413,7 @@ async def test_backtest_cli_entrypoint_writes_hash_and_fills(tmp_path, monkeypat
     assert saved['backtest']['organillo_carton_hash'] == load_selection(cfg).content_hash
     assert metadata['historical_selection']['content_hash'] == saved['backtest']['organillo_carton_hash']
     assert len(pd.read_csv(output / 'fills.csv')) > 0
+    assert (output / 'pnl_by_coin.png').exists() == (disable_plotting == 'coin_fills')
 
 
 @pytest.mark.parametrize('values,dates,error', [

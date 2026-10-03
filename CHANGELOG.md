@@ -4,6 +4,9 @@ All notable user-facing changes will be documented in this file.
 
 ## Unreleased
 
+- Add `pnl_by_coin.png` to backtest results: one cumulative realized net PnL curve
+  per traded coin on a shared chart, combining long and short fills and including fees.
+
 - Add daily historical coin eligibility from CSV/CSV.GZ cartons to backtests and CPU
   optimization suites. Forager ranks eligible candidates while existing positions retain
   graceful-stop management. Carton data is shared across optimizer workers and identified
