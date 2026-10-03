@@ -158,6 +158,10 @@ from limit_utils import expand_limit_checks, compute_limit_violation
 from pareto_store import ParetoStore
 import msgpack
 from typing import Sequence, Tuple, List, Dict, Any, Mapping, Optional
+from historical_selection import (
+    prepare_config as prepare_organillo_config,
+    prepare_arrays as prepare_organillo_arrays,
+)
 from shared_arrays import SharedArrayManager, attach_shared_array
 from ohlcv_utils import align_and_aggregate_hlcvs
 from optimize_suite import (
@@ -722,6 +726,10 @@ def _resume_config_mismatches(entry: dict, config: dict) -> list[str]:
 
     mismatches = []
     is_suite_result = entry.get("suite_metrics") is not None
+    if old_bt.get("organillo_mode", False) or new_bt.get("organillo_mode", False):
+        for key in ("organillo_mode", "organillo_carton_hash"):
+            if old_bt.get(key) != new_bt.get(key):
+                mismatches.append(f"backtest.{key}")
     old_bt_compare = _resume_subset(
         old_bt,
         {
@@ -1339,6 +1347,7 @@ class Evaluator:
         duplicate_counter=None,
         timestamps=None,
         shared_array_manager: SharedArrayManager | None = None,
+        historical_selections=None,
     ):
         logging.debug("Initializing Evaluator...")
         self.hlcvs_specs = hlcvs_specs
@@ -1361,6 +1370,15 @@ class Evaluator:
                 if btc_spec is not None:
                     self.shared_btc_np[exchange] = self.shared_array_manager.view(btc_spec)
 
+        self.historical_selections = {} if historical_selections is None else historical_selections
+        if historical_selections is None and config["backtest"].get("organillo_mode", False):
+            if shared_array_manager is None:
+                raise ValueError("Organillo optimizer preparation requires the shared array manager")
+            for exchange in self.exchanges:
+                prepared = prepare_organillo_arrays(
+                    config, config["backtest"]["coins"][exchange], self.timestamps[exchange],
+                )
+                self.historical_selections[exchange] = prepared.share(shared_array_manager)
         self.config = config
         logging.debug("Evaluator initialization complete.")
         logging.info("Evaluator ready | exchanges=%d", len(self.exchanges))
@@ -1559,6 +1577,7 @@ class Evaluator:
                 exchange,
                 self.shared_btc_np[exchange],
                 self.timestamps.get(exchange),
+                historical_selection=(self.historical_selections[exchange].arrays() if exchange in self.historical_selections else None),
                 metrics_only=True,
                 skip_btc_analysis=skip_btc_analysis,
             )
@@ -1735,7 +1754,9 @@ class Evaluator:
         return tuple(engine_scores), total_penalty
 
     def __del__(self):
-        for attachment_map in self._attachments.values():
+        for selection in getattr(self, "historical_selections", {}).values():
+            selection.close()
+        for attachment_map in getattr(self, "_attachments", {}).values():
             for attachment in attachment_map.values():
                 attachment.close()
 
@@ -1881,6 +1902,9 @@ class SuiteEvaluator:
         backtest_cfg["end_date"] = scenario_backtest["end_date"]
         backtest_cfg["coins"] = deepcopy(scenario_backtest.get("coins", {}))
         backtest_cfg["cache_dir"] = deepcopy(scenario_backtest.get("cache_dir", {}))
+        for key in ("organillo_mode", "organillo_carton_path", "organillo_carton_hash"):
+            if key in scenario_backtest:
+                backtest_cfg[key] = scenario_backtest[key]
         scenario_config["backtest"] = backtest_cfg
 
         scenario_live = ctx.config.get("live", {})
@@ -2013,6 +2037,7 @@ class SuiteEvaluator:
                     btc_data,
                     ctx.timestamps.get(exchange),
                     coin_indices=coin_indices,
+                    historical_selection=(ctx.historical_selections[exchange].arrays() if exchange in ctx.historical_selections else None),
                     metrics_only=True,
                     skip_btc_analysis=skip_btc_analysis,
                     runtime_config=runtime_config,
@@ -2236,6 +2261,8 @@ class SuiteEvaluator:
 
     def close(self):
         for ctx in getattr(self, "contexts", []):
+            for selection in getattr(ctx, "historical_selections", {}).values():
+                selection.close()
             attachments = getattr(ctx, "attachments", {}) or {}
             for attachment_map in attachments.values():
                 for attachment in attachment_map.values():
@@ -3201,6 +3228,8 @@ async def main():
         )
     else:
         apply_fine_tune_bounds(config, fine_tune_params, cli_bounds_overrides)
+    if not suite_cfg.get("enabled"):
+        config = prepare_organillo_config(config)
     backtest_exchanges = require_config_value(config, "backtest.exchanges")
     await format_approved_ignored_coins(
         config, backtest_exchanges, prefer_backtest_coin_source_keys=True
@@ -3231,6 +3260,17 @@ async def main():
             if not scenario_contexts:
                 raise ValueError("Suite configuration produced no scenarios.")
             logging.info("Optimizer suite enabled with %d scenario(s)", len(scenario_contexts))
+            resolved_scenarios = deepcopy(suite_cfg["scenarios"])
+            by_label = {ctx.label: ctx.config["backtest"] for ctx in scenario_contexts}
+            source_scenarios, _ = build_scenarios(suite_cfg, base_exchanges=backtest_exchanges)
+            for item, scenario in zip(resolved_scenarios, source_scenarios):
+                bt = by_label.get(scenario.label)
+                if bt and bt.get("organillo_mode", False):
+                    item["label"] = scenario.label
+                    overrides = item.setdefault("overrides", {})
+                    for key in ("organillo_mode", "organillo_carton_path", "organillo_carton_hash"):
+                        overrides[f"backtest.{key}"] = bt[key]
+            config["backtest"]["scenarios"] = resolved_scenarios
             first_ctx = scenario_contexts[0]
             hlcvs_specs = first_ctx.hlcvs_specs
             btc_usd_specs = first_ctx.btc_usd_specs
@@ -3387,6 +3427,7 @@ async def main():
             duplicate_counter=duplicate_counter,
             timestamps=timestamps_dict,
             shared_array_manager=array_manager,
+            historical_selections={} if suite_enabled else None,
         )
 
         if suite_enabled:

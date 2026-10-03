@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -19,6 +19,10 @@ from optimization.warmup import (
     compute_optimizer_backtest_warmup_minutes,
     compute_optimizer_per_coin_warmup_minutes,
     stamp_warmup_metadata,
+)
+from historical_selection import (
+    prepare_suite as prepare_organillo_suite,
+    prepare_arrays as prepare_organillo_arrays,
 )
 from shared_arrays import attach_shared_array
 from suite_runner import (
@@ -61,6 +65,7 @@ class ScenarioEvalContext:
     attachments: Dict[str, Dict[str, Any]]
     coin_indices: Dict[str, Optional[List[int]]]
     overrides: Dict[str, Any]
+    historical_selections: Dict[str, Any] = field(default_factory=dict)
     # Slice metadata for lazy slicing from master dataset (memory optimization)
     master_hlcvs_specs: Optional[Dict[str, Any]] = None
     master_btc_specs: Optional[Dict[str, Any]] = None
@@ -78,6 +83,7 @@ async def prepare_suite_contexts(
 
     base_exchanges = require_config_value(config, "backtest.exchanges")
     scenarios, aggregate_cfg = build_scenarios(suite_cfg, base_exchanges=base_exchanges)
+    config, scenarios = prepare_organillo_suite(config, scenarios)
 
     # Determine which individual exchange datasets are needed for single-exchange scenarios
     needed_individual = _determine_needed_individual_exchanges(scenarios, base_exchanges)
@@ -524,6 +530,19 @@ async def prepare_suite_contexts(
                 coin_slice_indices=coin_slice_indices or None,
             )
         )
+
+    for ctx in contexts:
+        for exchange in ctx.exchanges:
+            if not ctx.config["backtest"].get("organillo_mode", False):
+                continue
+            lazy = bool(ctx.master_hlcvs_specs and exchange in ctx.master_hlcvs_specs)
+            indices = ctx.coin_slice_indices[exchange] if lazy else ctx.coin_indices.get(exchange)
+            width = (ctx.master_hlcvs_specs[exchange] if lazy else ctx.hlcvs_specs[exchange]).shape[1]
+            prepared = prepare_organillo_arrays(
+                ctx.config, ctx.config["backtest"]["coins"][exchange], ctx.timestamps[exchange],
+                column_indices=indices, n_columns=width,
+            )
+            ctx.historical_selections[exchange] = prepared.share(shared_array_manager)
 
     if not contexts:
         raise ValueError("Suite configuration produced no runnable scenarios after filtering.")

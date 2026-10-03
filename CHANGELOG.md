@@ -4,6 +4,16 @@ All notable user-facing changes will be documented in this file.
 
 ## Unreleased
 
+- Add `pnl_by_coin.png` to backtest results: one cumulative realized net PnL curve
+  per traded coin on a shared chart, combining long and short fills and including fees.
+
+- Add daily historical coin eligibility from CSV/CSV.GZ cartons to backtests and CPU
+  optimization suites. Forager ranks eligible candidates while existing positions retain
+  graceful-stop management. Carton data is shared across optimizer workers and identified
+  by content hash for reproducible results and resume checks. Future-selected markets are
+  excluded from current decision and exposure-counting inputs until their first selection,
+  including automatic indicator warmup and coin-mode HSL inputs.
+
 ## v8.1.0 - 2026-08-10
 
 - Scope coin-mode HSL fill-history readiness for `restart_after_red_policy=always` to the

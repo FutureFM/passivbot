@@ -128,6 +128,9 @@ def get_template_config():
                 "candle_interval_minutes": 1,
                 "coin_sources": {},
                 "compress_cache": True,
+                "organillo_mode": False,
+                "organillo_carton_path": None,
+                "organillo_carton_hash": None,
                 "dynamic_wel_by_tradability": True,
                 "end_date": "now",
                 "exchanges": [

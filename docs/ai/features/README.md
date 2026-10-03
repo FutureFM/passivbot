@@ -15,6 +15,7 @@ Open only the contract for the subsystem being changed.
 | Monitor relay/dashboard | `monitor_relay.md` |
 | Structured live events | `live_events.md` and `../generated/live_event_registry.md` |
 | Trailing diagnostics tool | `trailing_diagnostics.md` |
+| Historical daily coin selection (Organillo) | `historical_selection.md` |
 | Strategy schema and Rust runtime | `strategy_runtime.md` |
 
 Feature contracts contain current invariants, failure semantics, non-obvious edge cases,
