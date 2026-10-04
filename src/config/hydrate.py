@@ -12,7 +12,7 @@ from optimization.random_seed import normalize_optional_seed
 
 from .limits import _resolve_optimize_limits_for_load
 from .log_output import log_config_message
-from .optimize_bounds import sort_optimize_bounds_in_place
+from .optimize_bounds import SHARED_OPTIMIZE_LOCAL_TO_FLAT_KEY, sort_optimize_bounds_in_place
 from .scoring import extract_objective_specs
 from .schema import get_template_config
 from .tree_ops import add_missing_keys_recursively, remove_unused_keys_recursively
@@ -39,6 +39,12 @@ TEMPLATE_SYNC_PRESERVE_PATHS: tuple[Path, ...] = (
     ("backtest", "market_settings"),
     ("backtest", "market_settings_sources"),
     *tuple(PARTIALLY_OPEN_CONFIG_PATHS),
+)
+_DIVERGENCE_OPTIMIZE_BOUND_PATHS: tuple[Path, ...] = tuple(
+    (pside, "risk", key)
+    for pside in ("long", "short")
+    for key in SHARED_OPTIMIZE_LOCAL_TO_FLAT_KEY["risk"]
+    if key.startswith("divergence_")
 )
 
 
@@ -130,7 +136,11 @@ def sync_with_template(
         template_with_extras,
         result,
         verbose=verbose,
-        preserve=TEMPLATE_SYNC_PRESERVE_PATHS + tuple(preserved_live_optimize_bounds),
+        preserve=(
+            TEMPLATE_SYNC_PRESERVE_PATHS
+            + tuple(preserved_live_optimize_bounds)
+            + tuple(("optimize", "bounds", *path) for path in _DIVERGENCE_OPTIMIZE_BOUND_PATHS)
+        ),
         tracker=tracker,
     )
     remove_unused_keys_recursively(template["bot"], result["bot"], verbose=verbose, tracker=tracker)
@@ -138,6 +148,7 @@ def sync_with_template(
         template["optimize"]["bounds"],
         result["optimize"]["bounds"],
         verbose=verbose,
+        preserve=_DIVERGENCE_OPTIMIZE_BOUND_PATHS,
         tracker=tracker,
     )
     remove_unused_keys_recursively(

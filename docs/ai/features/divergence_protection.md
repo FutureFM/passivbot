@@ -26,6 +26,8 @@ The fields live under `bot.<long|short>.risk`:
 
 With only three coins, the largest possible absolute population z-score for one isolated outlier is `sqrt(2) ≈ 1.414`. A threshold of 2.0 therefore needs at least six valid coins to flag a lone outlier; use a lower threshold if operating with only three to five coins.
 
+To tune the six numeric fields, add only the desired keys under `optimize.bounds.<side>.risk`. Bounds are optional: fields without bounds retain their `bot.<side>.risk` values during optimization. Set the boolean `divergence_filter_enabled` in `bot.<side>.risk`; it is not an optimizer bound.
+
 ## Validation
 
 - Rust unit tests cover isolated long drops, isolated short pumps, market-wide moves, and fewer than three valid coins.

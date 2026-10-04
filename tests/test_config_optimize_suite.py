@@ -2,6 +2,8 @@ from copy import deepcopy
 
 from config import load_prepared_config
 from config_utils import format_config, get_template_config
+from optimization.config_adapter import get_optimization_key_paths
+from optimization.warmup import build_optimizer_max_config
 from suite_runner import extract_suite_config
 
 
@@ -43,6 +45,68 @@ def test_optimizer_objective_scenario_is_preserved():
     formatted = format_config(deepcopy(base), verbose=False)
 
     assert formatted["optimize"]["objective_scenario"] == "base"
+
+
+def test_optional_divergence_bounds_survive_config_roundtrip():
+    config = get_template_config()
+    bounds = {
+        "divergence_zscore_threshold": [1.5, 3.0, 0.1],
+        "divergence_breadth_threshold_pct": [30.0, 60.0, 5.0],
+        "divergence_breadth_drop_pct": [0.5, 3.0, 0.25],
+        "divergence_delay_multiplier": [2.0, 10.0, 1.0],
+        "divergence_we_cap_pct": [0.1, 0.5, 0.05],
+        "divergence_min_timeframes": [1, 3, 1],
+    }
+    config["optimize"]["bounds"]["long"]["risk"].update(bounds)
+    config["optimize"]["bounds"]["short"]["risk"]["divergence_zscore_threshold"] = [
+        1.5,
+        3.0,
+        0.1,
+    ]
+
+    formatted = format_config(config, verbose=False)
+
+    assert {
+        key: formatted["optimize"]["bounds"]["long"]["risk"][key] for key in bounds
+    } == bounds
+    key_paths = dict(get_optimization_key_paths(formatted))
+    for key in bounds:
+        assert key_paths[f"long_{key}"] == ("bot", "long", "risk", key)
+    assert formatted["optimize"]["bounds"]["short"]["risk"]["divergence_zscore_threshold"] == [
+        1.5,
+        3.0,
+        0.1,
+    ]
+    assert key_paths["short_divergence_zscore_threshold"] == (
+        "bot",
+        "short",
+        "risk",
+        "divergence_zscore_threshold",
+    )
+
+
+def test_unbounded_divergence_settings_remain_fixed_during_optimization():
+    config = get_template_config()
+    config["bot"]["long"]["risk"].update(
+        divergence_filter_enabled=True,
+        divergence_zscore_threshold=1.7,
+        divergence_delay_multiplier=6.0,
+        divergence_we_cap_pct=0.25,
+    )
+
+    formatted = format_config(config, verbose=False)
+    optimizer_config = build_optimizer_max_config(formatted)
+
+    assert not any("divergence_" in key for key, _ in get_optimization_key_paths(formatted))
+    for key in (
+        "divergence_filter_enabled",
+        "divergence_zscore_threshold",
+        "divergence_delay_multiplier",
+        "divergence_we_cap_pct",
+    ):
+        assert optimizer_config["bot"]["long"]["risk"][key] == formatted["bot"]["long"][
+            "risk"
+        ][key]
 
 
 def test_optimizer_scoring_basis_round_trip_preserves_omitted_named_and_null_scenarios():
