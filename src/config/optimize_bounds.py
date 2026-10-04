@@ -34,6 +34,8 @@ SHARED_OPTIMIZE_LOCAL_TO_FLAT_KEY = {
     },
     "risk": {
         "entry_cooldown_minutes": "risk_entry_cooldown_minutes",
+        "entry_cooldown_factor_per_fill": "risk_entry_cooldown_factor_per_fill",
+        "entry_cooldown_max_minutes": "risk_entry_cooldown_max_minutes",
         "divergence_zscore_threshold": "divergence_zscore_threshold",
         "divergence_breadth_threshold_pct": "divergence_breadth_threshold_pct",
         "divergence_breadth_drop_pct": "divergence_breadth_drop_pct",

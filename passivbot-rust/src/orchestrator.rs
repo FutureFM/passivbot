@@ -259,6 +259,9 @@ mod core {
         MissingTrailing {
             symbol_idx: usize,
         },
+        MissingEntryFillHistory {
+            symbol_idx: usize,
+        },
     }
 
     #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -393,6 +396,8 @@ mod core {
         pub trailing_available: bool,
         #[serde(default)]
         pub last_increase_fill_timestamp_ms: Option<u64>,
+        #[serde(default)]
+        pub entry_fill_count: Option<u32>,
         /// Per-symbol/per-pside params after applying coin_overrides.
         pub bot_params: BotParams,
         #[serde(default)]
@@ -2486,6 +2491,7 @@ mod core {
             OrchestratorError::MissingTrailing { .. } => {
                 !symbol_side_input(symbol, pside).trailing_available
             }
+            OrchestratorError::MissingEntryFillHistory { .. } => true,
             _ => false,
         };
         if explicitly_unavailable {
@@ -2648,6 +2654,51 @@ mod core {
         })
     }
 
+    fn effective_entry_cooldown_minutes(
+        side: &SymbolSideInput,
+        symbol_idx: usize,
+        divergence_multiplier: f64,
+    ) -> Result<f64, OrchestratorError> {
+        let bp = &side.bot_params;
+        let base = bp.risk_entry_cooldown_minutes;
+        let factor = bp.risk_entry_cooldown_factor_per_fill;
+        let max_minutes = bp.risk_entry_cooldown_max_minutes;
+        if !base.is_finite()
+            || base < 0.0
+            || !factor.is_finite()
+            || factor <= 0.0
+            || !max_minutes.is_finite()
+            || max_minutes <= 0.0
+            || max_minutes > 1440.0
+            || !divergence_multiplier.is_finite()
+            || divergence_multiplier < 1.0
+        {
+            return Err(OrchestratorError::NonFiniteInput {
+                field: "entry_cooldown",
+                symbol_idx: Some(symbol_idx),
+            });
+        }
+        if base == 0.0 {
+            return Ok(0.0);
+        }
+        let exponent = if side.position.size == 0.0 || factor == 1.0 {
+            0
+        } else {
+            let count = side
+                .entry_fill_count
+                .filter(|count| *count > 0)
+                .ok_or(OrchestratorError::MissingEntryFillHistory { symbol_idx })?;
+            count - 1
+        };
+        let scaled = base * factor.powf(exponent as f64);
+        let divergence = if side.position.size == 0.0 {
+            1.0
+        } else {
+            divergence_multiplier
+        };
+        Ok((scaled * divergence).min(max_minutes))
+    }
+
     fn generate_strategy_ideal_orders(
         input: &OrchestratorInput,
         symbol: &SymbolInput,
@@ -2751,17 +2802,17 @@ mod core {
         );
         let mut entries = Vec::new();
         append_strategy_orders_as_ideal(&mut entries, generated.entries, symbol.symbol_idx, pside);
+        let cooldown = if wants_entries {
+            effective_entry_cooldown_minutes(side, symbol.symbol_idx, divergence_delay_multiplier)?
+        } else {
+            0.0
+        };
         apply_add_order_gates(
             &mut entries,
             pside,
             input.timestamp_ms,
             side.last_increase_fill_timestamp_ms,
-            side.bot_params.risk_entry_cooldown_minutes
-                * if side.position.size != 0.0 {
-                    divergence_delay_multiplier
-                } else {
-                    1.0
-                },
+            cooldown,
             strategy_requires_sequential_entry_staging(&strategy_params),
         );
         let mut closes = Vec::new();
@@ -2781,7 +2832,13 @@ mod core {
         diagnostics: &mut OrchestratorDiagnostics,
     ) -> Result<(Vec<IdealOrder>, Vec<IdealOrder>, bool), OrchestratorError> {
         let side = symbol_side_input(symbol, pside);
-        let requests = if (symbol.allow_missing_strategy_inputs || !side.trailing_available)
+        let missing_entry_fill_history = side.position.size != 0.0
+            && side.bot_params.risk_entry_cooldown_minutes > 0.0
+            && side.bot_params.risk_entry_cooldown_factor_per_fill != 1.0
+            && !matches!(side.entry_fill_count, Some(count) if count > 0);
+        let requests = if (symbol.allow_missing_strategy_inputs
+            || !side.trailing_available
+            || missing_entry_fill_history)
             && wants_entries
             && wants_closes
         {
@@ -4636,6 +4693,7 @@ mod core {
                     strategy_params: None,
                     parsed_strategy_params: None,
                     last_increase_fill_timestamp_ms: None,
+                    entry_fill_count: Some(0),
                     runtime_budget: None,
                 },
                 short: SymbolSideInput {
@@ -4647,6 +4705,7 @@ mod core {
                     strategy_params: None,
                     parsed_strategy_params: None,
                     last_increase_fill_timestamp_ms: None,
+                    entry_fill_count: Some(0),
                     runtime_budget: None,
                 },
             }
@@ -8451,6 +8510,70 @@ mod core {
             let out = compute_ideal_orders_for_test(&input).unwrap();
             assert_eq!(out.orders.len(), 1);
             assert_eq!(out.orders[0].order_type, OrderType::ClosePanicLong);
+        }
+
+        #[test]
+        fn cooldown_factor_tracks_each_entry_fill_and_caps_total_delay() {
+            let mut side = make_basic_symbol(0).long;
+            side.position = Position {
+                size: 1.0,
+                price: 100.0,
+            };
+            side.bot_params.risk_entry_cooldown_minutes = 10.0;
+            side.bot_params.risk_entry_cooldown_factor_per_fill = 2.0;
+            side.entry_fill_count = Some(1);
+            assert_eq!(
+                effective_entry_cooldown_minutes(&side, 0, 1.0).unwrap(),
+                10.0
+            );
+            side.entry_fill_count = Some(2);
+            assert_eq!(
+                effective_entry_cooldown_minutes(&side, 0, 1.0).unwrap(),
+                20.0
+            );
+            side.entry_fill_count = Some(3);
+            assert_eq!(
+                effective_entry_cooldown_minutes(&side, 0, 2.0).unwrap(),
+                80.0
+            );
+            side.entry_fill_count = Some(30);
+            assert_eq!(
+                effective_entry_cooldown_minutes(&side, 0, 4.0).unwrap(),
+                1440.0
+            );
+            side.bot_params.risk_entry_cooldown_factor_per_fill = 0.5;
+            side.entry_fill_count = Some(3);
+            assert_eq!(
+                effective_entry_cooldown_minutes(&side, 0, 1.0).unwrap(),
+                2.5
+            );
+            side.bot_params.risk_entry_cooldown_factor_per_fill = 1.0;
+            assert_eq!(
+                effective_entry_cooldown_minutes(&side, 0, 1.0).unwrap(),
+                10.0
+            );
+            side.position = Position::default();
+            side.entry_fill_count = Some(0);
+            assert_eq!(
+                effective_entry_cooldown_minutes(&side, 0, 4.0).unwrap(),
+                10.0
+            );
+        }
+
+        #[test]
+        fn adaptive_cooldown_requires_proven_entry_fills() {
+            let mut side = make_basic_symbol(0).long;
+            side.position = Position {
+                size: 1.0,
+                price: 100.0,
+            };
+            side.bot_params.risk_entry_cooldown_minutes = 10.0;
+            side.bot_params.risk_entry_cooldown_factor_per_fill = 2.0;
+            side.entry_fill_count = None;
+            assert!(matches!(
+                effective_entry_cooldown_minutes(&side, 0, 1.0),
+                Err(OrchestratorError::MissingEntryFillHistory { symbol_idx: 0 })
+            ));
         }
     }
 }

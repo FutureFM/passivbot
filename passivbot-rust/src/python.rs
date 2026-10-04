@@ -2558,6 +2558,16 @@ fn bot_params_from_dict(dict: &PyDict) -> PyResult<BotParams> {
         hsl_orange_tier_mode,
         hsl_panic_close_order_type,
         risk_entry_cooldown_minutes: extract_optional_f64(dict, "risk_entry_cooldown_minutes")?,
+        risk_entry_cooldown_factor_per_fill: extract_optional_f64_or(
+            dict,
+            "risk_entry_cooldown_factor_per_fill",
+            1.0,
+        )?,
+        risk_entry_cooldown_max_minutes: extract_optional_f64_or(
+            dict,
+            "risk_entry_cooldown_max_minutes",
+            1440.0,
+        )?,
         divergence_filter_enabled: extract_optional_bool(dict, "divergence_filter_enabled", false)?,
         divergence_zscore_threshold: extract_optional_f64_or(
             dict,
@@ -2789,6 +2799,20 @@ fn validate_hsl_risk_unstuck_bot_params(
         0.0,
         None,
         true,
+    )?;
+    validate_finite_range(
+        &format!("{path_prefix}.risk_entry_cooldown_factor_per_fill"),
+        params.risk_entry_cooldown_factor_per_fill,
+        0.0,
+        None,
+        false,
+    )?;
+    validate_finite_range(
+        &format!("{path_prefix}.risk_entry_cooldown_max_minutes"),
+        params.risk_entry_cooldown_max_minutes,
+        0.0,
+        Some(1440.0),
+        false,
     )?;
     validate_finite_range(
         &format!("{path_prefix}.total_wallet_exposure_limit"),

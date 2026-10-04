@@ -42,6 +42,8 @@ def _get_shared_bot_defaults():
             },
             "risk": {
                 "entry_cooldown_minutes": 24.1,
+                "entry_cooldown_factor_per_fill": 1.0,
+                "entry_cooldown_max_minutes": 1440.0,
                 "divergence_filter_enabled": False,
                 "divergence_zscore_threshold": 2.0,
                 "divergence_breadth_threshold_pct": 40.0,
@@ -96,6 +98,8 @@ def _get_shared_bot_defaults():
             },
             "risk": {
                 "entry_cooldown_minutes": 0.0,
+                "entry_cooldown_factor_per_fill": 1.0,
+                "entry_cooldown_max_minutes": 1440.0,
                 "divergence_filter_enabled": False,
                 "divergence_zscore_threshold": 2.0,
                 "divergence_breadth_threshold_pct": 40.0,

@@ -1685,6 +1685,24 @@ def test_prepare_config_rejects_negative_entry_cooldown_minutes():
         prepare_config(source, verbose=False, target="canonical", runtime=None)
 
 
+def test_entry_cooldown_fill_factor_roundtrips_to_rust_config():
+    source = get_template_config()
+    source["bot"]["long"]["risk"]["entry_cooldown_factor_per_fill"] = 2.0
+    prepared = prepare_config(source, verbose=False, target="canonical", runtime=None)
+    compiled = compile_runtime_config(prepared, runtime="backtest")
+    assert compiled["bot"]["long"]["risk_entry_cooldown_factor_per_fill"] == 2.0
+    assert compiled["bot"]["long"]["risk_entry_cooldown_max_minutes"] == 1440.0
+    assert compiled["bot"]["short"]["risk_entry_cooldown_factor_per_fill"] == 1.0
+
+
+@pytest.mark.parametrize("factor", [0.0, -0.5, float("nan"), float("inf")])
+def test_entry_cooldown_fill_factor_rejects_invalid_values(factor):
+    source = get_template_config()
+    source["bot"]["long"]["risk"]["entry_cooldown_factor_per_fill"] = factor
+    with pytest.raises(ValueError, match="entry_cooldown_factor_per_fill"):
+        prepare_config(source, verbose=False, target="canonical", runtime=None)
+
+
 def test_prepare_config_rejects_positive_twel_with_zero_positions():
     source = get_template_config()
     risk = source["bot"]["long"]["risk"]

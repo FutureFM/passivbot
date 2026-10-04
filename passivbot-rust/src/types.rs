@@ -555,6 +555,12 @@ impl ForagerScoreWeights {
 fn default_divergence_zscore_threshold() -> f64 {
     2.0
 }
+fn default_entry_cooldown_factor_per_fill() -> f64 {
+    1.0
+}
+fn default_entry_cooldown_max_minutes() -> f64 {
+    1440.0
+}
 fn default_divergence_breadth_threshold_pct() -> f64 {
     40.0
 }
@@ -646,6 +652,10 @@ pub struct BotParams {
     pub hsl_panic_close_order_type: String,
     #[serde(default)]
     pub risk_entry_cooldown_minutes: f64,
+    #[serde(default = "default_entry_cooldown_factor_per_fill")]
+    pub risk_entry_cooldown_factor_per_fill: f64,
+    #[serde(default = "default_entry_cooldown_max_minutes")]
+    pub risk_entry_cooldown_max_minutes: f64,
     #[serde(default)]
     pub divergence_filter_enabled: bool,
     #[serde(default = "default_divergence_zscore_threshold")]
@@ -726,6 +736,8 @@ impl Default for BotParams {
             hsl_orange_tier_mode: default_hsl_orange_tier_mode(),
             hsl_panic_close_order_type: default_hsl_panic_close_order_type(),
             risk_entry_cooldown_minutes: 0.0,
+            risk_entry_cooldown_factor_per_fill: default_entry_cooldown_factor_per_fill(),
+            risk_entry_cooldown_max_minutes: default_entry_cooldown_max_minutes(),
             divergence_filter_enabled: false,
             divergence_zscore_threshold: default_divergence_zscore_threshold(),
             divergence_breadth_threshold_pct: default_divergence_breadth_threshold_pct(),

@@ -82,6 +82,8 @@ CONDITIONAL_HSL_OVERRIDE_PATHS = frozenset(
 OVERRIDABLE_SHARED_BOT_PATHS = frozenset(
     {
         "risk.entry_cooldown_minutes",
+        "risk.entry_cooldown_factor_per_fill",
+        "risk.entry_cooldown_max_minutes",
         "risk.position_exposure_enforcer_enabled",
         "risk.position_exposure_enforcer_threshold",
         "risk.we_excess_allowance_pct",

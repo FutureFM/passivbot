@@ -640,6 +640,8 @@ pub struct Backtest<'a> {
     did_fill_short: Vec<bool>,
     last_increase_fill_timestamp_long: Vec<Option<u64>>,
     last_increase_fill_timestamp_short: Vec<Option<u64>>,
+    entry_fill_count_long: Vec<u32>,
+    entry_fill_count_short: Vec<u32>,
     pub total_wallet_exposures: Vec<f64>,
     // removed rolling_volume_sum & buffer — replaced by per-coin EMAs in `emas`
     equity_tracking_active: bool,
@@ -1654,6 +1656,7 @@ impl<'a> Backtest<'a> {
                         trailing_available: true,
                         last_increase_fill_timestamp_ms: self.last_increase_fill_timestamp_long
                             [idx],
+                        entry_fill_count: Some(self.entry_fill_count_long[idx]),
                         bot_params: self.bot_params[idx].long.clone(),
                         strategy_params: None,
                         parsed_strategy_params: Some(self.strategy_params[idx].long),
@@ -1666,6 +1669,7 @@ impl<'a> Backtest<'a> {
                         trailing_available: true,
                         last_increase_fill_timestamp_ms: self.last_increase_fill_timestamp_short
                             [idx],
+                        entry_fill_count: Some(self.entry_fill_count_short[idx]),
                         bot_params: self.bot_params[idx].short.clone(),
                         strategy_params: None,
                         parsed_strategy_params: Some(self.strategy_params[idx].short),
@@ -1794,8 +1798,10 @@ impl<'a> Backtest<'a> {
             sym.long.trailing = self.trailing_prices.long[idx].clone();
             sym.short.trailing = self.trailing_prices.short[idx].clone();
             sym.long.last_increase_fill_timestamp_ms = self.last_increase_fill_timestamp_long[idx];
+            sym.long.entry_fill_count = Some(self.entry_fill_count_long[idx]);
             sym.short.last_increase_fill_timestamp_ms =
                 self.last_increase_fill_timestamp_short[idx];
+            sym.short.entry_fill_count = Some(self.entry_fill_count_short[idx]);
 
             sym.long.runtime_budget = Some(self.runtime_budget[idx].long.clone());
             sym.short.runtime_budget = Some(self.runtime_budget[idx].short.clone());
@@ -2307,6 +2313,8 @@ impl<'a> Backtest<'a> {
             did_fill_short: vec![false; n_coins],
             last_increase_fill_timestamp_long: vec![None; n_coins],
             last_increase_fill_timestamp_short: vec![None; n_coins],
+            entry_fill_count_long: vec![0; n_coins],
+            entry_fill_count_short: vec![0; n_coins],
             total_wallet_exposures: Vec::with_capacity(n_timesteps),
             equity_tracking_active: false,
             debug_writer: if DEBUG_DUMP_ORDERS {
@@ -4306,6 +4314,8 @@ impl<'a> Backtest<'a> {
                         self.last_increase_fill_timestamp_long[idx] =
                             Some(self.first_timestamp_ms + (k as u64) * self.interval_ms);
                         self.process_entry_fill_long(k, idx, &order, exec);
+                        self.entry_fill_count_long[idx] =
+                            self.entry_fill_count_long[idx].saturating_add(1);
                     }
                 }
             }
@@ -4344,6 +4354,8 @@ impl<'a> Backtest<'a> {
                         self.last_increase_fill_timestamp_short[idx] =
                             Some(self.first_timestamp_ms + (k as u64) * self.interval_ms);
                         self.process_entry_fill_short(k, idx, &order, exec);
+                        self.entry_fill_count_short[idx] =
+                            self.entry_fill_count_short[idx].saturating_add(1);
                     }
                 }
             }
@@ -4412,6 +4424,7 @@ impl<'a> Backtest<'a> {
         let current_pprice = current_position.price;
         if new_psize == 0.0 {
             self.positions.long[idx] = Position::default();
+            self.entry_fill_count_long[idx] = 0;
         } else {
             self.positions.long[idx].size = new_psize;
         }
@@ -4511,6 +4524,7 @@ impl<'a> Backtest<'a> {
         let current_pprice = current_position.price;
         if new_psize == 0.0 {
             self.positions.short[idx] = Position::default();
+            self.entry_fill_count_short[idx] = 0;
         } else {
             self.positions.short[idx].size = new_psize;
         }
@@ -7522,6 +7536,7 @@ mod tests {
             .filter(|fill| fill.index == 1 && fill.fill_qty > 0.0)
             .collect();
         assert_eq!(same_candle_entries.len(), staged_entry_count);
+        assert_eq!(bt.entry_fill_count_long[0], staged_entry_count as u32);
         assert!(same_candle_entries.len() >= 2);
         assert!(same_candle_entries
             .iter()

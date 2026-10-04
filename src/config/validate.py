@@ -78,6 +78,31 @@ def validate_config(
         )
         if entry_cooldown_minutes < 0.0:
             raise ValueError(f"bot.{pside}.risk.entry_cooldown_minutes must be >= 0.0")
+        cooldown_factor = get_grouped_bot_value(
+            bot_side, "risk_entry_cooldown_factor_per_fill", 1.0
+        )
+        if (
+            isinstance(cooldown_factor, bool)
+            or not isinstance(cooldown_factor, (int, float))
+            or not math.isfinite(cooldown_factor)
+            or cooldown_factor <= 0.0
+        ):
+            raise ValueError(
+                f"bot.{pside}.risk.entry_cooldown_factor_per_fill must be finite and > 0"
+            )
+        cooldown_max = get_grouped_bot_value(
+            bot_side, "risk_entry_cooldown_max_minutes", 1440.0
+        )
+        if (
+            isinstance(cooldown_max, bool)
+            or not isinstance(cooldown_max, (int, float))
+            or not math.isfinite(cooldown_max)
+            or cooldown_max <= 0.0
+            or cooldown_max > 1440.0
+        ):
+            raise ValueError(
+                f"bot.{pside}.risk.entry_cooldown_max_minutes must be in (0, 1440]"
+            )
         divergence_enabled = get_grouped_bot_value(bot_side, "divergence_filter_enabled")
         if not isinstance(divergence_enabled, bool):
             raise ValueError(f"bot.{pside}.risk.divergence_filter_enabled must be a boolean")

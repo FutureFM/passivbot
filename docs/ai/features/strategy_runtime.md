@@ -23,6 +23,14 @@ With `entry_cooldown_minutes = 0.0`, `trailing_grid_v7` preserves v7's simultane
 ladder even when a later trailing leg uses retracement. Its recursive generator stops expansion
 before stacking retracement-dependent trailing orders. Positive entry cooldowns still stage at
 most one position-adding order and apply their configured post-fill delay.
+`risk.entry_cooldown_factor_per_fill` scales that delay by the number of
+position-increasing fills in the current open position: the first fill uses the
+base, later fills multiply by `factor^(count - 1)`, and flattening resets the
+count. Divergence multiplies the result for held positions; the final delay is
+capped at `risk.entry_cooldown_max_minutes`, at most 1440. Live reconstructs
+the count from normalized exchange fills after restart. An unproven episode
+defers only affected entries while a scoped history repair runs; closes remain
+independent.
 
 Removed v7 trailing-grid concepts:
 

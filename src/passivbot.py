@@ -2006,7 +2006,12 @@ class Passivbot:
         symbols: list[Optional[str]] = [None]
         symbols.extend(sorted((getattr(self, "coin_overrides", {}) or {}).keys()))
         return max(
-            float(self.bp(pside, "risk_entry_cooldown_minutes", symbol) or 0.0)
+            (
+                float(self.bp(pside, "risk_entry_cooldown_max_minutes", symbol))
+                if float(self.bp(pside, "risk_entry_cooldown_factor_per_fill", symbol)) != 1.0
+                and float(self.bp(pside, "risk_entry_cooldown_minutes", symbol)) > 0.0
+                else float(self.bp(pside, "risk_entry_cooldown_minutes", symbol) or 0.0)
+            )
             for symbol in symbols
             for pside in ("long", "short")
         )
@@ -13730,7 +13735,12 @@ class Passivbot:
                 cooldown_minutes = float(self.bp(pside, "risk_entry_cooldown_minutes", symbol) or 0.0)
                 if cooldown_minutes > 0.0:
                     relevant_pairs.add((symbol, pside))
-                    max_cooldown_minutes = max(max_cooldown_minutes, cooldown_minutes)
+                    horizon = (
+                        float(self.bp(pside, "risk_entry_cooldown_max_minutes", symbol))
+                        if float(self.bp(pside, "risk_entry_cooldown_factor_per_fill", symbol)) != 1.0
+                        else cooldown_minutes
+                    )
+                    max_cooldown_minutes = max(max_cooldown_minutes, horizon)
         if not relevant_pairs:
             return out
 
@@ -13757,6 +13767,141 @@ class Passivbot:
             if not unresolved:
                 break
         return out
+
+    def _get_entry_fill_counts(
+        self, symbols: Iterable[str]
+    ) -> dict[str, dict[str, Optional[int]]]:
+        """Rebuild open-position entry fill counts from normalized exchange fills.
+
+        None means that the current position episode is not proven by the cached
+        fills. Rust then defers only entries that need the factor.
+        """
+        out: dict[str, dict[str, Optional[int]]] = {}
+        needed: set[tuple[str, str]] = set()
+        for symbol in symbols:
+            out[symbol] = {"long": 0, "short": 0}
+            for pside in ("long", "short"):
+                pos = self.positions.get(symbol, {}).get(pside, {})
+                if (
+                    float(pos.get("size", 0.0) or 0.0) != 0.0
+                    and float(self.bp(pside, "risk_entry_cooldown_minutes", symbol)) > 0.0
+                    and float(self.bp(pside, "risk_entry_cooldown_factor_per_fill", symbol)) != 1.0
+                ):
+                    out[symbol][pside] = None
+                    needed.add((symbol, pside))
+        if not needed or self._pnls_manager is None:
+            return out
+
+        counts = {key: 0 for key in needed}
+        known = {key: False for key in needed}
+        last_sizes = {key: 0.0 for key in needed}
+        episode_starts: dict[tuple[str, str], int] = {}
+        for event in self._pnls_manager.get_events():
+            key = (str(event.symbol), str(event.position_side).lower())
+            if key not in needed:
+                continue
+            symbol, pside = key
+            multiplier = float(getattr(event, "c_mult", 1.0) or 1.0)
+            delta = float(event.qty) * multiplier * (1.0 if pside == "long" else -1.0)
+            after = float(event.psize)
+            if not math.isfinite(after) or not math.isfinite(delta) or after < 0.0:
+                continue
+            step = float(self.qty_steps.get(symbol, 0.0) or 0.0)
+            epsilon = max(step * multiplier * 0.5, 1e-9)
+            before = after - delta
+            if after <= epsilon:
+                counts[key] = 0
+                known[key] = True
+                episode_starts.pop(key, None)
+            elif before <= epsilon and delta > 0.0:
+                counts[key] = 1
+                known[key] = True
+                episode_starts[key] = int(event.timestamp)
+            elif delta > 0.0 and known[key]:
+                counts[key] += 1
+            last_sizes[key] = after
+
+        for key in needed:
+            symbol, pside = key
+            current = abs(float(self.positions[symbol][pside]["size"]))
+            multiplier = float(self.c_mults.get(symbol, 1.0) or 1.0)
+            epsilon = max(float(self.qty_steps.get(symbol, 0.0) or 0.0) * multiplier, 1e-8)
+            if not (
+                known[key]
+                and counts[key] > 0
+                and abs(last_sizes[key] - current * multiplier) <= epsilon
+            ):
+                continue
+            # A truncated cache can start with an apparent opening fill and
+            # still match the exchange position by coincidence. Require the
+            # exchange-backed coverage record to precede that opening fill.
+            start_ms = episode_starts.get(key)
+            if start_ms is None:
+                continue
+            coverage = self._fill_history_coverage_status(start_ms=max(0, start_ms - 1))
+            if bool(coverage.get("ready", False)):
+                out[symbol][pside] = counts[key]
+        return out
+
+    def _schedule_entry_fill_count_history_repair(
+        self, counts: dict[str, dict[str, Optional[int]]], now_ms: int
+    ) -> None:
+        """Recover missing open-position fills without delaying close planning."""
+        missing = [
+            (symbol, pside)
+            for symbol, sides in counts.items()
+            for pside, count in sides.items()
+            if count is None
+        ]
+        if not missing:
+            self._entry_fill_count_repair_full_history_attempted = False
+            self._entry_fill_count_repair_last_start_ms = None
+            return
+        if self._pnls_manager is None:
+            return
+        running = getattr(self, "_entry_fill_count_repair_task", None)
+        if running is not None and not running.done():
+            return
+        last_attempt = int(getattr(self, "_entry_fill_count_repair_last_attempt_ms", 0) or 0)
+        if last_attempt > 0 and now_ms - last_attempt < 300_000:
+            return
+        self._entry_fill_count_repair_last_attempt_ms = now_ms
+        opening_times = [
+            self._position_history_anchor_timestamp_ms(symbol, pside)
+            for symbol, pside in missing
+        ]
+        start_ms = (
+            max(0, min(opening_times) - 60_000)
+            if opening_times and all(ts is not None for ts in opening_times)
+            else None
+        )
+        # If that bounded fetch still left the open episode unproven, widen
+        # the next attempt to all exchange-available history.
+        previous_start_ms = getattr(self, "_entry_fill_count_repair_last_start_ms", None)
+        if (
+            bool(getattr(self, "_entry_fill_count_repair_full_history_attempted", False))
+            or (start_ms is not None and previous_start_ms == start_ms)
+        ):
+            start_ms = None
+        if start_ms is None:
+            self._entry_fill_count_repair_full_history_attempted = True
+        self._entry_fill_count_repair_last_start_ms = start_ms
+
+        async def repair() -> None:
+            try:
+                if start_ms is None:
+                    await self._pnls_manager.refresh(start_ms=None, end_ms=None)
+                    self._pnls_manager.set_history_scope("all")
+                else:
+                    await self._pnls_manager.refresh_for_lookback(start_ms=start_ms)
+            except Exception:
+                logging.exception(
+                    "[fills] unable to reconstruct entry cooldown fill count; "
+                    "entries remain deferred for %s",
+                    missing,
+                )
+
+        self._entry_fill_count_repair_task = asyncio.create_task(repair())
 
     def _ensure_entry_cooldown_delta_guard_state(self) -> None:
         if not hasattr(self, "_entry_cooldown_prev_pos_sizes"):
@@ -16614,6 +16759,7 @@ class Passivbot:
                         "min_since_max": float(trailing.get("min_since_max", 0.0)),
                     },
                     "last_increase_fill_timestamp_ms": None,
+                    "entry_fill_count": 0,
                     "bot_params": self._bot_params_to_rust_dict(pside, symbol),
                     "strategy_params": self._strategy_params_to_rust_dict(pside, symbol),
                 }
@@ -17250,6 +17396,7 @@ class Passivbot:
         )
         realized_pnl_cumsum = snapshot.get("realized_pnl_cumsum", {"max": 0.0, "last": 0.0})
         last_increase_fill_timestamps = snapshot.get("last_increase_fill_timestamps", {})
+        entry_fill_counts = snapshot.get("entry_fill_counts", {})
         max_realized_loss_pct = float(Passivbot._live_max_realized_loss_pct(self))
         if hasattr(self, "_build_orchestrator_mode_overrides"):
             mode_overrides = self._build_orchestrator_mode_overrides(symbols)
@@ -17357,6 +17504,7 @@ class Passivbot:
                     "trailing": trailing,
                     "trailing_available": trailing_available,
                     "last_increase_fill_timestamp_ms": last_increase_fill_timestamps.get(symbol, {}).get(pside),
+                    "entry_fill_count": entry_fill_counts.get(symbol, {}).get(pside),
                     "bot_params": self._bot_params_to_rust_dict(pside, symbol),
                     "strategy_params": self._strategy_params_to_rust_dict(pside, symbol),
                 }
@@ -19857,6 +20005,8 @@ class Passivbot:
         last_increase_fill_timestamps = self._merge_entry_cooldown_anchors(
             fill_increase_timestamps, delta_increase_timestamps
         )
+        entry_fill_counts = self._get_entry_fill_counts(symbols)
+        self._schedule_entry_fill_count_history_repair(entry_fill_counts, now_ms)
         max_realized_loss_pct = float(Passivbot._live_max_realized_loss_pct(self))
 
         global_bp = {
@@ -19956,6 +20106,7 @@ class Passivbot:
                     "trailing": trailing,
                     "trailing_available": trailing_available,
                     "last_increase_fill_timestamp_ms": last_increase_fill_timestamps.get(symbol, {}).get(pside),
+                    "entry_fill_count": entry_fill_counts.get(symbol, {}).get(pside),
                     "bot_params": self._bot_params_to_rust_dict(pside, symbol),
                     "strategy_params": self._strategy_params_to_rust_dict(pside, symbol),
                 }
@@ -20176,6 +20327,7 @@ class Passivbot:
                 "auto_unstuck_allowed": auto_unstuck_allowed,
                 "realized_pnl_cumsum": realized_pnl_cumsum,
                 "last_increase_fill_timestamps": last_increase_fill_timestamps,
+                "entry_fill_counts": entry_fill_counts,
                 "planning_snapshot": (
                     planning_snapshot.to_dict()
                     if planning_snapshot is not None

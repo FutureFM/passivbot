@@ -1714,6 +1714,66 @@ def test_entry_cooldown_keeps_close_orders_while_blocking_adds():
     assert long_close_orders
 
 
+def test_missing_entry_fill_count_defers_only_entries():
+    import passivbot_rust as pbr
+
+    params = {
+        "risk_entry_cooldown_minutes": 1.0,
+        "risk_entry_cooldown_factor_per_fill": 2.0,
+    }
+    symbol = make_symbol(
+        0,
+        bid=102.0,
+        ask=102.0,
+        long_pos_size=1.0,
+        long_pos_price=100.0,
+        long_bp=params,
+    )
+    symbol["long"]["last_increase_fill_timestamp_ms"] = 60_000
+    symbol["long"]["entry_fill_count"] = None
+    inp = make_input(balance=1_000.0, global_bp=bot_params_pair(long_overrides=params), symbols=[symbol])
+    inp["timestamp_ms"] = 120_000
+
+    out = compute(pbr, inp)
+    assert not any(o["qty"] > 0.0 and o["pside"] == "long" for o in out["orders"])
+    assert any(o["qty"] < 0.0 and o["pside"] == "long" for o in out["orders"])
+    assert {
+        "strategy_input_unavailable": {
+            "symbol_idx": 0,
+            "pside": "long",
+            "scope": "strategy_orders",
+        }
+    } in out["diagnostics"]["warnings"]
+
+
+@pytest.mark.parametrize(
+    ("factor", "entry_allowed"),
+    [(0.5, True), (1.0, True), (2.0, False)],
+)
+def test_entry_cooldown_factor_changes_reentry_timing(factor, entry_allowed):
+    import passivbot_rust as pbr
+
+    params = {
+        "risk_entry_cooldown_minutes": 1.0,
+        "risk_entry_cooldown_factor_per_fill": factor,
+    }
+    symbol = make_symbol(
+        0,
+        bid=100.0,
+        ask=100.0,
+        long_pos_size=1.0,
+        long_pos_price=100.0,
+        long_bp=params,
+    )
+    symbol["long"]["last_increase_fill_timestamp_ms"] = 60_000
+    symbol["long"]["entry_fill_count"] = 2
+    inp = make_input(balance=1_000.0, global_bp=bot_params_pair(long_overrides=params), symbols=[symbol])
+    inp["timestamp_ms"] = 150_000  # 1.5 minutes since the last fill
+    out = compute(pbr, inp)
+    has_entry = any(o["qty"] > 0.0 and o["pside"] == "long" for o in out["orders"])
+    assert has_entry is entry_allowed
+
+
 def test_fractional_entry_cooldown_blocks_until_seconds_elapsed_then_keeps_one_add():
     import passivbot_rust as pbr
 
