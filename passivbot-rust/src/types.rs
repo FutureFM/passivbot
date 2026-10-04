@@ -552,6 +552,25 @@ impl ForagerScoreWeights {
     }
 }
 
+fn default_divergence_zscore_threshold() -> f64 {
+    2.0
+}
+fn default_divergence_breadth_threshold_pct() -> f64 {
+    40.0
+}
+fn default_divergence_breadth_drop_pct() -> f64 {
+    1.0
+}
+fn default_divergence_delay_multiplier() -> f64 {
+    1.0
+}
+fn default_divergence_we_cap_pct() -> f64 {
+    1.0
+}
+fn default_divergence_min_timeframes() -> usize {
+    2
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BotParams {
@@ -627,6 +646,20 @@ pub struct BotParams {
     pub hsl_panic_close_order_type: String,
     #[serde(default)]
     pub risk_entry_cooldown_minutes: f64,
+    #[serde(default)]
+    pub divergence_filter_enabled: bool,
+    #[serde(default = "default_divergence_zscore_threshold")]
+    pub divergence_zscore_threshold: f64,
+    #[serde(default = "default_divergence_breadth_threshold_pct")]
+    pub divergence_breadth_threshold_pct: f64,
+    #[serde(default = "default_divergence_breadth_drop_pct")]
+    pub divergence_breadth_drop_pct: f64,
+    #[serde(default = "default_divergence_delay_multiplier")]
+    pub divergence_delay_multiplier: f64,
+    #[serde(default = "default_divergence_we_cap_pct")]
+    pub divergence_we_cap_pct: f64,
+    #[serde(default = "default_divergence_min_timeframes")]
+    pub divergence_min_timeframes: usize,
     pub n_positions: usize,
     pub total_wallet_exposure_limit: f64,
     pub wallet_exposure_limit: f64, // per-position base limit (without excess allowance)
@@ -693,6 +726,13 @@ impl Default for BotParams {
             hsl_orange_tier_mode: default_hsl_orange_tier_mode(),
             hsl_panic_close_order_type: default_hsl_panic_close_order_type(),
             risk_entry_cooldown_minutes: 0.0,
+            divergence_filter_enabled: false,
+            divergence_zscore_threshold: default_divergence_zscore_threshold(),
+            divergence_breadth_threshold_pct: default_divergence_breadth_threshold_pct(),
+            divergence_breadth_drop_pct: default_divergence_breadth_drop_pct(),
+            divergence_delay_multiplier: default_divergence_delay_multiplier(),
+            divergence_we_cap_pct: default_divergence_we_cap_pct(),
+            divergence_min_timeframes: default_divergence_min_timeframes(),
             n_positions: 0,
             total_wallet_exposure_limit: 0.0,
             wallet_exposure_limit: 0.0,

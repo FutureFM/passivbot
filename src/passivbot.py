@@ -41,6 +41,7 @@ from candlestick_manager import (
     OhlcvTerminalEmptyPage,
     fetch_candles_with_resolution_ladder,
 )
+from divergence_inputs import collect_divergence_rocs
 from fill_events_manager import (
     FillEventCacheContractError,
     FillEventsManager,
@@ -16709,6 +16710,7 @@ class Passivbot:
             "risk_twel_enforcer_threshold",
         }
         bool_keys = {
+            "divergence_filter_enabled",
             "risk_wel_enforcer_enabled",
             "risk_twel_enforcer_enabled",
             "risk_twel_entry_gate_enabled",
@@ -16766,6 +16768,13 @@ class Passivbot:
             "forager_volume_drop_pct",
             "forager_score_weights",
             "risk_entry_cooldown_minutes",
+            "divergence_filter_enabled",
+            "divergence_zscore_threshold",
+            "divergence_breadth_threshold_pct",
+            "divergence_breadth_drop_pct",
+            "divergence_delay_multiplier",
+            "divergence_we_cap_pct",
+            "divergence_min_timeframes",
             "n_positions",
             "total_wallet_exposure_limit",
             "wallet_exposure_limit",
@@ -16818,7 +16827,7 @@ class Passivbot:
                     "ema_readiness": float(val["ema_readiness"]),
                     "volatility": float(val["volatility"]),
                 }
-            elif key == "n_positions":
+            elif key in {"n_positions", "divergence_min_timeframes"}:
                 out[out_key] = int(round(val or 0.0))
             elif key in bool_keys:
                 out[out_key] = bool(val)
@@ -17261,6 +17270,11 @@ class Passivbot:
             "long": self._bot_params_to_rust_dict("long", None),
             "short": self._bot_params_to_rust_dict("short", None),
         }
+        divergence_rocs = (
+            await collect_divergence_rocs(self.cm, symbols, timestamp_ms)
+            if any(global_bp[side]["divergence_filter_enabled"] for side in ("long", "short"))
+            else {}
+        )
         # Effective hedge_mode = config setting AND exchange capability.
         # If either is False, we block same-coin hedging in the orchestrator.
         effective_hedge_mode = self._config_hedge_mode and self.hedge_mode
@@ -17371,6 +17385,7 @@ class Passivbot:
             input_dict["symbols"].append(
                 {
                     "symbol_idx": int(idx),
+                    "divergence_roc_pct": divergence_rocs.get(symbol, [None] * 4),
                     "order_book": {"bid": mprice, "ask": mprice},
                     "exchange": Passivbot._orchestrator_exchange_params(self, symbol),
                     "tradable": bool(active and not exchange_cooldown_blocks_symbol),
@@ -19848,6 +19863,11 @@ class Passivbot:
             "long": self._bot_params_to_rust_dict("long", None),
             "short": self._bot_params_to_rust_dict("short", None),
         }
+        divergence_rocs = (
+            await collect_divergence_rocs(self.cm, symbols, now_ms)
+            if any(global_bp[side]["divergence_filter_enabled"] for side in ("long", "short"))
+            else {}
+        )
         # Effective hedge_mode = config setting AND exchange capability.
         # If either is False, we block same-coin hedging in the orchestrator.
         effective_hedge_mode = self._config_hedge_mode and self.hedge_mode
@@ -19965,6 +19985,7 @@ class Passivbot:
             input_dict["symbols"].append(
                 {
                     "symbol_idx": int(idx),
+                    "divergence_roc_pct": divergence_rocs.get(symbol, [None] * 4),
                     "order_book": {"bid": bid, "ask": ask},
                     "exchange": Passivbot._orchestrator_exchange_params(self, symbol),
                     "tradable": tradable,

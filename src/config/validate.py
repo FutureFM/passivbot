@@ -78,6 +78,33 @@ def validate_config(
         )
         if entry_cooldown_minutes < 0.0:
             raise ValueError(f"bot.{pside}.risk.entry_cooldown_minutes must be >= 0.0")
+        divergence_enabled = get_grouped_bot_value(bot_side, "divergence_filter_enabled")
+        if not isinstance(divergence_enabled, bool):
+            raise ValueError(f"bot.{pside}.risk.divergence_filter_enabled must be a boolean")
+        divergence_ranges = {
+            "divergence_zscore_threshold": (0.0, None),
+            "divergence_breadth_threshold_pct": (0.0, 100.0),
+            "divergence_breadth_drop_pct": (0.0, None),
+            "divergence_delay_multiplier": (1.0, None),
+            "divergence_we_cap_pct": (0.0, 1.0),
+        }
+        for name, (minimum, maximum) in divergence_ranges.items():
+            value = get_grouped_bot_value(bot_side, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"bot.{pside}.risk.{name} must be numeric")
+            if not math.isfinite(value) or value < minimum or (
+                maximum is not None and value > maximum
+            ) or (name == "divergence_we_cap_pct" and value == 0.0):
+                raise ValueError(f"bot.{pside}.risk.{name} is outside its allowed range")
+        min_timeframes = get_grouped_bot_value(bot_side, "divergence_min_timeframes")
+        if (
+            isinstance(min_timeframes, bool)
+            or not isinstance(min_timeframes, (int, float))
+            or not math.isfinite(min_timeframes)
+            or not float(min_timeframes).is_integer()
+            or not 1 <= min_timeframes <= 4
+        ):
+            raise ValueError(f"bot.{pside}.risk.divergence_min_timeframes must be 1..4")
         normalize_we_excess_allowance_mode(
             get_grouped_bot_value(bot_side, "risk_we_excess_allowance_mode"),
             path=f"bot.{pside}.risk.we_excess_allowance_mode",

@@ -4,6 +4,10 @@ All notable user-facing changes will be documented in this file.
 
 ## Unreleased
 
+- Add optional cross-asset divergence protection to live trading and backtests. Isolated drops
+  reduce long exposure budgets and extend re-entry cooldowns; isolated pumps provide the same
+  protection for short positions. Each horizon requires at least three valid coins.
+
 - Add `pnl_by_coin.png` to backtest results: one cumulative realized net PnL curve
   per traded coin on a shared chart, combining long and short fills and including fees.
 

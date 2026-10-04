@@ -2391,6 +2391,13 @@ fn extract_optional_f64(dict: &PyDict, key: &str) -> PyResult<f64> {
     })
 }
 
+fn extract_optional_f64_or(dict: &PyDict, key: &str, default: f64) -> PyResult<f64> {
+    Ok(match dict.get_item(key)? {
+        Some(item) => item.extract::<f64>()?,
+        None => default,
+    })
+}
+
 fn extract_optional_bool(dict: &PyDict, key: &str, default: bool) -> PyResult<bool> {
     Ok(match dict.get_item(key)? {
         Some(item) => item.extract::<bool>()?,
@@ -2551,6 +2558,32 @@ fn bot_params_from_dict(dict: &PyDict) -> PyResult<BotParams> {
         hsl_orange_tier_mode,
         hsl_panic_close_order_type,
         risk_entry_cooldown_minutes: extract_optional_f64(dict, "risk_entry_cooldown_minutes")?,
+        divergence_filter_enabled: extract_optional_bool(dict, "divergence_filter_enabled", false)?,
+        divergence_zscore_threshold: extract_optional_f64_or(
+            dict,
+            "divergence_zscore_threshold",
+            2.0,
+        )?,
+        divergence_breadth_threshold_pct: extract_optional_f64_or(
+            dict,
+            "divergence_breadth_threshold_pct",
+            40.0,
+        )?,
+        divergence_breadth_drop_pct: extract_optional_f64_or(
+            dict,
+            "divergence_breadth_drop_pct",
+            1.0,
+        )?,
+        divergence_delay_multiplier: extract_optional_f64_or(
+            dict,
+            "divergence_delay_multiplier",
+            1.0,
+        )?,
+        divergence_we_cap_pct: extract_optional_f64_or(dict, "divergence_we_cap_pct", 1.0)?,
+        divergence_min_timeframes: match dict.get_item("divergence_min_timeframes")? {
+            Some(item) => item.extract::<usize>()?,
+            None => 2,
+        },
         n_positions,
         total_wallet_exposure_limit,
         wallet_exposure_limit,

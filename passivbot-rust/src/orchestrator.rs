@@ -415,6 +415,9 @@ mod core {
     #[serde(deny_unknown_fields)]
     pub struct SymbolInput {
         pub symbol_idx: usize,
+        /// Completed 1m close ROC in percent for 5/15/60/240 minute horizons.
+        #[serde(default)]
+        pub divergence_roc_pct: [Option<f64>; 4],
         pub order_book: OrderBook, // must have bid>0 and ask>0
         pub exchange: ExchangeParams,
         pub tradable: bool,
@@ -2651,6 +2654,7 @@ mod core {
         pside: PositionSide,
         cache: &mut [CachedSideDerived],
         runtime_budget: RuntimeBudgetState,
+        divergence_delay_multiplier: f64,
         wants_entries: bool,
         wants_closes: bool,
     ) -> Result<(Vec<IdealOrder>, Vec<IdealOrder>), OrchestratorError> {
@@ -2752,7 +2756,12 @@ mod core {
             pside,
             input.timestamp_ms,
             side.last_increase_fill_timestamp_ms,
-            side.bot_params.risk_entry_cooldown_minutes,
+            side.bot_params.risk_entry_cooldown_minutes
+                * if side.position.size != 0.0 {
+                    divergence_delay_multiplier
+                } else {
+                    1.0
+                },
             strategy_requires_sequential_entry_staging(&strategy_params),
         );
         let mut closes = Vec::new();
@@ -2766,6 +2775,7 @@ mod core {
         pside: PositionSide,
         cache: &mut [CachedSideDerived],
         runtime_budget: RuntimeBudgetState,
+        divergence_delay_multiplier: f64,
         wants_entries: bool,
         wants_closes: bool,
         diagnostics: &mut OrchestratorDiagnostics,
@@ -2792,6 +2802,7 @@ mod core {
                 pside,
                 cache,
                 runtime_budget,
+                divergence_delay_multiplier,
                 request_entries,
                 request_closes,
             ) {
@@ -3256,6 +3267,30 @@ mod core {
             PositionSide::Short,
             &mut workspace.runtime_budget_short,
         );
+        let divergence_enabled = input.symbols.iter().any(|s| {
+            s.long.bot_params.divergence_filter_enabled
+                || s.short.bot_params.divergence_filter_enabled
+        });
+        let (divergence_long, divergence_short) = if divergence_enabled {
+            let rocs: Vec<_> = input.symbols.iter().map(|s| s.divergence_roc_pct).collect();
+            let long_params: Vec<_> = input.symbols.iter().map(|s| &s.long.bot_params).collect();
+            let short_params: Vec<_> = input.symbols.iter().map(|s| &s.short.bot_params).collect();
+            (
+                crate::divergence::detect(&rocs, &long_params, false),
+                crate::divergence::detect(&rocs, &short_params, true),
+            )
+        } else {
+            (
+                vec![crate::divergence::DivergenceEffect::default(); n_symbols],
+                vec![crate::divergence::DivergenceEffect::default(); n_symbols],
+            )
+        };
+        for idx in 0..n_symbols {
+            workspace.runtime_budget_long[idx].effective_wallet_exposure_limit *=
+                divergence_long[idx].wallet_exposure_factor;
+            workspace.runtime_budget_short[idx].effective_wallet_exposure_limit *=
+                divergence_short[idx].wallet_exposure_factor;
+        }
         workspace
             .derived_long
             .resize_with(n_symbols, CachedSideDerived::default);
@@ -3671,6 +3706,7 @@ mod core {
                                 PositionSide::Long,
                                 &mut workspace.derived_long,
                                 workspace.runtime_budget_long[s.symbol_idx],
+                                divergence_long[s.symbol_idx].delay_multiplier,
                                 wants_entries,
                                 wants_closes,
                                 &mut diagnostics,
@@ -3767,6 +3803,7 @@ mod core {
                                 PositionSide::Short,
                                 &mut workspace.derived_short,
                                 workspace.runtime_budget_short[s.symbol_idx],
+                                divergence_short[s.symbol_idx].delay_multiplier,
                                 wants_entries,
                                 wants_closes,
                                 &mut diagnostics,
@@ -4571,6 +4608,7 @@ mod core {
 
             SymbolInput {
                 symbol_idx: idx,
+                divergence_roc_pct: [None; 4],
                 order_book: OrderBook {
                     bid: 100.0,
                     ask: 100.0,

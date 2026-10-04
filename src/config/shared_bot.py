@@ -8,6 +8,13 @@ BOT_SHARED_GROUPS = ("risk", "forager", "hsl", "unstuck")
 BOT_GROUP_FIELD_MAP = {
     "risk": {
         "entry_cooldown_minutes": "risk_entry_cooldown_minutes",
+        "divergence_filter_enabled": "divergence_filter_enabled",
+        "divergence_zscore_threshold": "divergence_zscore_threshold",
+        "divergence_breadth_threshold_pct": "divergence_breadth_threshold_pct",
+        "divergence_breadth_drop_pct": "divergence_breadth_drop_pct",
+        "divergence_delay_multiplier": "divergence_delay_multiplier",
+        "divergence_we_cap_pct": "divergence_we_cap_pct",
+        "divergence_min_timeframes": "divergence_min_timeframes",
         "n_positions": "n_positions",
         "total_wallet_exposure_limit": "total_wallet_exposure_limit",
         "total_exposure_entry_gate_enabled": "risk_twel_entry_gate_enabled",

@@ -1400,6 +1400,30 @@ impl<'a> Backtest<'a> {
         }
     }
 
+    fn divergence_roc_at(&self, k: usize, idx: usize) -> [Option<f64>; 4] {
+        if !self.bot_params_master.long.divergence_filter_enabled
+            && !self.bot_params_master.short.divergence_filter_enabled
+        {
+            return [None; 4];
+        }
+        std::array::from_fn(|tf| {
+            let bars_back = crate::divergence::HORIZONS_MINUTES[tf];
+            if k < bars_back
+                || !self.coin_is_valid_at(idx, k)
+                || !self.coin_is_valid_at(idx, k - bars_back)
+            {
+                return None;
+            }
+            let now = self.hlcvs_value(k, idx, CLOSE);
+            let previous = self.hlcvs_value(k - bars_back, idx, CLOSE);
+            if now.is_finite() && previous.is_finite() && now > 0.0 && previous > 0.0 {
+                Some((now / previous - 1.0) * 100.0)
+            } else {
+                None
+            }
+        })
+    }
+
     fn build_orchestrator_input_iter<I>(
         &mut self,
         k: usize,
@@ -1614,6 +1638,7 @@ impl<'a> Backtest<'a> {
 
                 orchestrator::SymbolInput {
                     symbol_idx: idx,
+                    divergence_roc_pct: self.divergence_roc_at(k, idx),
                     order_book,
                     exchange,
                     tradable,
@@ -1731,6 +1756,7 @@ impl<'a> Backtest<'a> {
 
         for sym in input.symbols.iter_mut() {
             let idx = sym.symbol_idx;
+            sym.divergence_roc_pct = self.divergence_roc_at(k, idx);
             let (start, end) = self.coin_valid_range(idx).unwrap_or((0, 0));
             let price_idx = k.clamp(start, end);
             let close_price = self.hlcvs_value(price_idx, idx, CLOSE).max(f64::EPSILON);
@@ -10946,6 +10972,68 @@ mod tests {
                 k
             );
         }
+    }
+
+    #[test]
+    fn divergence_uses_historical_close_at_matching_horizons() {
+        let mut hlcvs = Array3::from_shape_vec((241, 3, 4), vec![100.0; 241 * 3 * 4]).unwrap();
+        hlcvs[[240, 0, CLOSE]] = 1.0;
+        let btc_usd_prices = Array1::from_vec(vec![20_000.0; 241]);
+        let mut bp_pair = BotParamsPair::default();
+        bp_pair.long.n_positions = 1;
+        bp_pair.long.total_wallet_exposure_limit = 1.0;
+        bp_pair.long.wallet_exposure_limit = 1.0;
+        bp_pair.long.ema_span_0 = 10.0;
+        bp_pair.long.ema_span_1 = 20.0;
+        bp_pair.long.divergence_filter_enabled = true;
+        bp_pair.long.divergence_zscore_threshold = 1.0;
+        bp_pair.long.divergence_min_timeframes = 2;
+        let backtest_params = BacktestParams {
+            starting_balance: 1000.0,
+            maker_fee: 0.0,
+            taker_fee: 0.00055,
+            coins: vec!["A".into(), "B".into(), "C".into()],
+            active_coin_indices: None,
+            first_timestamp_ms: 0,
+            requested_start_timestamp_ms: 0,
+            first_valid_indices: vec![0; 3],
+            last_valid_indices: vec![240; 3],
+            warmup_minutes: vec![0; 3],
+            trade_start_indices: vec![0; 3],
+            global_warmup_bars: 0,
+            btc_collateral_cap: 0.0,
+            btc_collateral_ltv_cap: None,
+            metrics_only: true,
+            skip_btc_analysis: false,
+            filter_by_min_effective_cost: false,
+            dynamic_wel_by_tradability: true,
+            hedge_mode: true,
+            max_realized_loss_pct: 1.0,
+            pnls_max_lookback_days: 30.0,
+            liquidation_threshold: 0.05,
+            equity_hard_stop_loss: EquityHardStopLossConfig::default(),
+            market_orders_allowed: false,
+            market_order_near_touch_threshold: 0.001,
+            market_order_slippage_pct: 0.0005,
+            forager_score_hysteresis_pct: 0.0,
+            candle_interval_minutes: 1,
+        };
+        let mut bt = Backtest::new(
+            hlcvs.view(),
+            btc_usd_prices.view(),
+            vec![bp_pair.clone(); 3],
+            vec![ExchangeParams::default(); 3],
+            &backtest_params,
+        );
+        let input = bt.get_orchestrator_input_cached(240, None, None);
+        assert_eq!(input.symbols[0].divergence_roc_pct, [Some(-99.0); 4]);
+        assert_eq!(input.symbols[1].divergence_roc_pct, [Some(0.0); 4]);
+        let rocs: Vec<_> = input.symbols.iter().map(|s| s.divergence_roc_pct).collect();
+        let params: Vec<_> = input.symbols.iter().map(|s| &s.long.bot_params).collect();
+        assert_eq!(
+            crate::divergence::detect(&rocs, &params, false)[0].flagged_timeframes,
+            4
+        );
     }
 
     #[test]

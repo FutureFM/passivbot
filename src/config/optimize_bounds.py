@@ -34,6 +34,12 @@ SHARED_OPTIMIZE_LOCAL_TO_FLAT_KEY = {
     },
     "risk": {
         "entry_cooldown_minutes": "risk_entry_cooldown_minutes",
+        "divergence_zscore_threshold": "divergence_zscore_threshold",
+        "divergence_breadth_threshold_pct": "divergence_breadth_threshold_pct",
+        "divergence_breadth_drop_pct": "divergence_breadth_drop_pct",
+        "divergence_delay_multiplier": "divergence_delay_multiplier",
+        "divergence_we_cap_pct": "divergence_we_cap_pct",
+        "divergence_min_timeframes": "divergence_min_timeframes",
         "n_positions": "n_positions",
         "total_exposure_enforcer_threshold": "risk_twel_enforcer_threshold",
         "we_excess_allowance_pct": "risk_we_excess_allowance_pct",
