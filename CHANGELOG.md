@@ -4,6 +4,11 @@ All notable user-facing changes will be documented in this file.
 
 ## Unreleased
 
+- Add optional time-based position reductions for every strategy and both sides.
+  Stops complete a configured fraction with reduce-only market orders, may realize losses
+  beyond the cumulative loss budget, and reconstruct their clock and unfinished target
+  from exchange fills/orders after restart. HSL retains priority and manual mode is respected.
+
 - Allow entry cooldown to multiply or shrink after each position-increasing fill, with a
   configurable per-fill factor and a 24-hour total cap. Live reconstructs the fill count from
   exchange history after restart; incomplete position history defers new entries for that side.

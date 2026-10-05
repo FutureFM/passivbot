@@ -235,7 +235,7 @@ fn calc_grid_entry_long(
         return Order::default();
     }
     let reentry_price = calc_reentry_price_bid(
-        position.price,
+        runtime.entry_reference_price.unwrap_or(position.price),
         wallet_exposure,
         state.order_book.bid,
         exchange,
@@ -609,7 +609,7 @@ fn calc_grid_entry_short(
         return Order::default();
     }
     let reentry_price = calc_reentry_price_ask(
-        position.price,
+        runtime.entry_reference_price.unwrap_or(position.price),
         wallet_exposure,
         state.order_book.ask,
         exchange,
@@ -1926,6 +1926,7 @@ fn calc_entries_long(
     position: &Position,
     trailing: &TrailingPriceBundle,
 ) -> Vec<Order> {
+    let mut entry_runtime = *runtime;
     let mut entries = Vec::<Order>::new();
     let mut psize = position.size;
     let mut pprice = position.price;
@@ -1941,7 +1942,7 @@ fn calc_entries_long(
             exchange,
             &state_mod,
             bot,
-            runtime,
+            &entry_runtime,
             entry_params,
             &position_mod,
             trailing,
@@ -1978,6 +1979,7 @@ fn calc_entries_long(
         }
         (psize, pprice) =
             calc_new_psize_pprice(psize, pprice, entry.qty, entry.price, exchange.qty_step);
+        entry_runtime.entry_reference_price = None;
         bid = bid.min(entry.price);
         entries.push(entry);
     }
@@ -1993,6 +1995,7 @@ fn calc_entries_short(
     position: &Position,
     trailing: &TrailingPriceBundle,
 ) -> Vec<Order> {
+    let mut entry_runtime = *runtime;
     let mut entries = Vec::<Order>::new();
     let mut psize = position.size;
     let mut pprice = position.price;
@@ -2008,7 +2011,7 @@ fn calc_entries_short(
             exchange,
             &state_mod,
             bot,
-            runtime,
+            &entry_runtime,
             entry_params,
             &position_mod,
             trailing,
@@ -2045,6 +2048,7 @@ fn calc_entries_short(
         }
         (psize, pprice) =
             calc_new_psize_pprice(psize, pprice, entry.qty, entry.price, exchange.qty_step);
+        entry_runtime.entry_reference_price = None;
         ask = ask.max(entry.price);
         entries.push(entry);
     }
@@ -2181,6 +2185,7 @@ pub fn generate_orders(side: StrategySide, request: StrategyRequest<'_>) -> Gene
         _ => panic!("trailing_grid_v7 strategy received non-trailing_grid_v7 params"),
     };
     let runtime_context = RuntimeOrderContext {
+        entry_reference_price: request.entry_reference_price,
         effective_wallet_exposure_limit: request.runtime_budget.effective_wallet_exposure_limit,
     };
     let TrailingGridV7Params { entry, close, .. } = *params;
@@ -2537,6 +2542,7 @@ mod tests {
 
     fn runtime() -> RuntimeOrderContext {
         RuntimeOrderContext {
+            entry_reference_price: None,
             effective_wallet_exposure_limit: 1.0,
         }
     }

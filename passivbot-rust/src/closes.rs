@@ -855,6 +855,7 @@ mod tests {
 
     fn make_runtime_context() -> RuntimeOrderContext {
         RuntimeOrderContext {
+            entry_reference_price: None,
             effective_wallet_exposure_limit: 1.0,
         }
     }

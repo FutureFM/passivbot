@@ -642,6 +642,8 @@ pub struct Backtest<'a> {
     last_increase_fill_timestamp_short: Vec<Option<u64>>,
     entry_fill_count_long: Vec<u32>,
     entry_fill_count_short: Vec<u32>,
+    time_stop_long: Vec<Option<orchestrator::TimeStopState>>,
+    time_stop_short: Vec<Option<orchestrator::TimeStopState>>,
     pub total_wallet_exposures: Vec<f64>,
     // removed rolling_volume_sum & buffer — replaced by per-coin EMAs in `emas`
     equity_tracking_active: bool,
@@ -1657,6 +1659,7 @@ impl<'a> Backtest<'a> {
                         last_increase_fill_timestamp_ms: self.last_increase_fill_timestamp_long
                             [idx],
                         entry_fill_count: Some(self.entry_fill_count_long[idx]),
+                        time_stop: self.time_stop_long[idx].clone(),
                         bot_params: self.bot_params[idx].long.clone(),
                         strategy_params: None,
                         parsed_strategy_params: Some(self.strategy_params[idx].long),
@@ -1670,6 +1673,7 @@ impl<'a> Backtest<'a> {
                         last_increase_fill_timestamp_ms: self.last_increase_fill_timestamp_short
                             [idx],
                         entry_fill_count: Some(self.entry_fill_count_short[idx]),
+                        time_stop: self.time_stop_short[idx].clone(),
                         bot_params: self.bot_params[idx].short.clone(),
                         strategy_params: None,
                         parsed_strategy_params: Some(self.strategy_params[idx].short),
@@ -1799,9 +1803,11 @@ impl<'a> Backtest<'a> {
             sym.short.trailing = self.trailing_prices.short[idx].clone();
             sym.long.last_increase_fill_timestamp_ms = self.last_increase_fill_timestamp_long[idx];
             sym.long.entry_fill_count = Some(self.entry_fill_count_long[idx]);
+            sym.long.time_stop = self.time_stop_long[idx].clone();
             sym.short.last_increase_fill_timestamp_ms =
                 self.last_increase_fill_timestamp_short[idx];
             sym.short.entry_fill_count = Some(self.entry_fill_count_short[idx]);
+            sym.short.time_stop = self.time_stop_short[idx].clone();
 
             sym.long.runtime_budget = Some(self.runtime_budget[idx].long.clone());
             sym.short.runtime_budget = Some(self.runtime_budget[idx].short.clone());
@@ -2315,6 +2321,8 @@ impl<'a> Backtest<'a> {
             last_increase_fill_timestamp_short: vec![None; n_coins],
             entry_fill_count_long: vec![0; n_coins],
             entry_fill_count_short: vec![0; n_coins],
+            time_stop_long: vec![None; n_coins],
+            time_stop_short: vec![None; n_coins],
             total_wallet_exposures: Vec::with_capacity(n_timesteps),
             equity_tracking_active: false,
             debug_writer: if DEBUG_DUMP_ORDERS {
@@ -4425,10 +4433,18 @@ impl<'a> Backtest<'a> {
         if new_psize == 0.0 {
             self.positions.long[idx] = Position::default();
             self.entry_fill_count_long[idx] = 0;
+            self.time_stop_long[idx] = None;
         } else {
             self.positions.long[idx].size = new_psize;
         }
         let timestamp_ms = self.first_timestamp_ms + (k as u64) * self.interval_ms;
+        if new_psize != 0.0 && close_fill.order_type == OrderType::CloseTimeStopLong {
+            self.time_stop_long[idx] = Some(orchestrator::TimeStopState {
+                anchor_timestamp_ms: timestamp_ms,
+                pending_target_size: None,
+                grid_ref_price: Some(exec.price),
+            });
+        }
         let wallet_exposure = if new_psize != 0.0 {
             calc_wallet_exposure(
                 self.exchange_params_list[idx].c_mult,
@@ -4525,10 +4541,18 @@ impl<'a> Backtest<'a> {
         if new_psize == 0.0 {
             self.positions.short[idx] = Position::default();
             self.entry_fill_count_short[idx] = 0;
+            self.time_stop_short[idx] = None;
         } else {
             self.positions.short[idx].size = new_psize;
         }
         let timestamp_ms = self.first_timestamp_ms + (k as u64) * self.interval_ms;
+        if new_psize != 0.0 && order.order_type == OrderType::CloseTimeStopShort {
+            self.time_stop_short[idx] = Some(orchestrator::TimeStopState {
+                anchor_timestamp_ms: timestamp_ms,
+                pending_target_size: None,
+                grid_ref_price: Some(exec.price),
+            });
+        }
         let wallet_exposure = if new_psize != 0.0 {
             calc_wallet_exposure(
                 self.exchange_params_list[idx].c_mult,
@@ -4601,6 +4625,15 @@ impl<'a> Backtest<'a> {
             exec.price,
             self.exchange_params_list[idx].qty_step,
         );
+        if self.positions.long[idx].size == 0.0 {
+            self.time_stop_long[idx] = Some(orchestrator::TimeStopState {
+                anchor_timestamp_ms: self.first_timestamp_ms + k as u64 * self.interval_ms,
+                pending_target_size: None,
+                grid_ref_price: None,
+            });
+        } else if let Some(state) = self.time_stop_long[idx].as_mut() {
+            state.grid_ref_price = None;
+        }
         self.positions.long[idx].size = new_psize;
         self.positions.long[idx].price = new_pprice;
         let timestamp_ms = self.first_timestamp_ms + (k as u64) * self.interval_ms;
@@ -4675,6 +4708,15 @@ impl<'a> Backtest<'a> {
             exec.price,
             self.exchange_params_list[idx].qty_step,
         );
+        if self.positions.short[idx].size == 0.0 {
+            self.time_stop_short[idx] = Some(orchestrator::TimeStopState {
+                anchor_timestamp_ms: self.first_timestamp_ms + k as u64 * self.interval_ms,
+                pending_target_size: None,
+                grid_ref_price: None,
+            });
+        } else if let Some(state) = self.time_stop_short[idx].as_mut() {
+            state.grid_ref_price = None;
+        }
         self.positions.short[idx].size = new_psize;
         self.positions.short[idx].price = new_pprice;
         let wallet_exposure = if new_psize != 0.0 {

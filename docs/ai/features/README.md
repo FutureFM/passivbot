@@ -17,6 +17,7 @@ Open only the contract for the subsystem being changed.
 | Trailing diagnostics tool | `trailing_diagnostics.md` |
 | Historical daily coin selection (Organillo) | `historical_selection.md` |
 | Strategy schema and Rust runtime | `strategy_runtime.md` |
+| Time-based position reductions | `time_stop.md` |
 | Cross-asset divergence protection | `divergence_protection.md` |
 
 Feature contracts contain current invariants, failure semantics, non-obvious edge cases,

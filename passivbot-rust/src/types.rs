@@ -555,6 +555,10 @@ impl ForagerScoreWeights {
 fn default_divergence_zscore_threshold() -> f64 {
     2.0
 }
+fn default_time_stop_one() -> f64 {
+    1.0
+}
+
 fn default_entry_cooldown_factor_per_fill() -> f64 {
     1.0
 }
@@ -652,6 +656,17 @@ pub struct BotParams {
     pub hsl_panic_close_order_type: String,
     #[serde(default)]
     pub risk_entry_cooldown_minutes: f64,
+    #[serde(default)]
+    pub risk_time_stop_max_age_days: f64,
+    #[serde(default = "default_time_stop_one")]
+    pub risk_time_stop_close_pct: f64,
+    #[serde(default)]
+    pub risk_time_stop_we_trigger_pct: f64,
+    #[serde(default)]
+    pub risk_time_stop_close_we_min: f64,
+    #[serde(default = "default_time_stop_one")]
+    pub risk_time_stop_close_we_max: f64,
+
     #[serde(default = "default_entry_cooldown_factor_per_fill")]
     pub risk_entry_cooldown_factor_per_fill: f64,
     #[serde(default = "default_entry_cooldown_max_minutes")]
@@ -736,6 +751,12 @@ impl Default for BotParams {
             hsl_orange_tier_mode: default_hsl_orange_tier_mode(),
             hsl_panic_close_order_type: default_hsl_panic_close_order_type(),
             risk_entry_cooldown_minutes: 0.0,
+            risk_time_stop_max_age_days: 0.0,
+            risk_time_stop_close_pct: 1.0,
+            risk_time_stop_we_trigger_pct: 0.0,
+            risk_time_stop_close_we_min: 0.0,
+            risk_time_stop_close_we_max: 1.0,
+
             risk_entry_cooldown_factor_per_fill: default_entry_cooldown_factor_per_fill(),
             risk_entry_cooldown_max_minutes: default_entry_cooldown_max_minutes(),
             divergence_filter_enabled: false,
@@ -769,6 +790,7 @@ impl Default for BotParams {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RuntimeOrderContext {
     pub effective_wallet_exposure_limit: f64,
+    pub entry_reference_price: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -842,6 +864,8 @@ pub enum OrderType {
     CloseEmaAnchorLong = 27,
     EntryEmaAnchorShort = 28,
     CloseEmaAnchorShort = 29,
+    CloseTimeStopLong = 30,
+    CloseTimeStopShort = 31,
 
     Empty = 65535,
 }
@@ -878,6 +902,7 @@ impl OrderType {
                 | ClosePanicLong
                 | EntryEmaAnchorLong
                 | CloseEmaAnchorLong
+                | CloseTimeStopLong
         )
     }
 
@@ -923,7 +948,9 @@ impl OrderType {
                 | CloseAutoReduceWelLong
                 | CloseAutoReduceWelShort
                 | CloseEmaAnchorLong
+                | CloseTimeStopLong
                 | CloseEmaAnchorShort
+                | CloseTimeStopShort
         )
     }
 }

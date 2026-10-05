@@ -525,6 +525,7 @@ mod tests {
         let position = Position::default();
         let trailing = TrailingPriceBundle::default();
         let request = StrategyRequest {
+            entry_reference_price: None,
             wants_entries: true,
             wants_closes: false,
             exchange: &exchange,
@@ -700,6 +701,7 @@ mod tests {
         let position = Position::default();
         let trailing = TrailingPriceBundle::default();
         let request = StrategyRequest {
+            entry_reference_price: None,
             wants_entries: true,
             wants_closes: true,
             exchange: &exchange,
@@ -774,6 +776,7 @@ mod tests {
         };
 
         let flat_request = StrategyRequest {
+            entry_reference_price: None,
             wants_entries: true,
             wants_closes: false,
             exchange: &exchange,
@@ -787,6 +790,7 @@ mod tests {
             peek: None,
         };
         let long_request = StrategyRequest {
+            entry_reference_price: None,
             wants_entries: true,
             wants_closes: false,
             exchange: &exchange,
@@ -800,6 +804,7 @@ mod tests {
             peek: None,
         };
         let opposite_request = StrategyRequest {
+            entry_reference_price: None,
             wants_entries: true,
             wants_closes: false,
             exchange: &exchange,

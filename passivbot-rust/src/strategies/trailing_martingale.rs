@@ -44,6 +44,7 @@ pub fn generate_orders(side: StrategySide, request: StrategyRequest<'_>) -> Gene
         _ => panic!("trailing_martingale strategy received non-trailing_martingale params"),
     };
     let runtime_context = RuntimeOrderContext {
+        entry_reference_price: request.entry_reference_price,
         effective_wallet_exposure_limit: request.runtime_budget.effective_wallet_exposure_limit,
     };
     let entry_params = params.entry_params();
@@ -380,6 +381,7 @@ mod tests {
         next_high: f64,
     ) -> StrategyRequest<'a> {
         StrategyRequest {
+            entry_reference_price: None,
             wants_entries: false,
             wants_closes: true,
             exchange,

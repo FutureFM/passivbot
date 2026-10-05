@@ -158,6 +158,7 @@ from utils import (
 )
 from prettytable import PrettyTable
 from uuid import uuid4
+from time_stop import reconstruct_episodes, decode_target, time_stop_type_id
 from copy import deepcopy
 from dataclasses import dataclass
 from collections import defaultdict, Counter
@@ -292,6 +293,9 @@ def custom_id_to_snake(custom_id) -> str:
 
 def try_decode_type_id_from_custom_id(custom_id: str) -> int | None:
     """Extract the 16-bit order type id encoded in a custom order id string."""
+    temporal_id = time_stop_type_id(custom_id)
+    if temporal_id is not None:
+        return temporal_id
     # 1) Preferred: look for "...0x<4-hex>..." anywhere
     m = _TYPE_MARKER_RE.search(custom_id)
     if m:
@@ -308,7 +312,7 @@ def try_decode_type_id_from_custom_id(custom_id: str) -> int | None:
 def custom_id_has_explicit_passivbot_marker(custom_id) -> bool:
     """Return True only when the custom id contains the explicit 0xABCD Passivbot marker."""
     try:
-        return bool(_TYPE_MARKER_RE.search(str(custom_id)))
+        return time_stop_type_id(custom_id) is not None or bool(_TYPE_MARKER_RE.search(str(custom_id)))
     except Exception:
         return False
 
@@ -13792,55 +13796,85 @@ class Passivbot:
         if not needed or self._pnls_manager is None:
             return out
 
-        counts = {key: 0 for key in needed}
-        known = {key: False for key in needed}
-        last_sizes = {key: 0.0 for key in needed}
-        episode_starts: dict[tuple[str, str], int] = {}
-        for event in self._pnls_manager.get_events():
-            key = (str(event.symbol), str(event.position_side).lower())
-            if key not in needed:
-                continue
-            symbol, pside = key
-            multiplier = float(getattr(event, "c_mult", 1.0) or 1.0)
-            delta = float(event.qty) * multiplier * (1.0 if pside == "long" else -1.0)
-            after = float(event.psize)
-            if not math.isfinite(after) or not math.isfinite(delta) or after < 0.0:
-                continue
-            step = float(self.qty_steps.get(symbol, 0.0) or 0.0)
-            epsilon = max(step * multiplier * 0.5, 1e-9)
-            before = after - delta
-            if after <= epsilon:
-                counts[key] = 0
-                known[key] = True
-                episode_starts.pop(key, None)
-            elif before <= epsilon and delta > 0.0:
-                counts[key] = 1
-                known[key] = True
-                episode_starts[key] = int(event.timestamp)
-            elif delta > 0.0 and known[key]:
-                counts[key] += 1
-            last_sizes[key] = after
+        facts = reconstruct_episodes(
+            self._pnls_manager.get_events(), self.positions, self.qty_steps, self.c_mults,
+            self._fill_history_coverage_status, needed,
+        )
+        for (symbol, pside), fact in facts.items():
+            if fact is not None:
+                out[symbol][pside] = fact["count"]
+        return out
 
-        for key in needed:
-            symbol, pside = key
-            current = abs(float(self.positions[symbol][pside]["size"]))
-            multiplier = float(self.c_mults.get(symbol, 1.0) or 1.0)
-            epsilon = max(float(self.qty_steps.get(symbol, 0.0) or 0.0) * multiplier, 1e-8)
-            if not (
-                known[key]
-                and counts[key] > 0
-                and abs(last_sizes[key] - current * multiplier) <= epsilon
-            ):
-                continue
-            # A truncated cache can start with an apparent opening fill and
-            # still match the exchange position by coincidence. Require the
-            # exchange-backed coverage record to precede that opening fill.
-            start_ms = episode_starts.get(key)
-            if start_ms is None:
-                continue
-            coverage = self._fill_history_coverage_status(start_ms=max(0, start_ms - 1))
-            if bool(coverage.get("ready", False)):
-                out[symbol][pside] = counts[key]
+    def _get_time_stop_states(self, symbols):
+        out = {symbol: {"long": None, "short": None} for symbol in symbols}
+        needed = {
+            (symbol, pside) for symbol in symbols for pside in ("long", "short")
+            if abs(float(self.positions.get(symbol, {}).get(pside, {}).get("size", 0))) > 0
+            and float(self.bp(pside, "risk_time_stop_max_age_days", symbol)) > 0
+            and float(self.bp(pside, "risk_time_stop_close_pct", symbol)) > 0
+        }
+        if not needed:
+            self._time_stop_missing_evidence_signature = ()
+            return out
+        if self._pnls_manager is None:
+            self._time_stop_missing_evidence_signature = tuple(sorted(needed))
+            return out
+        facts = reconstruct_episodes(
+            self._pnls_manager.get_events(), self.positions, self.qty_steps, self.c_mults,
+            self._fill_history_coverage_status, needed, time_stop_keys=needed,
+        )
+        missing = {}
+        for symbol, pside in needed:
+            fact = facts[(symbol, pside)]
+            state = fact["time_stop"] if fact is not None else None
+            if state is not None:
+                open_target = None
+                for order in self.open_orders.get(symbol, []):
+                    if order.get("position_side") != pside:
+                        continue
+                    cid = self._extract_order_custom_id(order)
+                    if custom_id_to_snake(cid) != f"close_time_stop_{pside}":
+                        continue
+                    created = order.get("timestamp")
+                    if (isinstance(created, bool) or not isinstance(created, (int, float))
+                            or not math.isfinite(created)):
+                        state = None
+                        break
+                    if created < fact["opened_timestamp_ms"]:
+                        continue  # stale order from an already-flat episode
+                    try:
+                        target = decode_target(cid, pside)
+                    except ValueError:
+                        state = None
+                        break
+                    current = abs(float(self.positions[symbol][pside]["size"]))
+                    if target < current:
+                        pending = state["pending_target_size"]
+                        if ((pending is not None and target > pending + 1e-10)
+                                or (open_target is not None and not math.isclose(
+                                    target, open_target, rel_tol=0, abs_tol=1e-10))):
+                            state = None
+                            break
+                        # A retry may lower the target to satisfy exchange minimums.
+                        open_target = target
+                        state["pending_target_size"] = target
+            out[symbol][pside] = state
+            if state is None:
+                missing.setdefault(symbol, {"long": 0, "short": 0})[pside] = None
+        if missing:
+            now_ms = int(self.get_exchange_time())
+            signature = tuple(sorted((symbol, side) for symbol, sides in missing.items()
+                                     for side, value in sides.items() if value is None))
+            if (signature != getattr(self, "_time_stop_missing_evidence_signature", ())
+                    or now_ms - getattr(self, "_time_stop_missing_evidence_logged_ms", 0) >= 300_000):
+                logging.warning(
+                    "[time_stop] history or order attribution unavailable for %d held sides; "
+                    "deferring temporal closes and entries", len(signature),
+                )
+                self._time_stop_missing_evidence_logged_ms = now_ms
+            self._time_stop_missing_evidence_signature = signature
+        else:
+            self._time_stop_missing_evidence_signature = ()
         return out
 
     def _schedule_entry_fill_count_history_repair(
@@ -13896,8 +13930,8 @@ class Passivbot:
                     await self._pnls_manager.refresh_for_lookback(start_ms=start_ms)
             except Exception:
                 logging.exception(
-                    "[fills] unable to reconstruct entry cooldown fill count; "
-                    "entries remain deferred for %s",
+                    "[fills] unable to reconstruct position episode history; "
+                    "history-dependent entries and time stops remain deferred for %s",
                     missing,
                 )
 
@@ -16914,6 +16948,13 @@ class Passivbot:
             "forager_volume_drop_pct",
             "forager_score_weights",
             "risk_entry_cooldown_minutes",
+            "risk_entry_cooldown_factor_per_fill",
+            "risk_entry_cooldown_max_minutes",
+            "risk_time_stop_max_age_days",
+            "risk_time_stop_close_pct",
+            "risk_time_stop_we_trigger_pct",
+            "risk_time_stop_close_we_min",
+            "risk_time_stop_close_we_max",
             "divergence_filter_enabled",
             "divergence_zscore_threshold",
             "divergence_breadth_threshold_pct",
@@ -17397,6 +17438,7 @@ class Passivbot:
         realized_pnl_cumsum = snapshot.get("realized_pnl_cumsum", {"max": 0.0, "last": 0.0})
         last_increase_fill_timestamps = snapshot.get("last_increase_fill_timestamps", {})
         entry_fill_counts = snapshot.get("entry_fill_counts", {})
+        time_stop_states = snapshot.get("time_stop_states", {})
         max_realized_loss_pct = float(Passivbot._live_max_realized_loss_pct(self))
         if hasattr(self, "_build_orchestrator_mode_overrides"):
             mode_overrides = self._build_orchestrator_mode_overrides(symbols)
@@ -17505,6 +17547,7 @@ class Passivbot:
                     "trailing_available": trailing_available,
                     "last_increase_fill_timestamp_ms": last_increase_fill_timestamps.get(symbol, {}).get(pside),
                     "entry_fill_count": entry_fill_counts.get(symbol, {}).get(pside),
+                    "time_stop": time_stop_states.get(symbol, {}).get(pside),
                     "bot_params": self._bot_params_to_rust_dict(pside, symbol),
                     "strategy_params": self._strategy_params_to_rust_dict(pside, symbol),
                 }
@@ -17616,6 +17659,8 @@ class Passivbot:
                 execution_type,
                 execution_priority,
             )
+            if order_type.startswith("close_time_stop_"):
+                tup = (*tup, float(o["time_stop_target_size"]))
             ideal_orders.setdefault(symbol, []).append(tup)
 
         # Log unstuck coin selection
@@ -20006,7 +20051,11 @@ class Passivbot:
             fill_increase_timestamps, delta_increase_timestamps
         )
         entry_fill_counts = self._get_entry_fill_counts(symbols)
-        self._schedule_entry_fill_count_history_repair(entry_fill_counts, now_ms)
+        time_stop_states = self._get_time_stop_states(symbols)
+        repair_counts = {symbol: dict(sides) for symbol, sides in entry_fill_counts.items()}
+        for symbol, pside in getattr(self, "_time_stop_missing_evidence_signature", ()):
+            repair_counts.setdefault(symbol, {"long": 0, "short": 0})[pside] = None
+        self._schedule_entry_fill_count_history_repair(repair_counts, now_ms)
         max_realized_loss_pct = float(Passivbot._live_max_realized_loss_pct(self))
 
         global_bp = {
@@ -20107,6 +20156,7 @@ class Passivbot:
                     "trailing_available": trailing_available,
                     "last_increase_fill_timestamp_ms": last_increase_fill_timestamps.get(symbol, {}).get(pside),
                     "entry_fill_count": entry_fill_counts.get(symbol, {}).get(pside),
+                    "time_stop": time_stop_states.get(symbol, {}).get(pside),
                     "bot_params": self._bot_params_to_rust_dict(pside, symbol),
                     "strategy_params": self._strategy_params_to_rust_dict(pside, symbol),
                 }
@@ -20286,6 +20336,8 @@ class Passivbot:
                 execution_type,
                 execution_priority,
             )
+            if order_type.startswith("close_time_stop_"):
+                tup = (*tup, float(o["time_stop_target_size"]))
             ideal_orders.setdefault(symbol, []).append(tup)
 
         # Log unstuck coin selection
@@ -20328,6 +20380,7 @@ class Passivbot:
                 "realized_pnl_cumsum": realized_pnl_cumsum,
                 "last_increase_fill_timestamps": last_increase_fill_timestamps,
                 "entry_fill_counts": entry_fill_counts,
+                "time_stop_states": time_stop_states,
                 "planning_snapshot": (
                     planning_snapshot.to_dict()
                     if planning_snapshot is not None
