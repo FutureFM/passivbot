@@ -27,6 +27,8 @@ All notable user-facing changes will be documented in this file.
 - Allow entry cooldown to multiply or shrink after each position-increasing fill, with a
   configurable per-fill factor and a 24-hour total cap. Live reconstructs the fill count from
   exchange history after restart; incomplete position history defers new entries for that side.
+  Optimizer bounds for the factor and cap are optional: when omitted, the configured values stay
+  fixed instead of the bounds being dropped during config loading.
 
 - Add optional cross-asset divergence protection to live trading and backtests. Isolated drops
   reduce long exposure budgets and extend re-entry cooldowns; isolated pumps provide the same

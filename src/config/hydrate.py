@@ -40,11 +40,14 @@ TEMPLATE_SYNC_PRESERVE_PATHS: tuple[Path, ...] = (
     ("backtest", "market_settings_sources"),
     *tuple(PARTIALLY_OPEN_CONFIG_PATHS),
 )
-_DIVERGENCE_OPTIMIZE_BOUND_PATHS: tuple[Path, ...] = tuple(
+# Risk bounds without template defaults are optional: when present they are tuned, and when
+# absent the bot value stays fixed. Without this, sync would silently drop user bounds.
+_OPTIONAL_RISK_BOUND_KEYS = ("entry_cooldown_factor_per_fill", "entry_cooldown_max_minutes")
+_OPTIONAL_OPTIMIZE_BOUND_PATHS: tuple[Path, ...] = tuple(
     (pside, "risk", key)
     for pside in ("long", "short")
     for key in SHARED_OPTIMIZE_LOCAL_TO_FLAT_KEY["risk"]
-    if key.startswith("divergence_")
+    if key.startswith("divergence_") or key in _OPTIONAL_RISK_BOUND_KEYS
 )
 
 
@@ -139,7 +142,7 @@ def sync_with_template(
         preserve=(
             TEMPLATE_SYNC_PRESERVE_PATHS
             + tuple(preserved_live_optimize_bounds)
-            + tuple(("optimize", "bounds", *path) for path in _DIVERGENCE_OPTIMIZE_BOUND_PATHS)
+            + tuple(("optimize", "bounds", *path) for path in _OPTIONAL_OPTIMIZE_BOUND_PATHS)
         ),
         tracker=tracker,
     )
@@ -148,7 +151,7 @@ def sync_with_template(
         template["optimize"]["bounds"],
         result["optimize"]["bounds"],
         verbose=verbose,
-        preserve=_DIVERGENCE_OPTIMIZE_BOUND_PATHS,
+        preserve=_OPTIONAL_OPTIMIZE_BOUND_PATHS,
         tracker=tracker,
     )
     remove_unused_keys_recursively(

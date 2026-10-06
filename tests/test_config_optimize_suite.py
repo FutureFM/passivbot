@@ -214,3 +214,22 @@ def test_legacy_combine_ohlcvs_removed():
     assert "combine_ohlcvs" not in formatted["backtest"]
     # volume_normalization should exist
     assert "volume_normalization" in formatted["backtest"]
+
+
+def test_optional_entry_cooldown_bounds_survive_config_roundtrip():
+    config = get_template_config()
+    bounds = {
+        "entry_cooldown_factor_per_fill": [1.0, 2.0, 0.05],
+        "entry_cooldown_max_minutes": [60.0, 1440.0, 60.0],
+    }
+    config["optimize"]["bounds"]["long"]["risk"].update(bounds)
+
+    formatted = format_config(config, verbose=False)
+
+    assert {
+        key: formatted["optimize"]["bounds"]["long"]["risk"][key] for key in bounds
+    } == bounds
+    key_paths = dict(get_optimization_key_paths(formatted))
+    for key in bounds:
+        assert key_paths[f"long_risk_{key}"] == ("bot", "long", "risk", key)
+    assert "entry_cooldown_factor_per_fill" not in formatted["optimize"]["bounds"]["short"]["risk"]
