@@ -608,3 +608,12 @@ def test_future_coin_indicator_spans_cannot_delay_past_trading(tmp_path):
     np.testing.assert_array_equal(past_fills[0], past_fills[1])
     np.testing.assert_array_equal(results[0][1][results[0][1][:, 0] < cutoff],
                                   results[1][1][results[1][1][:, 0] < cutoff])
+
+
+def test_optimizer_float_integer_params_reach_rust_backtest(tmp_path):
+    # Optimizer candidates carry integer-valued bounds as floats (e.g. 2.0).
+    cfg = config_for(carton(tmp_path))
+    for side in ('long', 'short'):
+        cfg['bot'][side]['risk'].update(divergence_filter_enabled=True,
+            divergence_extended_horizons=True, divergence_min_timeframes=2.0)
+    run(prepare_config(cfg))

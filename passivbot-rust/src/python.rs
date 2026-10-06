@@ -2612,8 +2612,17 @@ fn bot_params_from_dict(dict: &PyDict) -> PyResult<BotParams> {
             1.0,
         )?,
         divergence_we_cap_pct: extract_optional_f64_or(dict, "divergence_we_cap_pct", 1.0)?,
+        // Optimizer candidates carry integer-valued bounds as floats; accept them like n_positions.
         divergence_min_timeframes: match dict.get_item("divergence_min_timeframes")? {
-            Some(item) => item.extract::<usize>()?,
+            Some(item) => {
+                let value = item.extract::<f64>()?;
+                if !value.is_finite() || value < 0.0 {
+                    return Err(PyValueError::new_err(format!(
+                        "divergence_min_timeframes must be a finite non-negative number; got {value}"
+                    )));
+                }
+                value.round() as usize
+            }
             None => 2,
         },
         divergence_extended_horizons: extract_optional_bool(
