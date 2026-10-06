@@ -2465,6 +2465,7 @@ mod core {
         symbol: &SymbolInput,
         pside: PositionSide,
         budget: RuntimeBudgetState,
+        cap_wallet_exposure_limit: f64,
     ) -> Result<Option<IdealOrder>, OrchestratorError> {
         let side = symbol_side_input(symbol, pside);
         let bp = &side.bot_params;
@@ -2552,8 +2553,8 @@ mod core {
             } else {
                 let mut amount = full * bp.risk_time_stop_close_pct;
                 let cap = bp.risk_time_stop_close_we_max;
-                if cap > 0.0 && cap < 1.0 && wel > 0.0 && we > 0.0 {
-                    amount = amount.min(full * cap * wel / we);
+                if cap > 0.0 && cap < 1.0 && cap_wallet_exposure_limit > 0.0 && we > 0.0 {
+                    amount = amount.min(full * cap * cap_wallet_exposure_limit / we);
                 }
                 amount
             }
@@ -3528,6 +3529,18 @@ mod core {
                 vec![crate::divergence::DivergenceEffect::default(); n_symbols],
             )
         };
+        // Divergence shrinks the entry budget; it must not also shrink the time-stop
+        // reduction cap, which would weaken a temporal close exactly when protection is active.
+        let time_stop_cap_wel_long: Vec<f64> = workspace
+            .runtime_budget_long
+            .iter()
+            .map(|budget| budget.effective_wallet_exposure_limit)
+            .collect();
+        let time_stop_cap_wel_short: Vec<f64> = workspace
+            .runtime_budget_short
+            .iter()
+            .map(|budget| budget.effective_wallet_exposure_limit)
+            .collect();
         for idx in 0..n_symbols {
             workspace.runtime_budget_long[idx].effective_wallet_exposure_limit *=
                 divergence_long[idx].wallet_exposure_factor;
@@ -3944,6 +3957,7 @@ mod core {
                         s,
                         PositionSide::Long,
                         workspace.runtime_budget_long[s.symbol_idx],
+                        time_stop_cap_wel_long[s.symbol_idx],
                     )?
                 } else {
                     None
@@ -4059,6 +4073,7 @@ mod core {
                         s,
                         PositionSide::Short,
                         workspace.runtime_budget_short[s.symbol_idx],
+                        time_stop_cap_wel_short[s.symbol_idx],
                     )?
                 } else {
                     None
@@ -5142,6 +5157,7 @@ mod core {
                 &input.symbols[0],
                 PositionSide::Long,
                 RuntimeBudgetState::default(),
+                0.0,
             )
             .unwrap()
             .unwrap();
@@ -5175,7 +5191,8 @@ mod core {
                 &input,
                 &input.symbols[0],
                 PositionSide::Long,
-                RuntimeBudgetState::default()
+                RuntimeBudgetState::default(),
+                0.0
             )
             .is_err());
         }

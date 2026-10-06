@@ -4,6 +4,14 @@ All notable user-facing changes will be documented in this file.
 
 ## Unreleased
 
+- Cap `ema_anchor` entries at the per-position exposure limit (WEL including excess
+  allowance), matching the grid strategies. The inventory-scaled double-down could previously
+  push a single position far above its limit during a sustained drop. Divergence protection's
+  reduced WEL now also limits `ema_anchor` entries. Existing `ema_anchor` backtest results change.
+
+- Time-stop partial reductions capped by `time_stop_close_we_max` no longer shrink when
+  divergence protection lowers the WEL of the same coin.
+
 - Add optional time-based position reductions for every strategy and both sides.
   Stops complete a configured fraction with reduce-only market orders, may realize losses
   beyond the cumulative loss budget, and reconstruct their clock and unfinished target

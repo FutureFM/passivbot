@@ -9,7 +9,7 @@ and optimizer bounds. The feature is disabled by default and applies to every st
 | `time_stop_close_pct` | 1 | Position fraction to close, 0–1. Zero disables; one flattens. |
 | `time_stop_we_trigger_pct` | 0 | Require current WE to reach this fraction of effective WEL before starting a reduction. |
 | `time_stop_close_we_min` | 0 | When positive and current WE is at or below this fraction of WEL, close the full position. |
-| `time_stop_close_we_max` | 1 | Cap a partial reduction at this fraction of WEL. Zero and one disable the cap. |
+| `time_stop_close_we_max` | 1 | Cap a partial reduction at this fraction of WEL. Divergence protection does not lower this cap. Zero and one disable the cap. |
 
 For example, these long-side settings request a 25% reduction every seven days,
 provided exposure reaches half its effective limit:

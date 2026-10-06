@@ -59,6 +59,24 @@ def test_pct_min_max_precedence(pct, minimum, cap, expected):
     assert sum(abs(o['qty']) for o in stops) == expected
 
 
+def test_divergence_wel_reduction_does_not_shrink_time_stop_cap():
+    import passivbot_rust as pbr
+    protection = dict(divergence_filter_enabled=True, divergence_zscore_threshold=1.,
+                      divergence_breadth_threshold_pct=40., divergence_breadth_drop_pct=1.,
+                      divergence_min_timeframes=2, divergence_we_cap_pct=.5)
+    inp = stop_input(pct=.5, risk_time_stop_close_we_max=.1, **protection)
+    for i in (1, 2):
+        other = make_symbol(i, bid=90., ask=91., long_mode='manual', long_bp=protection)
+        for pside in ('long', 'short'):
+            other[pside]['strategy_params'] = copy.deepcopy(inp['symbols'][0][pside]['strategy_params'])
+        inp['symbols'].append(other)
+    for i, symbol in enumerate(inp['symbols']):
+        symbol['divergence_roc_pct'] = [-99., -99., None, None] if i == 0 else [0., 0., None, None]
+    stops = [o for o in compute(pbr, inp)['orders'] if o['order_type'] == 'close_time_stop_long']
+    # Cap = close_we_max * pre-divergence WEL * balance at the position price: 0.1 * 1 * 1000 / 100.
+    assert [o['qty'] for o in stops] == [-1.]
+
+
 def test_pending_reduction_finishes_original_target_without_another_interval_or_trigger():
     import passivbot_rust as pbr
     inp = stop_input(risk_time_stop_we_trigger_pct=1.)

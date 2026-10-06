@@ -20,7 +20,9 @@
    Percentage one closes the full position and ignores the maximum-exposure cap.
    A positive minimum-exposure threshold can likewise request full flattening.
 2. Other percentages reduce the current position fraction, capped when
-   `0 < time_stop_close_we_max < 1` at that fraction of effective WEL.
+   `0 < time_stop_close_we_max < 1` at that fraction of the runtime WEL before the
+   divergence reduction, so divergence protection cannot shrink a temporal close.
+   The trigger and minimum-exposure rule use the divergence-adjusted WEL.
    Zero and one disable the cap. Quantity is quantized to exchange steps.
 3. A new sub-minimum partial request is skipped, not enlarged. An unfinished
    market fragment is completed with the executable minimum if necessary. Shared
