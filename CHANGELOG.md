@@ -7,8 +7,9 @@ All notable user-facing changes will be documented in this file.
 - Add optional 1-day and 3-day horizons to divergence protection
   (`bot.<side>.risk.divergence_extended_horizons`, default off). A coin that collapsed and then
   traded sideways stays flagged instead of losing protection once the 5–240 minute horizons
-  normalize. With it enabled, `divergence_min_timeframes` accepts 1–6 and live fetches three days
-  of 1m candles per symbol.
+  normalize. Their market-wide breadth threshold scales with `sqrt(horizon / 240 minutes)`, so an
+  ordinary multi-day bear market does not disable them. With it enabled,
+  `divergence_min_timeframes` accepts 1–6 and live fetches three days of 1m candles per symbol.
 
 - Cap `ema_anchor` entries at the per-position exposure limit (WEL including excess
   allowance), matching the grid strategies. The inventory-scaled double-down could previously
