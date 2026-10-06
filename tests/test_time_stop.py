@@ -71,7 +71,7 @@ def test_divergence_wel_reduction_does_not_shrink_time_stop_cap():
             other[pside]['strategy_params'] = copy.deepcopy(inp['symbols'][0][pside]['strategy_params'])
         inp['symbols'].append(other)
     for i, symbol in enumerate(inp['symbols']):
-        symbol['divergence_roc_pct'] = [-99., -99., None, None] if i == 0 else [0., 0., None, None]
+        symbol['divergence_roc_pct'] = [-99., -99., None, None, None, None] if i == 0 else [0., 0., None, None, None, None]
     stops = [o for o in compute(pbr, inp)['orders'] if o['order_type'] == 'close_time_stop_long']
     # Cap = close_we_max * pre-divergence WEL * balance at the position price: 0.1 * 1 * 1000 / 100.
     assert [o['qty'] for o in stops] == [-1.]

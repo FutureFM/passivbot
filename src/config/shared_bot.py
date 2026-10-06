@@ -22,6 +22,7 @@ BOT_GROUP_FIELD_MAP = {
         "divergence_delay_multiplier": "divergence_delay_multiplier",
         "divergence_we_cap_pct": "divergence_we_cap_pct",
         "divergence_min_timeframes": "divergence_min_timeframes",
+        "divergence_extended_horizons": "divergence_extended_horizons",
         "n_positions": "n_positions",
         "total_wallet_exposure_limit": "total_wallet_exposure_limit",
         "total_exposure_entry_gate_enabled": "risk_twel_entry_gate_enabled",

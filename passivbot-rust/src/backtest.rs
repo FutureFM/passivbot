@@ -351,6 +351,16 @@ pub struct OpenOrderBundle {
     pub closes: Vec<BacktestOrder>,
 }
 
+/// Candles spanning a divergence horizon. A horizon that is not a whole number of backtest
+/// candles has no aligned close and yields no signal rather than a distorted window.
+fn divergence_bars_back(horizon_minutes: usize, interval_ms: u64) -> Option<usize> {
+    let horizon_ms = horizon_minutes as u64 * 60_000;
+    if interval_ms == 0 || horizon_ms % interval_ms != 0 {
+        return None;
+    }
+    Some((horizon_ms / interval_ms) as usize)
+}
+
 #[derive(Debug, Clone)]
 pub struct BacktestOrder {
     pub order: Order,
@@ -1404,14 +1414,23 @@ impl<'a> Backtest<'a> {
         }
     }
 
-    fn divergence_roc_at(&self, k: usize, idx: usize) -> [Option<f64>; 4] {
-        if !self.bot_params_master.long.divergence_filter_enabled
-            && !self.bot_params_master.short.divergence_filter_enabled
-        {
-            return [None; 4];
+    fn divergence_roc_at(&self, k: usize, idx: usize) -> crate::divergence::DivergenceRocs {
+        let long = &self.bot_params_master.long;
+        let short = &self.bot_params_master.short;
+        if !long.divergence_filter_enabled && !short.divergence_filter_enabled {
+            return [None; 6];
         }
+        let extended = (long.divergence_filter_enabled && long.divergence_extended_horizons)
+            || (short.divergence_filter_enabled && short.divergence_extended_horizons);
         std::array::from_fn(|tf| {
-            let bars_back = crate::divergence::HORIZONS_MINUTES[tf];
+            if tf >= crate::divergence::BASE_HORIZON_COUNT && !extended {
+                return None;
+            }
+            let Some(bars_back) =
+                divergence_bars_back(crate::divergence::HORIZONS_MINUTES[tf], self.interval_ms)
+            else {
+                return None;
+            };
             if k < bars_back
                 || !self.coin_is_valid_at(idx, k)
                 || !self.coin_is_valid_at(idx, k - bars_back)
@@ -11032,6 +11051,14 @@ mod tests {
     }
 
     #[test]
+    fn divergence_horizons_are_measured_in_minutes_not_candles() {
+        assert_eq!(divergence_bars_back(240, 60_000), Some(240));
+        assert_eq!(divergence_bars_back(240, 5 * 60_000), Some(48));
+        assert_eq!(divergence_bars_back(4320, 15 * 60_000), Some(288));
+        assert_eq!(divergence_bars_back(5, 15 * 60_000), None);
+    }
+
+    #[test]
     fn divergence_uses_historical_close_at_matching_horizons() {
         let mut hlcvs = Array3::from_shape_vec((241, 3, 4), vec![100.0; 241 * 3 * 4]).unwrap();
         hlcvs[[240, 0, CLOSE]] = 1.0;
@@ -11083,8 +11110,10 @@ mod tests {
             &backtest_params,
         );
         let input = bt.get_orchestrator_input_cached(240, None, None);
-        assert_eq!(input.symbols[0].divergence_roc_pct, [Some(-99.0); 4]);
-        assert_eq!(input.symbols[1].divergence_roc_pct, [Some(0.0); 4]);
+        assert_eq!(input.symbols[0].divergence_roc_pct[..4], [Some(-99.0); 4]);
+        assert_eq!(input.symbols[1].divergence_roc_pct[..4], [Some(0.0); 4]);
+        // Extended 1d/3d horizons are not computed unless enabled.
+        assert_eq!(input.symbols[0].divergence_roc_pct[4..], [None, None]);
         let rocs: Vec<_> = input.symbols.iter().map(|s| s.divergence_roc_pct).collect();
         let params: Vec<_> = input.symbols.iter().map(|s| &s.long.bot_params).collect();
         assert_eq!(

@@ -2596,13 +2596,45 @@ def test_divergence_caps_only_isolated_long_drop():
     ]
     inp = make_input(balance=1_000.0, strategy_kind="ema_anchor", symbols=symbols)
     for i, symbol in enumerate(symbols):
-        symbol["divergence_roc_pct"] = [-99.0, -99.0, None, None] if i == 0 else [0.0, 0.0, None, None]
+        symbol["divergence_roc_pct"] = [-99.0, -99.0, None, None, None, None] if i == 0 else [0.0, 0.0, None, None, None, None]
     protected = compute(pbr, inp)
     protected_entry = next(o for o in protected["orders"] if o["symbol_idx"] == 0 and o["qty"] > 0)
-    symbols[2]["divergence_roc_pct"] = [None] * 4
+    symbols[2]["divergence_roc_pct"] = [None] * 6
     unprotected = compute(pbr, inp)
     unprotected_entry = next(o for o in unprotected["orders"] if o["symbol_idx"] == 0 and o["qty"] > 0)
     assert protected_entry["qty"] < unprotected_entry["qty"]
+
+
+def test_divergence_extended_horizons_keep_multi_day_collapse_protected():
+    import passivbot_rust as pbr
+
+    strategy = {"base_qty_pct": 0.1, "ema_span_0": 10.0, "ema_span_1": 20.0,
+                "offset": 0.0, "offset_psize_weight": 0.0}
+
+    def entry_qty(extended):
+        protection = {
+            "divergence_filter_enabled": True,
+            "divergence_zscore_threshold": 1.0,
+            "divergence_breadth_threshold_pct": 40.0,
+            "divergence_breadth_drop_pct": 1.0,
+            "divergence_min_timeframes": 2,
+            "divergence_we_cap_pct": 0.5,
+            "divergence_extended_horizons": extended,
+        }
+        symbols = [
+            make_symbol(i, bid=100.0, ask=100.0,
+                        long_mode="normal" if i == 0 else "manual",
+                        long_bp=protection, long_strategy=strategy, short_strategy=strategy)
+            for i in range(3)
+        ]
+        # Short horizons have normalized after a rebound; only 1d/3d still show the collapse.
+        symbols[0]["divergence_roc_pct"] = [1.0, 2.0, 0.5, 0.1, -78.0, -85.0]
+        for symbol in symbols[1:]:
+            symbol["divergence_roc_pct"] = [0.0] * 6
+        out = compute(pbr, make_input(balance=1_000.0, strategy_kind="ema_anchor", symbols=symbols))
+        return next(o["qty"] for o in out["orders"] if o["symbol_idx"] == 0 and o["qty"] > 0)
+
+    assert entry_qty(True) < entry_qty(False)
 
 
 def test_divergence_extends_reentry_cooldown_only_for_flagged_symbol():
@@ -2627,10 +2659,10 @@ def test_divergence_extends_reentry_cooldown_only_for_flagged_symbol():
     inp["timestamp_ms"] = 180_000
     symbols[0]["long"]["last_increase_fill_timestamp_ms"] = 60_000
     for i, symbol in enumerate(symbols):
-        symbol["divergence_roc_pct"] = [-99.0, -99.0, None, None] if i == 0 else [0.0, 0.0, None, None]
+        symbol["divergence_roc_pct"] = [-99.0, -99.0, None, None, None, None] if i == 0 else [0.0, 0.0, None, None, None, None]
     flagged = compute(pbr, inp)
     assert not any(o["symbol_idx"] == 0 and o["qty"] > 0 for o in flagged["orders"])
-    symbols[2]["divergence_roc_pct"] = [None] * 4
+    symbols[2]["divergence_roc_pct"] = [None] * 6
     clear = compute(pbr, inp)
     assert any(o["symbol_idx"] == 0 and o["qty"] > 0 for o in clear["orders"])
 
@@ -2658,11 +2690,11 @@ def test_divergence_caps_isolated_short_pump_but_not_broad_pump():
     inp = make_input(balance=1_000.0, strategy_kind="ema_anchor",
                      global_bp=bot_params_pair(short_overrides=protection), symbols=symbols)
     for i, symbol in enumerate(symbols):
-        symbol["divergence_roc_pct"] = [99.0, 99.0, None, None] if i == 0 else [0.0, 0.0, None, None]
+        symbol["divergence_roc_pct"] = [99.0, 99.0, None, None, None, None] if i == 0 else [0.0, 0.0, None, None, None, None]
     isolated = compute(pbr, inp)
     isolated_qty = abs(next(o["qty"] for o in isolated["orders"] if o["symbol_idx"] == 0 and o["qty"] < 0))
     for symbol in symbols[1:]:
-        symbol["divergence_roc_pct"] = [10.0, 10.0, None, None]
+        symbol["divergence_roc_pct"] = [10.0, 10.0, None, None, None, None]
     broad = compute(pbr, inp)
     broad_qty = abs(next(o["qty"] for o in broad["orders"] if o["symbol_idx"] == 0 and o["qty"] < 0))
     assert isolated_qty < broad_qty

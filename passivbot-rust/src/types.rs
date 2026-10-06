@@ -685,6 +685,8 @@ pub struct BotParams {
     pub divergence_we_cap_pct: f64,
     #[serde(default = "default_divergence_min_timeframes")]
     pub divergence_min_timeframes: usize,
+    #[serde(default)]
+    pub divergence_extended_horizons: bool,
     pub n_positions: usize,
     pub total_wallet_exposure_limit: f64,
     pub wallet_exposure_limit: f64, // per-position base limit (without excess allowance)
@@ -766,6 +768,7 @@ impl Default for BotParams {
             divergence_delay_multiplier: default_divergence_delay_multiplier(),
             divergence_we_cap_pct: default_divergence_we_cap_pct(),
             divergence_min_timeframes: default_divergence_min_timeframes(),
+            divergence_extended_horizons: false,
             n_positions: 0,
             total_wallet_exposure_limit: 0.0,
             wallet_exposure_limit: 0.0,

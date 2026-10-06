@@ -16891,6 +16891,7 @@ class Passivbot:
         }
         bool_keys = {
             "divergence_filter_enabled",
+            "divergence_extended_horizons",
             "risk_wel_enforcer_enabled",
             "risk_twel_enforcer_enabled",
             "risk_twel_entry_gate_enabled",
@@ -16962,6 +16963,7 @@ class Passivbot:
             "divergence_delay_multiplier",
             "divergence_we_cap_pct",
             "divergence_min_timeframes",
+            "divergence_extended_horizons",
             "n_positions",
             "total_wallet_exposure_limit",
             "wallet_exposure_limit",
@@ -17460,7 +17462,16 @@ class Passivbot:
             "short": self._bot_params_to_rust_dict("short", None),
         }
         divergence_rocs = (
-            await collect_divergence_rocs(self.cm, symbols, timestamp_ms)
+            await collect_divergence_rocs(
+                self.cm,
+                symbols,
+                timestamp_ms,
+                extended=any(
+                    global_bp[side]["divergence_filter_enabled"]
+                    and global_bp[side]["divergence_extended_horizons"]
+                    for side in ("long", "short")
+                ),
+            )
             if any(global_bp[side]["divergence_filter_enabled"] for side in ("long", "short"))
             else {}
         )
@@ -17576,7 +17587,7 @@ class Passivbot:
             input_dict["symbols"].append(
                 {
                     "symbol_idx": int(idx),
-                    "divergence_roc_pct": divergence_rocs.get(symbol, [None] * 4),
+                    "divergence_roc_pct": divergence_rocs.get(symbol, [None] * 6),
                     "order_book": {"bid": mprice, "ask": mprice},
                     "exchange": Passivbot._orchestrator_exchange_params(self, symbol),
                     "tradable": bool(active and not exchange_cooldown_blocks_symbol),
@@ -20063,7 +20074,16 @@ class Passivbot:
             "short": self._bot_params_to_rust_dict("short", None),
         }
         divergence_rocs = (
-            await collect_divergence_rocs(self.cm, symbols, now_ms)
+            await collect_divergence_rocs(
+                self.cm,
+                symbols,
+                now_ms,
+                extended=any(
+                    global_bp[side]["divergence_filter_enabled"]
+                    and global_bp[side]["divergence_extended_horizons"]
+                    for side in ("long", "short")
+                ),
+            )
             if any(global_bp[side]["divergence_filter_enabled"] for side in ("long", "short"))
             else {}
         )
@@ -20186,7 +20206,7 @@ class Passivbot:
             input_dict["symbols"].append(
                 {
                     "symbol_idx": int(idx),
-                    "divergence_roc_pct": divergence_rocs.get(symbol, [None] * 4),
+                    "divergence_roc_pct": divergence_rocs.get(symbol, [None] * 6),
                     "order_book": {"bid": bid, "ask": ask},
                     "exchange": Passivbot._orchestrator_exchange_params(self, symbol),
                     "tradable": tradable,

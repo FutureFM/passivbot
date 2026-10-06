@@ -433,9 +433,9 @@ mod core {
     #[serde(deny_unknown_fields)]
     pub struct SymbolInput {
         pub symbol_idx: usize,
-        /// Completed 1m close ROC in percent for 5/15/60/240 minute horizons.
+        /// Completed 1m close ROC in percent for 5/15/60/240/1440/4320 minute horizons.
         #[serde(default)]
-        pub divergence_roc_pct: [Option<f64>; 4],
+        pub divergence_roc_pct: crate::divergence::DivergenceRocs,
         pub order_book: OrderBook, // must have bid>0 and ask>0
         pub exchange: ExchangeParams,
         pub tradable: bool,
@@ -4909,7 +4909,7 @@ mod core {
 
             SymbolInput {
                 symbol_idx: idx,
-                divergence_roc_pct: [None; 4],
+                divergence_roc_pct: [None; 6],
                 order_book: OrderBook {
                     bid: 100.0,
                     ask: 100.0,

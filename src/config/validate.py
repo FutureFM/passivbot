@@ -121,6 +121,10 @@ def validate_config(
         divergence_enabled = get_grouped_bot_value(bot_side, "divergence_filter_enabled")
         if not isinstance(divergence_enabled, bool):
             raise ValueError(f"bot.{pside}.risk.divergence_filter_enabled must be a boolean")
+        extended_horizons = get_grouped_bot_value(bot_side, "divergence_extended_horizons")
+        if not isinstance(extended_horizons, bool):
+            raise ValueError(f"bot.{pside}.risk.divergence_extended_horizons must be a boolean")
+        max_timeframes = 6 if extended_horizons else 4
         divergence_ranges = {
             "divergence_zscore_threshold": (0.0, None),
             "divergence_breadth_threshold_pct": (0.0, 100.0),
@@ -142,9 +146,11 @@ def validate_config(
             or not isinstance(min_timeframes, (int, float))
             or not math.isfinite(min_timeframes)
             or not float(min_timeframes).is_integer()
-            or not 1 <= min_timeframes <= 4
+            or not 1 <= min_timeframes <= max_timeframes
         ):
-            raise ValueError(f"bot.{pside}.risk.divergence_min_timeframes must be 1..4")
+            raise ValueError(
+                f"bot.{pside}.risk.divergence_min_timeframes must be 1..{max_timeframes}"
+            )
         normalize_we_excess_allowance_mode(
             get_grouped_bot_value(bot_side, "risk_we_excess_allowance_mode"),
             path=f"bot.{pside}.risk.we_excess_allowance_mode",

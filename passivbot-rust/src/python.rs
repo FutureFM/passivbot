@@ -2616,6 +2616,11 @@ fn bot_params_from_dict(dict: &PyDict) -> PyResult<BotParams> {
             Some(item) => item.extract::<usize>()?,
             None => 2,
         },
+        divergence_extended_horizons: extract_optional_bool(
+            dict,
+            "divergence_extended_horizons",
+            false,
+        )?,
         n_positions,
         total_wallet_exposure_limit,
         wallet_exposure_limit,
