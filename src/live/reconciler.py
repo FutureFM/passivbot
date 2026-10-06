@@ -1033,6 +1033,7 @@ def _canonical_rust_order_book_value(value: float, price_step: float) -> float:
 _PROTECTIVE_REDUCE_ONLY_FAMILIES = frozenset(
     {
         "close_panic",
+        "close_time_stop",
         "close_auto_reduce_twel",
         "close_auto_reduce_wel",
         "close_unstuck",
@@ -1423,6 +1424,8 @@ def _expected_rust_execution_type(
     qty: float,
     price: float,
 ) -> str:
+    if order_type.startswith("close_time_stop_"):
+        return "market"
     panic_execution_type = _expected_rust_panic_execution_type(
         global_input, symbol_side_hsl_execution, order_type
     )
@@ -1959,6 +1962,27 @@ def validate_rust_orchestrator_output(
             submitted_close_retracement_enabled[pair],
             f"Rust orchestrator order {order_idx}",
         )
+        if order_type.startswith("close_time_stop_"):
+            submitted_side = next(row for row in orchestrator_input["symbols"] if row["symbol_idx"] == symbol_idx)[pside]
+            params = submitted_side["bot_params"]
+            if (not submitted_global_side_enablement[pside]
+                    or submitted_input_modes[pair] in {"manual", "panic"}
+                    or params.get("risk_time_stop_max_age_days", 0) <= 0
+                    or params.get("risk_time_stop_close_pct", 0) <= 0
+                    or submitted_side.get("time_stop") is None):
+                raise FatalBotException("Rust emitted a time stop without enabled policy and proven history")
+            stop_state = submitted_side["time_stop"]
+            anchor = stop_state.get("anchor_timestamp_ms")
+            now = orchestrator_input.get("timestamp_ms", 0)
+            pending_target = stop_state.get("pending_target_size")
+            if (isinstance(anchor, bool) or not isinstance(anchor, int) or anchor < 0 or anchor > now
+                    or (pending_target is None and now - anchor < params["risk_time_stop_max_age_days"] * 86_400_000)):
+                raise FatalBotException("Rust emitted a time stop before its proven expiry")
+            target = _validated_rust_finite_number(order.get("time_stop_target_size"), "invalid time-stop target")
+            expected = max(0.0, submitted_position_sizes[pair] - abs(qty))
+            if target < 0 or not math.isclose(target, expected, rel_tol=0, abs_tol=max(1e-10, submitted_exchange_constraints[symbol_idx][0] * 1e-8)):
+                raise FatalBotException("Rust time-stop target does not match its final reduction")
+            panic_close_pairs.add(pair)  # exclusivity (quantity need not be full)
         if order_type.startswith("entry_"):
             entry_order_count[pair] = entry_order_count.get(pair, 0) + 1
             if (
@@ -2147,6 +2171,12 @@ def validate_rust_orchestrator_output(
                 f"Rust orchestrator {pside} entry batch for symbol_idx {symbol_idx} "
                 "contains more than one entry with positive submitted retracement"
             )
+
+    for pair in panic_close_pairs:
+        symbol_idx, pside = pair
+        side_orders = [order for order in orders if order["symbol_idx"] == symbol_idx and order["pside"] == pside]
+        if len(side_orders) != 1:
+            raise FatalBotException("Rust forced close must be exclusive for its position side")
 
     if held_initial_normal_orders:
         order_idx, pside = held_initial_normal_orders[0]
@@ -3902,8 +3932,8 @@ def to_executable_orders(
                 )
             pb_order_type = snake_of(order[3])
             # The Rust orchestrator is the single source of execution-type
-            # truth (every live path builds 6-tuples from its execution_type
-            # and execution_priority fields); a short tuple here means a broken producer, and
+            # truth (live tuples carry execution_type and execution_priority,
+            # plus a target for time stops); a short tuple means a broken producer, and
             # silently defaulting could downgrade a panic market close.
             if len(order) < 6:
                 raise ValueError(
@@ -3927,6 +3957,12 @@ def to_executable_orders(
                 execution_priority,
                 f"Rust ideal order for {symbol}",
             )
+            custom_id = bot.format_custom_id_single(order[3])
+            if pb_order_type.startswith("close_time_stop_"):
+                from time_stop import encode_target
+                if len(order) != 7 or execution_type != "market":
+                    raise FatalBotException("time stop requires market execution and target evidence")
+                custom_id = encode_target(custom_id, order[6])
             ideal_orders_f[symbol].append(
                 {
                     "symbol": symbol,
@@ -3935,7 +3971,7 @@ def to_executable_orders(
                     "qty": abs(order[0]),
                     "price": order[1],
                     "reduce_only": "close" in order[2],
-                    "custom_id": bot.format_custom_id_single(order[3]),
+                    "custom_id": custom_id,
                     "type": execution_type,
                     "pb_order_type": pb_order_type,
                     "execution_priority": execution_priority,

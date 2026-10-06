@@ -30,7 +30,8 @@ count. Divergence multiplies the result for held positions; the final delay is
 capped at `risk.entry_cooldown_max_minutes`, at most 1440. Live reconstructs
 the count from normalized exchange fills after restart. An unproven episode
 defers only affected entries while a scoped history repair runs; closes remain
-independent.
+independent. Optimizer bounds for the factor and cap are optional; without them the
+configured values stay fixed.
 
 Removed v7 trailing-grid concepts:
 
@@ -175,6 +176,10 @@ is effectively moot because multiple same-price slices would be redundant.
 ## Close Reducer Compatibility
 
 For each coin and position side, Rust selects at most one protective reducer per ideal-order batch.
+A [time stop](time_stop.md) is an explicit loss-budget exception: below HSL/panic priority,
+it is exclusive for its pair and completes its fixed target before other reducers or strategy
+orders. Its market execution overrides `market_orders_allowed`; manual mode still applies.
+The size-based allocation below applies to the remaining reducer families.
 Active panic, TWEL/WEL exposure-repair, and auto-unstuck intents are consolidated by keeping the
 largest loss-admissible absolute reduction after final position/minimum sizing, not by summing
 their quantities. If the realized-loss gate blocks the largest non-panic intent, Rust tries the

@@ -2,7 +2,22 @@
 
 use crate::types::BotParams;
 
-pub const HORIZONS_MINUTES: [usize; 4] = [5, 15, 60, 240];
+pub const HORIZONS_MINUTES: [usize; 6] = [5, 15, 60, 240, 1440, 4320];
+/// The first horizons are always evaluated; the remaining 1d/3d horizons only count for
+/// params with `divergence_extended_horizons` (they keep a multi-day collapse flagged after
+/// short horizons normalize).
+pub const BASE_HORIZON_COUNT: usize = 4;
+pub type DivergenceRocs = [Option<f64>; 6];
+/// Breadth thresholds are calibrated for horizons up to this length. Longer horizons scale
+/// the adverse-move threshold by sqrt(horizon / this), the random-walk growth of a typical
+/// move, so an ordinary multi-day bear market is not mistaken for a market-wide shock.
+const BREADTH_REFERENCE_MINUTES: f64 = 240.0;
+
+fn breadth_drop_scale(horizon_minutes: usize) -> f64 {
+    (horizon_minutes as f64 / BREADTH_REFERENCE_MINUTES)
+        .sqrt()
+        .max(1.0)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DivergenceEffect {
@@ -24,7 +39,7 @@ impl Default for DivergenceEffect {
 /// `roc_by_coin` contains percentage changes aligned to HORIZONS_MINUTES.
 /// A horizon with fewer than three valid coins cannot activate protection.
 pub fn detect(
-    roc_by_coin: &[[Option<f64>; 4]],
+    roc_by_coin: &[DivergenceRocs],
     params: &[&BotParams],
     short: bool,
 ) -> Vec<DivergenceEffect> {
@@ -44,6 +59,7 @@ pub fn detect(
             continue;
         }
         let n = values.len() as f64;
+        let drop_scale = breadth_drop_scale(HORIZONS_MINUTES[tf]);
         let mean = values.iter().map(|(_, roc)| roc).sum::<f64>() / n;
         let std = (values
             .iter()
@@ -54,16 +70,19 @@ pub fn detect(
             .max(1e-10);
         for &(idx, roc) in &values {
             let p = params[idx];
-            if !p.divergence_filter_enabled {
+            if !p.divergence_filter_enabled
+                || (tf >= BASE_HORIZON_COUNT && !p.divergence_extended_horizons)
+            {
                 continue;
             }
+            let breadth_drop_pct = p.divergence_breadth_drop_pct * drop_scale;
             let breadth_pct = values
                 .iter()
                 .filter(|(_, other)| {
                     if short {
-                        *other > p.divergence_breadth_drop_pct
+                        *other > breadth_drop_pct
                     } else {
-                        *other < -p.divergence_breadth_drop_pct
+                        *other < -breadth_drop_pct
                     }
                 })
                 .count() as f64
@@ -124,9 +143,9 @@ mod tests {
         let p = params();
         let refs = vec![&p; 3];
         let drops = [
-            [Some(-100.0), Some(-100.0), None, None],
-            [Some(0.0), Some(0.0), None, None],
-            [Some(0.0), Some(0.0), None, None],
+            [Some(-100.0), Some(-100.0), None, None, None, None],
+            [Some(0.0), Some(0.0), None, None, None, None],
+            [Some(0.0), Some(0.0), None, None, None, None],
         ];
         let long = detect(&drops, &refs, false);
         assert_eq!(long[0].flagged_timeframes, 2);
@@ -141,9 +160,9 @@ mod tests {
     fn broad_move_and_insufficient_coverage_do_not_trigger() {
         let p = params();
         let refs = vec![&p; 3];
-        let broad = [[Some(-100.0); 4], [Some(-10.0); 4], [Some(-10.0); 4]];
+        let broad = [[Some(-100.0); 6], [Some(-10.0); 6], [Some(-10.0); 6]];
         assert_eq!(detect(&broad, &refs, false)[0], DivergenceEffect::default());
-        let missing = [[Some(-100.0); 4], [Some(0.0); 4], [None; 4]];
+        let missing = [[Some(-100.0); 6], [Some(0.0); 6], [None; 6]];
         assert_eq!(
             detect(&missing, &refs, false)[0],
             DivergenceEffect::default()
@@ -155,7 +174,65 @@ mod tests {
         let mut p = params();
         p.divergence_zscore_threshold = 2.0;
         let refs = vec![&p; 3];
-        let rocs = [[Some(-99.0); 4], [Some(0.0); 4], [Some(0.0); 4]];
+        let rocs = [[Some(-99.0); 6], [Some(0.0); 6], [Some(0.0); 6]];
         assert_eq!(detect(&rocs, &refs, false)[0], DivergenceEffect::default());
+    }
+
+    #[test]
+    fn extended_horizons_count_only_when_enabled() {
+        // A multi-day collapse whose short horizons have normalized (a small rebound).
+        let collapse = [
+            Some(1.0),
+            Some(2.0),
+            Some(0.5),
+            Some(0.1),
+            Some(-78.0),
+            Some(-85.0),
+        ];
+        let flat = [Some(0.0); 6];
+        let rocs = [collapse, flat, flat];
+        let base = params();
+        let refs = vec![&base; 3];
+        assert_eq!(detect(&rocs, &refs, false)[0], DivergenceEffect::default());
+
+        let mut extended = params();
+        extended.divergence_extended_horizons = true;
+        let refs = vec![&extended; 3];
+        let effect = detect(&rocs, &refs, false)[0];
+        assert_eq!(effect.flagged_timeframes, 2);
+        assert!(effect.wallet_exposure_factor < 1.0);
+        // A single extended horizon does not satisfy a two-horizon minimum.
+        let one_day_only = [
+            [None, None, None, None, Some(-78.0), None],
+            [None, None, None, None, Some(0.0), None],
+            [None, None, None, None, Some(0.0), None],
+        ];
+        assert_eq!(detect(&one_day_only, &refs, false)[0].flagged_timeframes, 0);
+    }
+
+    #[test]
+    fn breadth_threshold_scales_only_beyond_four_hours() {
+        for h in [5, 15, 60, 240] {
+            assert_eq!(breadth_drop_scale(h), 1.0);
+        }
+        assert!((breadth_drop_scale(1440) - 6.0f64.sqrt()).abs() < 1e-12);
+        assert!((breadth_drop_scale(4320) - 18.0f64.sqrt()).abs() < 1e-12);
+    }
+
+    #[test]
+    fn ordinary_multi_day_bear_market_does_not_suppress_extended_horizons() {
+        // Market down ~8% over 1d and ~10% over 3d (typical bear week); one coin collapses.
+        let mut p = params();
+        p.divergence_breadth_drop_pct = 5.0;
+        p.divergence_extended_horizons = true;
+        p.divergence_zscore_threshold = 2.5;
+        let mut rocs = vec![[None, None, None, None, Some(-8.0), Some(-10.0)]; 20];
+        rocs[0] = [None, None, None, None, Some(-60.0), Some(-65.0)];
+        let refs = vec![&p; 20];
+        assert_eq!(detect(&rocs, &refs, false)[0].flagged_timeframes, 2);
+        // A genuine market-wide shock beyond the scaled thresholds still suppresses them.
+        let mut shock = vec![[None, None, None, None, Some(-25.0), Some(-35.0)]; 20];
+        shock[0] = [None, None, None, None, Some(-90.0), Some(-95.0)];
+        assert_eq!(detect(&shock, &refs, false)[0].flagged_timeframes, 0);
     }
 }

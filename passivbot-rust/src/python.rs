@@ -2558,6 +2558,28 @@ fn bot_params_from_dict(dict: &PyDict) -> PyResult<BotParams> {
         hsl_orange_tier_mode,
         hsl_panic_close_order_type,
         risk_entry_cooldown_minutes: extract_optional_f64(dict, "risk_entry_cooldown_minutes")?,
+        risk_time_stop_max_age_days: extract_optional_f64_or(
+            dict,
+            "risk_time_stop_max_age_days",
+            0.0,
+        )?,
+        risk_time_stop_close_pct: extract_optional_f64_or(dict, "risk_time_stop_close_pct", 1.0)?,
+        risk_time_stop_we_trigger_pct: extract_optional_f64_or(
+            dict,
+            "risk_time_stop_we_trigger_pct",
+            0.0,
+        )?,
+        risk_time_stop_close_we_min: extract_optional_f64_or(
+            dict,
+            "risk_time_stop_close_we_min",
+            0.0,
+        )?,
+        risk_time_stop_close_we_max: extract_optional_f64_or(
+            dict,
+            "risk_time_stop_close_we_max",
+            1.0,
+        )?,
+
         risk_entry_cooldown_factor_per_fill: extract_optional_f64_or(
             dict,
             "risk_entry_cooldown_factor_per_fill",
@@ -2590,10 +2612,24 @@ fn bot_params_from_dict(dict: &PyDict) -> PyResult<BotParams> {
             1.0,
         )?,
         divergence_we_cap_pct: extract_optional_f64_or(dict, "divergence_we_cap_pct", 1.0)?,
+        // Optimizer candidates carry integer-valued bounds as floats; accept them like n_positions.
         divergence_min_timeframes: match dict.get_item("divergence_min_timeframes")? {
-            Some(item) => item.extract::<usize>()?,
+            Some(item) => {
+                let value = item.extract::<f64>()?;
+                if !value.is_finite() || value < 0.0 {
+                    return Err(PyValueError::new_err(format!(
+                        "divergence_min_timeframes must be a finite non-negative number; got {value}"
+                    )));
+                }
+                value.round() as usize
+            }
             None => 2,
         },
+        divergence_extended_horizons: extract_optional_bool(
+            dict,
+            "divergence_extended_horizons",
+            false,
+        )?,
         n_positions,
         total_wallet_exposure_limit,
         wallet_exposure_limit,
@@ -3049,6 +3085,7 @@ fn make_trailing_martingale_close_params(
 
 fn make_runtime_order_context(wallet_exposure_limit: f64) -> RuntimeOrderContext {
     RuntimeOrderContext {
+        entry_reference_price: None,
         effective_wallet_exposure_limit: wallet_exposure_limit,
     }
 }
@@ -3147,6 +3184,7 @@ pub fn calc_trailing_grid_v7_diagnostic_py(input_json: &str) -> PyResult<String>
             .ok_or_else(|| PyValueError::new_err("missing bot_params"))?,
     )?;
     let runtime = RuntimeOrderContext {
+        entry_reference_price: None,
         effective_wallet_exposure_limit: input
             .get("runtime")
             .and_then(|runtime| runtime.get("effective_wallet_exposure_limit"))
@@ -3217,6 +3255,7 @@ pub fn calc_trailing_martingale_close_diagnostic_py(input_json: &str) -> PyResul
             .ok_or_else(|| PyValueError::new_err("missing bot_params"))?,
     )?;
     let runtime = RuntimeOrderContext {
+        entry_reference_price: None,
         effective_wallet_exposure_limit: input
             .get("runtime")
             .and_then(|runtime| runtime.get("effective_wallet_exposure_limit"))

@@ -137,6 +137,8 @@ mod core {
         pub order_type: OrderType,
         pub execution_type: ExecutionType,
         pub execution_priority: ExecutionPriority,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub time_stop_target_size: Option<f64>,
     }
 
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -383,6 +385,14 @@ mod core {
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
+    pub struct TimeStopState {
+        pub anchor_timestamp_ms: u64,
+        pub pending_target_size: Option<f64>,
+        pub grid_ref_price: Option<f64>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
     pub struct SymbolSideInput {
         /// `None` means “forager-eligible default”.
         /// `Some(Normal)` means “forced Normal” (always selected).
@@ -398,6 +408,9 @@ mod core {
         pub last_increase_fill_timestamp_ms: Option<u64>,
         #[serde(default)]
         pub entry_fill_count: Option<u32>,
+        /// Exchange/fill-proven clock and unfinished reduction; None is unavailable.
+        #[serde(default)]
+        pub time_stop: Option<TimeStopState>,
         /// Per-symbol/per-pside params after applying coin_overrides.
         pub bot_params: BotParams,
         #[serde(default)]
@@ -420,9 +433,9 @@ mod core {
     #[serde(deny_unknown_fields)]
     pub struct SymbolInput {
         pub symbol_idx: usize,
-        /// Completed 1m close ROC in percent for 5/15/60/240 minute horizons.
+        /// Completed 1m close ROC in percent for 5/15/60/240/1440/4320 minute horizons.
         #[serde(default)]
-        pub divergence_roc_pct: [Option<f64>; 4],
+        pub divergence_roc_pct: crate::divergence::DivergenceRocs,
         pub order_book: OrderBook, // must have bid>0 and ask>0
         pub exchange: ExchangeParams,
         pub tradable: bool,
@@ -627,6 +640,8 @@ mod core {
                 | ClosePanicShort
                 | CloseAutoReduceWelShort
                 | CloseEmaAnchorShort
+                | CloseTimeStopLong
+                | CloseTimeStopShort
         )
     }
 
@@ -635,6 +650,17 @@ mod core {
             order_type,
             OrderType::ClosePanicLong | OrderType::ClosePanicShort
         )
+    }
+
+    fn is_time_stop_order_type(order_type: OrderType) -> bool {
+        matches!(
+            order_type,
+            OrderType::CloseTimeStopLong | OrderType::CloseTimeStopShort
+        )
+    }
+
+    fn is_forced_close_order_type(order_type: OrderType) -> bool {
+        is_panic_close_order_type(order_type) || is_time_stop_order_type(order_type)
     }
 
     fn is_twel_close_order_type(order_type: OrderType, pside: PositionSide) -> bool {
@@ -678,6 +704,8 @@ mod core {
                 | (PositionSide::Short, OrderType::CloseAutoReduceTwelShort)
                 | (PositionSide::Short, OrderType::CloseAutoReduceWelShort)
                 | (PositionSide::Short, OrderType::CloseUnstuckShort)
+                | (PositionSide::Long, OrderType::CloseTimeStopLong)
+                | (PositionSide::Short, OrderType::CloseTimeStopShort)
         )
     }
 
@@ -686,10 +714,14 @@ mod core {
         b: &IdealOrder,
         ob: &OrderBook,
     ) -> std::cmp::Ordering {
-        // Larger reductions win. Reachability and stable order fields only break equal-size ties.
-        b.qty
-            .abs()
-            .total_cmp(&a.qty.abs())
+        // HSL/panic is exclusive; a time stop completes its fixed target before other reducers.
+        // Otherwise larger reductions win, with stable reachability ties.
+        is_panic_close_order_type(b.order_type)
+            .cmp(&is_panic_close_order_type(a.order_type))
+            .then_with(|| {
+                is_time_stop_order_type(b.order_type).cmp(&is_time_stop_order_type(a.order_type))
+            })
+            .then_with(|| b.qty.abs().total_cmp(&a.qty.abs()))
             .then_with(|| {
                 is_panic_close_order_type(b.order_type)
                     .cmp(&is_panic_close_order_type(a.order_type))
@@ -709,7 +741,7 @@ mod core {
             .min_by(|a, b| close_reducer_preference_cmp(a, b, ob))
             .cloned();
         if let Some(reducer) = selected_reducer {
-            if is_panic_close_order_type(reducer.order_type) {
+            if is_forced_close_order_type(reducer.order_type) {
                 orders.clear();
             } else {
                 orders.retain(|order| !is_protective_close_reducer(order.order_type, pside));
@@ -760,6 +792,9 @@ mod core {
         order_book: &OrderBook,
         symbol_bot_params: Option<&BotParams>,
     ) -> bool {
+        if is_time_stop_order_type(order.order_type) {
+            return true;
+        }
         if is_panic_close_order_type(order.order_type) {
             let params = symbol_bot_params.unwrap_or(match order.pside {
                 PositionSide::Long => &global.global_bot_params.long,
@@ -905,6 +940,7 @@ mod core {
             order_type: order.order_type,
             execution_type,
             execution_priority,
+            time_stop_target_size: None,
         }
     }
 
@@ -1767,7 +1803,7 @@ mod core {
     ) -> Vec<IdealOrder> {
         let mut finalized = if reducer
             .as_ref()
-            .is_some_and(|order| is_panic_close_order_type(order.order_type))
+            .is_some_and(|order| is_forced_close_order_type(order.order_type))
         {
             Vec::new()
         } else {
@@ -2006,7 +2042,7 @@ mod core {
             let candidate_idx = positions[position_idx].next_candidate_idx;
             let candidate = positions[position_idx].candidates[candidate_idx].clone();
             let symbol = &input.symbols[candidate.reducer.symbol_idx];
-            let allowed = is_panic_close_order_type(candidate.reducer.order_type)
+            let allowed = is_forced_close_order_type(candidate.reducer.order_type)
                 || close_passes_realized_loss_gate(
                     input,
                     &candidate.reducer,
@@ -2419,6 +2455,151 @@ mod core {
         Ok(())
     }
 
+    fn time_stop_enabled(side: &SymbolSideInput) -> bool {
+        side.bot_params.risk_time_stop_max_age_days > 0.0
+            && side.bot_params.risk_time_stop_close_pct > 0.0
+    }
+
+    fn calc_time_stop_close(
+        input: &OrchestratorInput,
+        symbol: &SymbolInput,
+        pside: PositionSide,
+        budget: RuntimeBudgetState,
+        cap_wallet_exposure_limit: f64,
+    ) -> Result<Option<IdealOrder>, OrchestratorError> {
+        let side = symbol_side_input(symbol, pside);
+        let bp = &side.bot_params;
+        for (name, value, upper) in [
+            (
+                "time_stop_max_age_days",
+                bp.risk_time_stop_max_age_days,
+                f64::INFINITY,
+            ),
+            ("time_stop_close_pct", bp.risk_time_stop_close_pct, 1.0),
+            (
+                "time_stop_we_trigger_pct",
+                bp.risk_time_stop_we_trigger_pct,
+                1.0,
+            ),
+            (
+                "time_stop_close_we_min",
+                bp.risk_time_stop_close_we_min,
+                1.0,
+            ),
+            (
+                "time_stop_close_we_max",
+                bp.risk_time_stop_close_we_max,
+                1.0,
+            ),
+        ] {
+            if !value.is_finite() || value < 0.0 || value > upper {
+                return Err(OrchestratorError::NonFiniteInput {
+                    field: name,
+                    symbol_idx: Some(symbol.symbol_idx),
+                });
+            }
+        }
+        if !(bp.risk_time_stop_max_age_days * 86_400_000.0).is_finite()
+            || bp.risk_time_stop_max_age_days * 86_400_000.0 > i64::MAX as f64
+        {
+            return Err(OrchestratorError::NonFiniteInput {
+                field: "time_stop_max_age_days",
+                symbol_idx: Some(symbol.symbol_idx),
+            });
+        }
+        if !time_stop_enabled(side) || side.position.size == 0.0 {
+            return Ok(None);
+        }
+        let Some(history) = &side.time_stop else {
+            return Ok(None);
+        };
+        if history.anchor_timestamp_ms > input.timestamp_ms
+            || history
+                .pending_target_size
+                .is_some_and(|q| !q.is_finite() || q < 0.0)
+            || history
+                .grid_ref_price
+                .is_some_and(|p| !p.is_finite() || p <= 0.0)
+        {
+            return Err(OrchestratorError::NonFiniteInput {
+                field: "time_stop",
+                symbol_idx: Some(symbol.symbol_idx),
+            });
+        }
+        let full = side.position.size.abs();
+        let mut qty = if let Some(target) = history.pending_target_size {
+            (full - target).max(0.0)
+        } else {
+            let duration_ms = bp.risk_time_stop_max_age_days * 86_400_000.0;
+            if ((input.timestamp_ms - history.anchor_timestamp_ms) as f64) < duration_ms {
+                return Ok(None);
+            }
+            let we = calc_wallet_exposure(
+                symbol.exchange.c_mult,
+                input.balance,
+                full,
+                side.position.price,
+            );
+            let wel = budget.effective_wallet_exposure_limit;
+            if wel > 0.0 && we < bp.risk_time_stop_we_trigger_pct * wel {
+                return Ok(None);
+            }
+            if bp.risk_time_stop_close_pct >= 1.0
+                || (wel > 0.0
+                    && bp.risk_time_stop_close_we_min > 0.0
+                    && we <= bp.risk_time_stop_close_we_min * wel)
+            {
+                full
+            } else {
+                let mut amount = full * bp.risk_time_stop_close_pct;
+                let cap = bp.risk_time_stop_close_we_max;
+                if cap > 0.0 && cap < 1.0 && cap_wallet_exposure_limit > 0.0 && we > 0.0 {
+                    amount = amount.min(full * cap * cap_wallet_exposure_limit / we);
+                }
+                amount
+            }
+        };
+        if qty < full {
+            qty = if history.pending_target_size.is_some() {
+                round_(qty, symbol.exchange.qty_step)
+            } else {
+                round_dn(qty, symbol.exchange.qty_step)
+            };
+        }
+        if qty <= 0.0 {
+            return Ok(None);
+        }
+        let mut order = calc_panic_close(
+            symbol.symbol_idx,
+            pside,
+            &side.position,
+            &symbol.order_book,
+            &symbol.exchange,
+        )
+        .unwrap();
+        let minimum = calc_min_entry_qty(
+            executable_touch_for_order_side(&symbol.order_book, order.qty),
+            &symbol.exchange,
+        );
+        // Don't turn a sub-minimum fractional request into a larger percentage.
+        if qty + 1e-12 < minimum && qty < full {
+            if history.pending_target_size.is_some() {
+                qty = minimum.min(full);
+            } else {
+                return Ok(None);
+            }
+        }
+        order.qty = match pside {
+            PositionSide::Long => -qty,
+            PositionSide::Short => qty,
+        };
+        order.order_type = match pside {
+            PositionSide::Long => OrderType::CloseTimeStopLong,
+            PositionSide::Short => OrderType::CloseTimeStopShort,
+        };
+        Ok(Some(order))
+    }
+
     fn calc_panic_close(
         symbol_idx: usize,
         pside: PositionSide,
@@ -2542,6 +2723,7 @@ mod core {
                             return false;
                         }
                         let runtime_context = RuntimeOrderContext {
+                            entry_reference_price: None,
                             effective_wallet_exposure_limit: runtime_budget
                                 .effective_wallet_exposure_limit,
                         };
@@ -2619,6 +2801,7 @@ mod core {
             ..Default::default()
         };
         let runtime_context = RuntimeOrderContext {
+            entry_reference_price: None,
             effective_wallet_exposure_limit: runtime_budget.effective_wallet_exposure_limit,
         };
         let wallet_exposure = calc_wallet_exposure(
@@ -2772,6 +2955,10 @@ mod core {
             strategy_kind_for_symbol_side(&input.global),
             strategy_side,
             StrategyRequest {
+                entry_reference_price: side
+                    .time_stop
+                    .as_ref()
+                    .and_then(|state| state.grid_ref_price),
                 wants_entries,
                 wants_closes,
                 exchange: &symbol.exchange,
@@ -3342,6 +3529,18 @@ mod core {
                 vec![crate::divergence::DivergenceEffect::default(); n_symbols],
             )
         };
+        // Divergence shrinks the entry budget; it must not also shrink the time-stop
+        // reduction cap, which would weaken a temporal close exactly when protection is active.
+        let time_stop_cap_wel_long: Vec<f64> = workspace
+            .runtime_budget_long
+            .iter()
+            .map(|budget| budget.effective_wallet_exposure_limit)
+            .collect();
+        let time_stop_cap_wel_short: Vec<f64> = workspace
+            .runtime_budget_short
+            .iter()
+            .map(|budget| budget.effective_wallet_exposure_limit)
+            .collect();
         for idx in 0..n_symbols {
             workspace.runtime_budget_long[idx].effective_wallet_exposure_limit *=
                 divergence_long[idx].wallet_exposure_factor;
@@ -3752,8 +3951,27 @@ mod core {
                     ) {
                         closes.push(p);
                     }
+                } else if let Some(order) = if mode != TradingMode::Manual {
+                    calc_time_stop_close(
+                        input,
+                        s,
+                        PositionSide::Long,
+                        workspace.runtime_budget_long[s.symbol_idx],
+                        time_stop_cap_wel_long[s.symbol_idx],
+                    )?
                 } else {
-                    let wants_entries = should_generate_entries(mode, has_pos, allow_initial);
+                    None
+                } {
+                    closes.push(order);
+                } else {
+                    let wants_entries = should_generate_entries(mode, has_pos, allow_initial)
+                        && !(has_pos
+                            && time_stop_enabled(&s.long)
+                            && (s.long.time_stop.is_none()
+                                || s.long
+                                    .time_stop
+                                    .as_ref()
+                                    .is_some_and(|state| state.pending_target_size.is_some())));
                     let wants_closes = should_generate_closes(mode, has_pos);
                     if wants_entries || wants_closes {
                         let (generated_entries, generated_closes, close_inputs_unavailable) =
@@ -3849,8 +4067,27 @@ mod core {
                     ) {
                         closes.push(p);
                     }
+                } else if let Some(order) = if mode != TradingMode::Manual {
+                    calc_time_stop_close(
+                        input,
+                        s,
+                        PositionSide::Short,
+                        workspace.runtime_budget_short[s.symbol_idx],
+                        time_stop_cap_wel_short[s.symbol_idx],
+                    )?
                 } else {
-                    let wants_entries = should_generate_entries(mode, has_pos, allow_initial);
+                    None
+                } {
+                    closes.push(order);
+                } else {
+                    let wants_entries = should_generate_entries(mode, has_pos, allow_initial)
+                        && !(has_pos
+                            && time_stop_enabled(&s.short)
+                            && (s.short.time_stop.is_none()
+                                || s.short
+                                    .time_stop
+                                    .as_ref()
+                                    .is_some_and(|state| state.pending_target_size.is_some())));
                     let wants_closes = should_generate_closes(mode, has_pos);
                     if wants_entries || wants_closes {
                         let (generated_entries, generated_closes, close_inputs_unavailable) =
@@ -4482,13 +4719,20 @@ mod core {
                 // normal so it can emit closes, but those closes remain risk-critical
                 // for live execution priority.
                 let mode = side.mode.unwrap_or(TradingMode::Normal);
-                to_executable_order(
+                let mut executable = to_executable_order(
                     order,
                     &input.global,
                     &symbol.order_book,
                     mode,
                     &side.bot_params,
-                )
+                );
+                if is_time_stop_order_type(executable.order_type) {
+                    executable.time_stop_target_size = Some(round_(
+                        (side.position.size.abs() - executable.qty.abs()).max(0.0),
+                        symbol.exchange.qty_step,
+                    ));
+                }
+                executable
             })
             .collect();
 
@@ -4665,7 +4909,7 @@ mod core {
 
             SymbolInput {
                 symbol_idx: idx,
-                divergence_roc_pct: [None; 4],
+                divergence_roc_pct: [None; 6],
                 order_book: OrderBook {
                     bid: 100.0,
                     ask: 100.0,
@@ -4694,6 +4938,7 @@ mod core {
                     parsed_strategy_params: None,
                     last_increase_fill_timestamp_ms: None,
                     entry_fill_count: Some(0),
+                    time_stop: None,
                     runtime_budget: None,
                 },
                 short: SymbolSideInput {
@@ -4706,6 +4951,7 @@ mod core {
                     parsed_strategy_params: None,
                     last_increase_fill_timestamp_ms: None,
                     entry_fill_count: Some(0),
+                    time_stop: None,
                     runtime_budget: None,
                 },
             }
@@ -4878,6 +5124,77 @@ mod core {
                 hedge_mode: true,
                 strategy_kind: StrategyKind::TrailingMartingale,
             }
+        }
+
+        #[test]
+        fn time_stop_finishes_a_subminimum_pending_fragment_and_ignores_new_trigger() {
+            let mut symbol = make_basic_symbol(0);
+            symbol.long.position = Position {
+                size: 10.0,
+                price: 100.0,
+            };
+            symbol.long.bot_params.risk_time_stop_max_age_days = 1.0;
+            symbol.long.bot_params.risk_time_stop_close_pct = 0.25;
+            symbol.long.bot_params.risk_time_stop_we_trigger_pct = 1.0;
+            symbol.exchange.min_qty = 1.0;
+            symbol.exchange.qty_step = 0.1;
+            symbol.long.time_stop = Some(TimeStopState {
+                anchor_timestamp_ms: 0,
+                pending_target_size: Some(9.9),
+                grid_ref_price: None,
+            });
+            let input = OrchestratorInput {
+                balance: 1000.0,
+                balance_raw: 1000.0,
+                timestamp_ms: 1,
+                global: make_basic_global(),
+                symbols: vec![symbol],
+                peek_hints: None,
+                forager_hysteresis: None,
+            };
+            let order = calc_time_stop_close(
+                &input,
+                &input.symbols[0],
+                PositionSide::Long,
+                RuntimeBudgetState::default(),
+                0.0,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(order.qty, -1.0);
+            assert_eq!(order.order_type, OrderType::CloseTimeStopLong);
+        }
+
+        #[test]
+        fn time_stop_rejects_a_future_anchor_without_guessing() {
+            let mut symbol = make_basic_symbol(0);
+            symbol.long.position = Position {
+                size: 10.0,
+                price: 100.0,
+            };
+            symbol.long.bot_params.risk_time_stop_max_age_days = 1.0;
+            symbol.long.time_stop = Some(TimeStopState {
+                anchor_timestamp_ms: 2,
+                pending_target_size: None,
+                grid_ref_price: None,
+            });
+            let input = OrchestratorInput {
+                balance: 1000.0,
+                balance_raw: 1000.0,
+                timestamp_ms: 1,
+                global: make_basic_global(),
+                symbols: vec![symbol],
+                peek_hints: None,
+                forager_hysteresis: None,
+            };
+            assert!(calc_time_stop_close(
+                &input,
+                &input.symbols[0],
+                PositionSide::Long,
+                RuntimeBudgetState::default(),
+                0.0
+            )
+            .is_err());
         }
 
         #[test]

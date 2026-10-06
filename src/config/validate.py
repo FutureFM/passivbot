@@ -47,6 +47,20 @@ def _validate_startup_phase_budgets(live_config: dict) -> None:
                 raise ValueError(f"{value_path} must be >= 0")
 
 
+def _validate_time_stop(side: dict, path: str, *, partial=False):
+    for name, upper in (("time_stop_max_age_days", None), ("time_stop_close_pct", 1.0),
+                        ("time_stop_we_trigger_pct", 1.0), ("time_stop_close_we_min", 1.0),
+                        ("time_stop_close_we_max", 1.0)):
+        value = get_grouped_bot_value(side, "risk_" + name)
+        if partial and value is None:
+            continue
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(value) or value < 0.0
+                or (upper is not None and value > upper)
+                or (upper is None and value * 86_400_000 > 2**63 - 1)):
+            raise ValueError(f"{path}.risk.{name} is outside its finite valid range")
+
+
 def validate_config(
     config: dict, *, raw_optimize=None, verbose: bool = True, tracker=None
 ) -> None:
@@ -103,9 +117,14 @@ def validate_config(
             raise ValueError(
                 f"bot.{pside}.risk.entry_cooldown_max_minutes must be in (0, 1440]"
             )
+        _validate_time_stop(bot_side, f"bot.{pside}")
         divergence_enabled = get_grouped_bot_value(bot_side, "divergence_filter_enabled")
         if not isinstance(divergence_enabled, bool):
             raise ValueError(f"bot.{pside}.risk.divergence_filter_enabled must be a boolean")
+        extended_horizons = get_grouped_bot_value(bot_side, "divergence_extended_horizons")
+        if not isinstance(extended_horizons, bool):
+            raise ValueError(f"bot.{pside}.risk.divergence_extended_horizons must be a boolean")
+        max_timeframes = 6 if extended_horizons else 4
         divergence_ranges = {
             "divergence_zscore_threshold": (0.0, None),
             "divergence_breadth_threshold_pct": (0.0, 100.0),
@@ -127,9 +146,11 @@ def validate_config(
             or not isinstance(min_timeframes, (int, float))
             or not math.isfinite(min_timeframes)
             or not float(min_timeframes).is_integer()
-            or not 1 <= min_timeframes <= 4
+            or not 1 <= min_timeframes <= max_timeframes
         ):
-            raise ValueError(f"bot.{pside}.risk.divergence_min_timeframes must be 1..4")
+            raise ValueError(
+                f"bot.{pside}.risk.divergence_min_timeframes must be 1..{max_timeframes}"
+            )
         normalize_we_excess_allowance_mode(
             get_grouped_bot_value(bot_side, "risk_we_excess_allowance_mode"),
             path=f"bot.{pside}.risk.we_excess_allowance_mode",
@@ -155,6 +176,7 @@ def validate_config(
                 override_side = override_bot.get(pside)
                 if not isinstance(override_side, dict):
                     continue
+                _validate_time_stop(override_side, f"coin_overrides.{coin}.bot.{pside}", partial=True)
                 if "risk_we_excess_allowance_mode" in override_side:
                     normalize_we_excess_allowance_mode(
                         override_side.get("risk_we_excess_allowance_mode"),

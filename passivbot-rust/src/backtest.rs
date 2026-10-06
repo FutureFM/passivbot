@@ -351,6 +351,16 @@ pub struct OpenOrderBundle {
     pub closes: Vec<BacktestOrder>,
 }
 
+/// Candles spanning a divergence horizon. A horizon that is not a whole number of backtest
+/// candles has no aligned close and yields no signal rather than a distorted window.
+fn divergence_bars_back(horizon_minutes: usize, interval_ms: u64) -> Option<usize> {
+    let horizon_ms = horizon_minutes as u64 * 60_000;
+    if interval_ms == 0 || horizon_ms % interval_ms != 0 {
+        return None;
+    }
+    Some((horizon_ms / interval_ms) as usize)
+}
+
 #[derive(Debug, Clone)]
 pub struct BacktestOrder {
     pub order: Order,
@@ -642,6 +652,8 @@ pub struct Backtest<'a> {
     last_increase_fill_timestamp_short: Vec<Option<u64>>,
     entry_fill_count_long: Vec<u32>,
     entry_fill_count_short: Vec<u32>,
+    time_stop_long: Vec<Option<orchestrator::TimeStopState>>,
+    time_stop_short: Vec<Option<orchestrator::TimeStopState>>,
     pub total_wallet_exposures: Vec<f64>,
     // removed rolling_volume_sum & buffer — replaced by per-coin EMAs in `emas`
     equity_tracking_active: bool,
@@ -1402,14 +1414,23 @@ impl<'a> Backtest<'a> {
         }
     }
 
-    fn divergence_roc_at(&self, k: usize, idx: usize) -> [Option<f64>; 4] {
-        if !self.bot_params_master.long.divergence_filter_enabled
-            && !self.bot_params_master.short.divergence_filter_enabled
-        {
-            return [None; 4];
+    fn divergence_roc_at(&self, k: usize, idx: usize) -> crate::divergence::DivergenceRocs {
+        let long = &self.bot_params_master.long;
+        let short = &self.bot_params_master.short;
+        if !long.divergence_filter_enabled && !short.divergence_filter_enabled {
+            return [None; 6];
         }
+        let extended = (long.divergence_filter_enabled && long.divergence_extended_horizons)
+            || (short.divergence_filter_enabled && short.divergence_extended_horizons);
         std::array::from_fn(|tf| {
-            let bars_back = crate::divergence::HORIZONS_MINUTES[tf];
+            if tf >= crate::divergence::BASE_HORIZON_COUNT && !extended {
+                return None;
+            }
+            let Some(bars_back) =
+                divergence_bars_back(crate::divergence::HORIZONS_MINUTES[tf], self.interval_ms)
+            else {
+                return None;
+            };
             if k < bars_back
                 || !self.coin_is_valid_at(idx, k)
                 || !self.coin_is_valid_at(idx, k - bars_back)
@@ -1657,6 +1678,7 @@ impl<'a> Backtest<'a> {
                         last_increase_fill_timestamp_ms: self.last_increase_fill_timestamp_long
                             [idx],
                         entry_fill_count: Some(self.entry_fill_count_long[idx]),
+                        time_stop: self.time_stop_long[idx].clone(),
                         bot_params: self.bot_params[idx].long.clone(),
                         strategy_params: None,
                         parsed_strategy_params: Some(self.strategy_params[idx].long),
@@ -1670,6 +1692,7 @@ impl<'a> Backtest<'a> {
                         last_increase_fill_timestamp_ms: self.last_increase_fill_timestamp_short
                             [idx],
                         entry_fill_count: Some(self.entry_fill_count_short[idx]),
+                        time_stop: self.time_stop_short[idx].clone(),
                         bot_params: self.bot_params[idx].short.clone(),
                         strategy_params: None,
                         parsed_strategy_params: Some(self.strategy_params[idx].short),
@@ -1799,9 +1822,11 @@ impl<'a> Backtest<'a> {
             sym.short.trailing = self.trailing_prices.short[idx].clone();
             sym.long.last_increase_fill_timestamp_ms = self.last_increase_fill_timestamp_long[idx];
             sym.long.entry_fill_count = Some(self.entry_fill_count_long[idx]);
+            sym.long.time_stop = self.time_stop_long[idx].clone();
             sym.short.last_increase_fill_timestamp_ms =
                 self.last_increase_fill_timestamp_short[idx];
             sym.short.entry_fill_count = Some(self.entry_fill_count_short[idx]);
+            sym.short.time_stop = self.time_stop_short[idx].clone();
 
             sym.long.runtime_budget = Some(self.runtime_budget[idx].long.clone());
             sym.short.runtime_budget = Some(self.runtime_budget[idx].short.clone());
@@ -2315,6 +2340,8 @@ impl<'a> Backtest<'a> {
             last_increase_fill_timestamp_short: vec![None; n_coins],
             entry_fill_count_long: vec![0; n_coins],
             entry_fill_count_short: vec![0; n_coins],
+            time_stop_long: vec![None; n_coins],
+            time_stop_short: vec![None; n_coins],
             total_wallet_exposures: Vec::with_capacity(n_timesteps),
             equity_tracking_active: false,
             debug_writer: if DEBUG_DUMP_ORDERS {
@@ -4425,10 +4452,18 @@ impl<'a> Backtest<'a> {
         if new_psize == 0.0 {
             self.positions.long[idx] = Position::default();
             self.entry_fill_count_long[idx] = 0;
+            self.time_stop_long[idx] = None;
         } else {
             self.positions.long[idx].size = new_psize;
         }
         let timestamp_ms = self.first_timestamp_ms + (k as u64) * self.interval_ms;
+        if new_psize != 0.0 && close_fill.order_type == OrderType::CloseTimeStopLong {
+            self.time_stop_long[idx] = Some(orchestrator::TimeStopState {
+                anchor_timestamp_ms: timestamp_ms,
+                pending_target_size: None,
+                grid_ref_price: Some(exec.price),
+            });
+        }
         let wallet_exposure = if new_psize != 0.0 {
             calc_wallet_exposure(
                 self.exchange_params_list[idx].c_mult,
@@ -4525,10 +4560,18 @@ impl<'a> Backtest<'a> {
         if new_psize == 0.0 {
             self.positions.short[idx] = Position::default();
             self.entry_fill_count_short[idx] = 0;
+            self.time_stop_short[idx] = None;
         } else {
             self.positions.short[idx].size = new_psize;
         }
         let timestamp_ms = self.first_timestamp_ms + (k as u64) * self.interval_ms;
+        if new_psize != 0.0 && order.order_type == OrderType::CloseTimeStopShort {
+            self.time_stop_short[idx] = Some(orchestrator::TimeStopState {
+                anchor_timestamp_ms: timestamp_ms,
+                pending_target_size: None,
+                grid_ref_price: Some(exec.price),
+            });
+        }
         let wallet_exposure = if new_psize != 0.0 {
             calc_wallet_exposure(
                 self.exchange_params_list[idx].c_mult,
@@ -4601,6 +4644,15 @@ impl<'a> Backtest<'a> {
             exec.price,
             self.exchange_params_list[idx].qty_step,
         );
+        if self.positions.long[idx].size == 0.0 {
+            self.time_stop_long[idx] = Some(orchestrator::TimeStopState {
+                anchor_timestamp_ms: self.first_timestamp_ms + k as u64 * self.interval_ms,
+                pending_target_size: None,
+                grid_ref_price: None,
+            });
+        } else if let Some(state) = self.time_stop_long[idx].as_mut() {
+            state.grid_ref_price = None;
+        }
         self.positions.long[idx].size = new_psize;
         self.positions.long[idx].price = new_pprice;
         let timestamp_ms = self.first_timestamp_ms + (k as u64) * self.interval_ms;
@@ -4675,6 +4727,15 @@ impl<'a> Backtest<'a> {
             exec.price,
             self.exchange_params_list[idx].qty_step,
         );
+        if self.positions.short[idx].size == 0.0 {
+            self.time_stop_short[idx] = Some(orchestrator::TimeStopState {
+                anchor_timestamp_ms: self.first_timestamp_ms + k as u64 * self.interval_ms,
+                pending_target_size: None,
+                grid_ref_price: None,
+            });
+        } else if let Some(state) = self.time_stop_short[idx].as_mut() {
+            state.grid_ref_price = None;
+        }
         self.positions.short[idx].size = new_psize;
         self.positions.short[idx].price = new_pprice;
         let wallet_exposure = if new_psize != 0.0 {
@@ -10990,6 +11051,14 @@ mod tests {
     }
 
     #[test]
+    fn divergence_horizons_are_measured_in_minutes_not_candles() {
+        assert_eq!(divergence_bars_back(240, 60_000), Some(240));
+        assert_eq!(divergence_bars_back(240, 5 * 60_000), Some(48));
+        assert_eq!(divergence_bars_back(4320, 15 * 60_000), Some(288));
+        assert_eq!(divergence_bars_back(5, 15 * 60_000), None);
+    }
+
+    #[test]
     fn divergence_uses_historical_close_at_matching_horizons() {
         let mut hlcvs = Array3::from_shape_vec((241, 3, 4), vec![100.0; 241 * 3 * 4]).unwrap();
         hlcvs[[240, 0, CLOSE]] = 1.0;
@@ -11041,8 +11110,10 @@ mod tests {
             &backtest_params,
         );
         let input = bt.get_orchestrator_input_cached(240, None, None);
-        assert_eq!(input.symbols[0].divergence_roc_pct, [Some(-99.0); 4]);
-        assert_eq!(input.symbols[1].divergence_roc_pct, [Some(0.0); 4]);
+        assert_eq!(input.symbols[0].divergence_roc_pct[..4], [Some(-99.0); 4]);
+        assert_eq!(input.symbols[1].divergence_roc_pct[..4], [Some(0.0); 4]);
+        // Extended 1d/3d horizons are not computed unless enabled.
+        assert_eq!(input.symbols[0].divergence_roc_pct[4..], [None, None]);
         let rocs: Vec<_> = input.symbols.iter().map(|s| s.divergence_roc_pct).collect();
         let params: Vec<_> = input.symbols.iter().map(|s| &s.long.bot_params).collect();
         assert_eq!(

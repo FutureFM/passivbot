@@ -203,6 +203,7 @@ pub struct GeneratedOrders {
 }
 
 pub struct StrategyRequest<'a> {
+    pub entry_reference_price: Option<f64>,
     pub wants_entries: bool,
     pub wants_closes: bool,
     pub exchange: &'a ExchangeParams,

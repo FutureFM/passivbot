@@ -3,7 +3,7 @@ use crate::dynamic::{calc_dynamic_distance_multiplier, DynamicDistanceInputs};
 use crate::entries::{calc_min_entry_qty, wallet_exposure_limit_with_allowance_from_base};
 use crate::types::{BotParams, ExchangeParams, Order, OrderType, StateParams};
 use crate::utils::{
-    cost_to_qty, qty_to_cost, round_, tolerant_round_dn_preserve_step,
+    cost_to_qty, qty_to_cost, round_, round_dn, tolerant_round_dn_preserve_step,
     tolerant_round_up_preserve_step,
 };
 
@@ -150,6 +150,7 @@ fn calc_entry_qty(
     price: f64,
     effective_wallet_exposure_limit: f64,
     psize: f64,
+    pprice: f64,
     mid: f64,
 ) -> f64 {
     let base_qty = calc_base_clip_qty(
@@ -175,7 +176,35 @@ fn calc_entry_qty(
         StrategySide::Short => (-signed_we_ratio).max(0.0),
     };
     let multiplier = (1.0 + same_side_bias * params.entry_double_down_factor).max(1.0);
-    round_(base_qty * multiplier, exchange.qty_step)
+    let qty = round_(base_qty * multiplier, exchange.qty_step);
+    // Same per-position cap as the grid strategies: a fill may not push the position's
+    // cost above balance * WEL (with excess allowance). The double-down multiplier grows
+    // with exposure, so without this cap inventory compounds past the limit in a sustained drop.
+    let limit =
+        wallet_exposure_limit_with_allowance_from_base(bot_params, effective_wallet_exposure_limit);
+    let same_side_size = match side {
+        StrategySide::Long => psize.max(0.0),
+        StrategySide::Short => (-psize).max(0.0),
+    };
+    let held_cost = if same_side_size > 0.0 {
+        qty_to_cost(same_side_size, pprice, exchange.c_mult)
+    } else {
+        0.0
+    };
+    let room_qty = round_dn(
+        cost_to_qty(
+            (balance * limit - held_cost).max(0.0),
+            price,
+            exchange.c_mult,
+        ),
+        exchange.qty_step,
+    );
+    let capped = qty.min(room_qty);
+    if capped < calc_min_entry_qty(price, exchange) {
+        0.0
+    } else {
+        capped
+    }
 }
 
 #[inline]
@@ -253,6 +282,7 @@ pub fn generate_orders(side: StrategySide, request: StrategyRequest<'_>) -> Gene
                         bid_price,
                         effective_wallet_exposure_limit,
                         request.position.size,
+                        request.position.price,
                         mid,
                     );
                     if qty > 0.0 {
@@ -342,6 +372,7 @@ pub fn generate_orders(side: StrategySide, request: StrategyRequest<'_>) -> Gene
                         ask_price,
                         effective_wallet_exposure_limit,
                         request.position.size,
+                        request.position.price,
                         mid,
                     );
                     if qty > 0.0 {
@@ -525,6 +556,7 @@ mod tests {
         let position = Position::default();
         let trailing = TrailingPriceBundle::default();
         let request = StrategyRequest {
+            entry_reference_price: None,
             wants_entries: true,
             wants_closes: false,
             exchange: &exchange,
@@ -700,6 +732,7 @@ mod tests {
         let position = Position::default();
         let trailing = TrailingPriceBundle::default();
         let request = StrategyRequest {
+            entry_reference_price: None,
             wants_entries: true,
             wants_closes: true,
             exchange: &exchange,
@@ -743,6 +776,84 @@ mod tests {
     }
 
     #[test]
+    fn entries_are_cropped_to_the_per_position_exposure_limit() {
+        let exchange = base_exchange();
+        let bot_params = BotParams::default();
+        let params = EmaAnchorParams {
+            base_qty_pct: 0.5,
+            entry_double_down_factor: 2.0,
+            ..base_params()
+        };
+        // balance 1000, WEL 1.0 -> room for 1000 of cost. Long 8 @ 100 holds 800.
+        let near_limit = calc_entry_qty(
+            StrategySide::Long,
+            &exchange,
+            &bot_params,
+            &params,
+            1000.0,
+            50.0,
+            1.0,
+            8.0,
+            100.0,
+            50.0,
+        );
+        assert_eq!(near_limit, 4.0);
+        let at_limit = calc_entry_qty(
+            StrategySide::Long,
+            &exchange,
+            &bot_params,
+            &params,
+            1000.0,
+            50.0,
+            1.0,
+            10.0,
+            100.0,
+            50.0,
+        );
+        assert_eq!(at_limit, 0.0);
+        let short_near_limit = calc_entry_qty(
+            StrategySide::Short,
+            &exchange,
+            &bot_params,
+            &params,
+            1000.0,
+            200.0,
+            1.0,
+            -8.0,
+            100.0,
+            200.0,
+        );
+        assert_eq!(short_near_limit, 1.0);
+        // An opposite-side position does not consume this side's budget.
+        let flat = calc_entry_qty(
+            StrategySide::Long,
+            &exchange,
+            &bot_params,
+            &params,
+            1000.0,
+            100.0,
+            1.0,
+            0.0,
+            0.0,
+            100.0,
+        );
+        let opposite = calc_entry_qty(
+            StrategySide::Long,
+            &exchange,
+            &bot_params,
+            &params,
+            1000.0,
+            100.0,
+            1.0,
+            -8.0,
+            100.0,
+            100.0,
+        );
+        assert_eq!(flat, 5.0);
+        assert_eq!(opposite, flat);
+    }
+
+    #[test]
     fn entry_double_down_factor_only_scales_same_side_entry_qty() {
         let state = StateParams {
             order_book: OrderBook {
@@ -774,6 +885,7 @@ mod tests {
         };
 
         let flat_request = StrategyRequest {
+            entry_reference_price: None,
             wants_entries: true,
             wants_closes: false,
             exchange: &exchange,
@@ -787,6 +899,7 @@ mod tests {
             peek: None,
         };
         let long_request = StrategyRequest {
+            entry_reference_price: None,
             wants_entries: true,
             wants_closes: false,
             exchange: &exchange,
@@ -800,6 +913,7 @@ mod tests {
             peek: None,
         };
         let opposite_request = StrategyRequest {
+            entry_reference_price: None,
             wants_entries: true,
             wants_closes: false,
             exchange: &exchange,

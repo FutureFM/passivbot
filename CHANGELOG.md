@@ -4,9 +4,31 @@ All notable user-facing changes will be documented in this file.
 
 ## Unreleased
 
+- Add optional 1-day and 3-day horizons to divergence protection
+  (`bot.<side>.risk.divergence_extended_horizons`, default off). A coin that collapsed and then
+  traded sideways stays flagged instead of losing protection once the 5–240 minute horizons
+  normalize. Their market-wide breadth threshold scales with `sqrt(horizon / 240 minutes)`, so an
+  ordinary multi-day bear market does not disable them. With it enabled,
+  `divergence_min_timeframes` accepts 1–6 and live fetches three days of 1m candles per symbol.
+
+- Cap `ema_anchor` entries at the per-position exposure limit (WEL including excess
+  allowance), matching the grid strategies. The inventory-scaled double-down could previously
+  push a single position far above its limit during a sustained drop. Divergence protection's
+  reduced WEL now also limits `ema_anchor` entries. Existing `ema_anchor` backtest results change.
+
+- Time-stop partial reductions capped by `time_stop_close_we_max` no longer shrink when
+  divergence protection lowers the WEL of the same coin.
+
+- Add optional time-based position reductions for every strategy and both sides.
+  Stops complete a configured fraction with reduce-only market orders, may realize losses
+  beyond the cumulative loss budget, and reconstruct their clock and unfinished target
+  from exchange fills/orders after restart. HSL retains priority and manual mode is respected.
+
 - Allow entry cooldown to multiply or shrink after each position-increasing fill, with a
   configurable per-fill factor and a 24-hour total cap. Live reconstructs the fill count from
   exchange history after restart; incomplete position history defers new entries for that side.
+  Optimizer bounds for the factor and cap are optional: when omitted, the configured values stay
+  fixed instead of the bounds being dropped during config loading.
 
 - Add optional cross-asset divergence protection to live trading and backtests. Isolated drops
   reduce long exposure budgets and extend re-entry cooldowns; isolated pumps provide the same

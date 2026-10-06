@@ -63,6 +63,7 @@ except ImportError:  # pragma: no cover - fallback for package-relative executio
 from logging_setup import configure_logging
 from procedures import load_user_info
 from pure_funcs import ensure_millis
+from time_stop import time_stop_type_id
 
 logger = logging.getLogger(__name__)
 _TYPE_MARKER_RE = re.compile(r"0x([0-9a-fA-F]{4})", re.IGNORECASE)
@@ -8197,6 +8198,9 @@ class OkxFetcher(BaseFetcher):
 
 def _try_decode_type_id_from_custom_id(client_oid: str) -> int | None:
     custom_id = str(client_oid or "")
+    temporal_id = time_stop_type_id(custom_id)
+    if temporal_id is not None:
+        return temporal_id
     match = _TYPE_MARKER_RE.search(custom_id)
     if match:
         return int(match.group(1), 16)

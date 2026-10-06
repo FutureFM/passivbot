@@ -374,7 +374,10 @@ fn calc_reentry_price_bid(
     );
     let reentry_price = f64::min(
         round_dn(
-            position_price * (1.0 - entry_params.threshold_base_pct * spacing_multiplier),
+            runtime_context
+                .entry_reference_price
+                .unwrap_or(position_price)
+                * (1.0 - entry_params.threshold_base_pct * spacing_multiplier),
             exchange_params.price_step,
         ),
         order_book_bid,
@@ -411,7 +414,10 @@ fn calc_reentry_price_ask(
     );
     let reentry_price = f64::max(
         round_up(
-            position_price * (1.0 + entry_params.threshold_base_pct * spacing_multiplier),
+            runtime_context
+                .entry_reference_price
+                .unwrap_or(position_price)
+                * (1.0 + entry_params.threshold_base_pct * spacing_multiplier),
             exchange_params.price_step,
         ),
         order_book_ask,
@@ -1102,6 +1108,7 @@ pub fn calc_entries_long(
     position: &Position,
     trailing_price_bundle: &TrailingPriceBundle,
 ) -> Vec<Order> {
+    let mut entry_runtime = *runtime_context;
     let mut entries = Vec::<Order>::new();
     let mut psize = position.size;
     let mut pprice = position.price;
@@ -1117,7 +1124,7 @@ pub fn calc_entries_long(
             exchange_params,
             &state_params_mod,
             bot_params,
-            runtime_context,
+            &entry_runtime,
             entry_params,
             &position_mod,
             &trailing_price_bundle,
@@ -1161,6 +1168,7 @@ pub fn calc_entries_long(
             entry.price,
             exchange_params.qty_step,
         );
+        entry_runtime.entry_reference_price = None;
         bid = bid.min(entry.price);
         entries.push(entry);
     }
@@ -1176,6 +1184,7 @@ pub fn calc_entries_short(
     position: &Position,
     trailing_price_bundle: &TrailingPriceBundle,
 ) -> Vec<Order> {
+    let mut entry_runtime = *runtime_context;
     let mut entries = Vec::<Order>::new();
     let mut psize = position.size;
     let mut pprice = position.price;
@@ -1191,7 +1200,7 @@ pub fn calc_entries_short(
             exchange_params,
             &state_params_mod,
             bot_params,
-            runtime_context,
+            &entry_runtime,
             entry_params,
             &position_mod,
             &trailing_price_bundle,
@@ -1235,6 +1244,7 @@ pub fn calc_entries_short(
             entry.price,
             exchange_params.qty_step,
         );
+        entry_runtime.entry_reference_price = None;
         ask = ask.max(entry.price);
         entries.push(entry);
     }
@@ -1249,6 +1259,7 @@ mod tests {
 
     fn make_runtime_context() -> RuntimeOrderContext {
         RuntimeOrderContext {
+            entry_reference_price: None,
             effective_wallet_exposure_limit: 1.0,
         }
     }
