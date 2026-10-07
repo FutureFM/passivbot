@@ -15,3 +15,5 @@ psutil==7.2.2; python_version >= "3.14"
 requests==2.34.2
 dictdiffer==0.9.0
 quantstats==0.0.86
+# yfinance>=0.2.55 requires websockets>=13, which conflicts with the websockets pin above.
+yfinance==0.2.54
