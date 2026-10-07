@@ -1,0 +1,87 @@
+# D-TREND replica. Values below are the defaults; they follow the thread.
+# Change a value here, then run: dtrend research configs/dtrend.toml
+
+[data]
+data_dir = "data/binance"
+interval = "1d"
+start = "2021-01-01"
+# Empty list = every USDT perp in the store, delisted ones included (survivorship free).
+symbols = []
+universe_size = 50              # "top 50 coins"
+universe_lookback_days = 30     # rank by 30-day quote volume (Binance has no market cap)
+universe_rebalance = "MS"       # re-rank at each month start
+min_history_days = 60
+benchmark = "BTCUSDT"
+
+[forecast]
+target_abs_forecast = 10.0      # Carver: average |forecast| = 10
+cap = 20.0                      # forecasts capped at +-20
+scalar_min_periods = 60
+max_fdm = 2.5
+fdm_lookback_days = 500
+xs_min_instruments = 5
+
+[risk]
+target_vol = 0.50               # "50% annual vol"
+vol_span = 35
+vol_floor = 0.20
+max_idm = 2.5
+idm_lookback_days = 365
+leg_weighting = "equal_risk"    # "equal weighting by risk" (Narang)
+leg_vol_lookback_days = 365
+leg_scale_bounds = [0.5, 2.0]
+max_leg_dm = 2.5
+max_gross_leverage = 5.0
+recalc_every = "MS"
+
+[execution]
+cost_per_trade = 0.00095        # "9.5 bp once"
+buffer_fraction = 0.10          # Carver position buffer (10% of the average position)
+starting_equity = 10000.0       # "$10k starting balance"
+min_trade_notional = 5.0
+venue = "BINANCE"
+default_leverage = 10.0
+
+[analysis]
+decile_horizons = [1, 2, 3, 4, 5, 6, 7, 8]
+speed_limit_sr = 0.15           # Carver speed limit
+apply_speed_limit = false       # the thread found it lowers Sharpe; off by default
+
+# Legs: 4 TS factors x lookbacks, the same as XS momentum, and XS carry (~21 forecasts).
+# Remove this whole block to use the built-in defaults (identical to the block).
+[[legs]]
+name = "ts_momentum"
+mode = "ts"
+rules = [
+  { kind = "ewmac", lookback = 16, smooth = 0 },
+  { kind = "ewmac", lookback = 32, smooth = 0 },
+  { kind = "ewmac", lookback = 64, smooth = 0 },
+  { kind = "breakout", lookback = 20 },
+  { kind = "breakout", lookback = 40 },
+  { kind = "breakout", lookback = 80 },
+  { kind = "bollinger", lookback = 20 },
+  { kind = "bollinger", lookback = 40 },
+  { kind = "returns", lookback = 20 },
+  { kind = "returns", lookback = 60 },
+]
+
+[[legs]]
+name = "xs_momentum"
+mode = "xs"
+rules = [
+  { kind = "ewmac", lookback = 16, smooth = 0 },
+  { kind = "ewmac", lookback = 32, smooth = 0 },
+  { kind = "ewmac", lookback = 64, smooth = 0 },
+  { kind = "breakout", lookback = 20 },
+  { kind = "breakout", lookback = 40 },
+  { kind = "breakout", lookback = 80 },
+  { kind = "bollinger", lookback = 20 },
+  { kind = "bollinger", lookback = 40 },
+  { kind = "returns", lookback = 20 },
+  { kind = "returns", lookback = 60 },
+]
+
+[[legs]]
+name = "xs_carry"
+mode = "xs"
+rules = [{ kind = "carry", lookback = 3, smooth = 0 }]
