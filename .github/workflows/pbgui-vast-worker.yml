@@ -1,0 +1,122 @@
+name: PBGui Vast worker image
+
+# Builds the PBGui Vast GPU worker from this fork and publishes it to GHCR.
+# Pin the printed digest/revision in pbgui.ini [vast] on the PBGui host.
+on:
+  workflow_dispatch:
+    inputs:
+      pbgui_repository:
+        description: PBGui repository providing the worker (must match the PBGui host)
+        default: msei99/pbgui
+        required: true
+      pbgui_ref:
+        description: PBGui tag/commit whose setup/vast_gpu_benchmark/cloud_worker.py is baked in
+        default: v2.08.5
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: pbgui-vast-worker-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          docker system prune --all --force
+          df -h /
+
+      - name: Check out fork
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          path: build/passivbot
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Check out PBGui worker
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          repository: ${{ inputs.pbgui_repository }}
+          ref: ${{ inputs.pbgui_ref }}
+          path: pbgui
+          sparse-checkout: setup/vast_gpu_benchmark
+          persist-credentials: false
+
+      - name: Prepare build context
+        id: meta
+        run: |
+          cp build/passivbot/container/pbgui-vast-worker/Dockerfile build/Dockerfile
+          cp pbgui/setup/vast_gpu_benchmark/cloud_worker.py build/cloud_worker.py
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          echo "image=ghcr.io/${owner}/pbgui-pb8-worker" >> "$GITHUB_OUTPUT"
+          echo "tag=pb8-${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+          echo "pbgui_commit=$(git -C pbgui rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Build image
+        run: |
+          DOCKER_BUILDKIT=1 docker build build \
+            --build-arg PB8_REVISION="${GITHUB_SHA}" \
+            --label org.opencontainers.image.source="https://github.com/${GITHUB_REPOSITORY}" \
+            --label org.opencontainers.image.revision="${GITHUB_SHA}" \
+            --label io.pbgui.worker.commit="${{ steps.meta.outputs.pbgui_commit }}" \
+            -t "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}"
+
+      - name: Verify offline (no GPU, no network)
+        run: |
+          image="${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}"
+          docker run --rm --network none "$image" bash -ec '
+            test "$(cat /opt/pb8-revision)" = "'"${GITHUB_SHA}"'"
+            python -m py_compile /opt/pbgui/worker.py
+            cd /opt/passivbot
+            PYTHONPATH=/opt/passivbot/src python -c "
+          from rust_utils import verify_loaded_runtime_extension
+          state = verify_loaded_runtime_extension()
+          assert state[\"runtime_compiled_source_stamp\"] == state[\"expected_source_fingerprint\"]
+          from config.load import load_prepared_config
+          import historical_selection, optimization.gpu.cuda_kernel, optimization.backends.gpu_backend
+          print(\"PB8 runtime OK\")
+          "'
+          docker run --rm --network none -v "$PWD/pbgui/setup/vast_gpu_benchmark:/check:ro" "$image" bash -ec '
+            cd /opt/passivbot && PYTHONPATH=/opt/passivbot/src python /check/export_metric_contract.py > /tmp/contract.json
+            python - <<EOF
+          import json
+          built = json.load(open("/tmp/contract.json"))
+          pinned = json.load(open("/check/gpu_metric_contract.json"))
+          for key in ("allowed_metrics", "exact_only_metrics"):
+              assert set(built[key]) == set(pinned[key]), f"GPU metric contract differs from PBGui: {key}"
+          print("GPU metric contract matches PBGui")
+          EOF'
+
+      - name: Push to GHCR
+        id: push
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          image="${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}"
+          docker push "$image"
+          digest="$(docker inspect --format '{{index .RepoDigests 0}}' "$image")"
+          # PBGui verifies a single image manifest (not an index) by digest.
+          docker buildx imagetools inspect --raw "$digest" | python3 -c 'import json,sys; m=json.load(sys.stdin).get("mediaType"); assert m in ("application/vnd.docker.distribution.manifest.v2+json","application/vnd.oci.image.manifest.v1+json"), f"PBGui needs a single image manifest, got {m}"; print(m)'
+          echo "pinned=${digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Summary
+        run: |
+          {
+            echo "## PBGui Vast worker published"
+            echo
+            echo "Make the GHCR package **public** (Package settings → Change visibility), then on the PBGui host:"
+            echo
+            echo '```ini'
+            echo '[vast]'
+            echo "worker_image = ${{ steps.push.outputs.pinned }}"
+            echo "worker_revision = ${GITHUB_SHA}"
+            echo '```'
+            echo
+            echo "Worker from ${{ inputs.pbgui_repository }}@${{ steps.meta.outputs.pbgui_commit }}. Restart PBGui after editing pbgui.ini."
+          } >> "$GITHUB_STEP_SUMMARY"
