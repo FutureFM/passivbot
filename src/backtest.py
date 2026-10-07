@@ -179,13 +179,13 @@ import passivbot_rust as pbr  # noqa: E402
 verify_loaded_runtime_extension()
 from tools.event_loop_policy import set_windows_event_loop_policy
 
-PLOT_GROUP_SUMMARY = {"balance", "twe", "pnl", "hard_stop"}
+PLOT_GROUP_SUMMARY = {"balance", "twe", "pnl", "hard_stop", "quantstats"}
 PLOT_GROUP_ALL = PLOT_GROUP_SUMMARY | {"coin_fills"}
 DISABLE_PLOTTING_HELP = (
     "Disable selected plot groups. Use without a value to disable all plotting. "
-    "Allowed values: all, summary, balance, twe, pnl, hard_stop, coin_fills, "
+    "Allowed values: all, summary, balance, twe, pnl, hard_stop, quantstats, coin_fills, "
     "or a comma-separated combination. summary disables balance, twe, pnl, "
-    "and hard_stop; coin_fills disables per-coin fill plots only."
+    "hard_stop and the quantstats HTML report; coin_fills disables per-coin fill plots only."
 )
 HLCVS_CACHE_ROOT = Path("caches") / "hlcvs_data"
 HLCVS_CACHE_HASH_LEN = 16
@@ -232,7 +232,8 @@ def parse_disabled_plot_groups(value) -> set[str]:
             disabled.add(token)
         else:
             raise ValueError(
-                "disable_plotting must be one of all, summary, balance, twe, pnl, hard_stop, coin_fills"
+                "disable_plotting must be one of all, summary, balance, twe, pnl, hard_stop, "
+                "quantstats, coin_fills"
             )
     return disabled
 
@@ -3111,6 +3112,12 @@ def post_process(
         )
         if hard_stop_figs:
             save_figures(hard_stop_figs, results_path)
+    if "quantstats" not in disabled_plot_groups:
+        from quantstats_report import write_quantstats_report
+
+        write_quantstats_report(
+            bal_eq, results_path, title=f"{label_prefix}Passivbot {exchange} backtest".strip()
+        )
     if "coin_fills" not in disabled_plot_groups:
         try:
             coins = require_config_value(config, f"backtest.coins.{exchange}")

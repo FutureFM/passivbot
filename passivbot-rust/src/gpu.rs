@@ -444,6 +444,16 @@ mod tests {
     }
 
     #[test]
+    fn ema_anchor_sources_crop_entries_at_the_position_exposure_limit() {
+        // Exact Rust caps ema_anchor entries at WEL x (1 + excess allowance).
+        assert!(
+            MPS_EMA_ANCHOR_BODY.contains("? fmin(side.allowed_wel, gate_cap) : side.allowed_wel;")
+        );
+        assert!(MPS_EMA_ANCHOR_MULTICOIN_BODY
+            .contains("float position_cap = allowed_coin_wel - 1.0e-7f;"));
+    }
+
+    #[test]
     fn all_strategy_sources_compose_one_shared_btc_risk_controller() {
         for body in [
             MPS_EMA_ANCHOR_BODY,

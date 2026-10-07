@@ -65,8 +65,11 @@ running Python tests that exercise them.
 
 This branch line (fork of `enarjord/passivbot`, synced with upstream `master` / schema v8.6.0) adds
 the features below. Each has a contract doc — read it before changing the feature. Divergence,
-time stops and historical selection are CPU-only: the GPU optimizer rejects them, and its
-`ema_anchor` screening warns that it does not model the exposure cap (exact CPU validation does).
+time stops and historical selection are not modeled by GPU screening: the GPU optimizer warns,
+ranks without them and pins their searchable bounds to the configured values
+(`pin_cpu_only_feature_bounds`); exact CPU validation of results applies them. The `ema_anchor`
+exposure cap IS modeled on GPU (`mps_ema_anchor_directional.metal` `entry_cap`, multicoin
+`position_cap`); keep both in sync with `strategies/ema_anchor.rs`.
 
 | Feature | Config | Contract / user doc | Main code |
 |---|---|---|---|
@@ -76,6 +79,7 @@ time stops and historical selection are CPU-only: the GPU optimizer rejects them
 | `ema_anchor` per-position exposure cap (entries cropped at WEL × (1+excess allowance)) | always on | CHANGELOG | `passivbot-rust/src/strategies/ema_anchor.rs` |
 | Time-based stops: reduce-only market closes (`close_time_stop_<side>`) after N days; clock and partial-close target are reconstructed from fills + client order IDs (target encoded in the ID), no local timer | `risk.time_stop_*` | `docs/ai/features/time_stop.md`, `docs/time_stop.md` | Rust `calc_time_stop_close` in `orchestrator.rs`; `src/time_stop.py` (`reconstruct_episodes`, ID encode/decode), `src/passivbot.py`, `src/live/reconciler.py` |
 | `pnl_by_coin.png` backtest chart | — | `docs/backtesting.md` | `src/plotting.py` |
+| `quantstats_report.html` tearsheet of daily strategy-equity returns (optional dep, never fails the backtest) | `-dp quantstats` disables | `docs/backtesting.md` | `src/quantstats_report.py`, called from `src/backtest.py` |
 
 Shared mechanics worth knowing: `time_stop.reconstruct_episodes` replays the fill stream to rebuild
 the time-stop clock and target; missing/ambiguous evidence yields `None`, which Rust treats as

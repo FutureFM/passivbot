@@ -324,7 +324,10 @@ inline EmaSide load_side(constant float* params, int po, float seed_close) {
     if (isfinite(twel_threshold) && twel_threshold > 0.0f) {
         gate_cap = fmin(side.twel, side.twel * twel_threshold);
     }
-    side.entry_cap = twel_entry_gate_enabled ? gate_cap : INFINITY;
+    // Exact Rust crops ema_anchor entries at the per-position limit with excess
+    // allowance; the TWEL entry gate can only tighten it (as in Trailing Martingale).
+    side.entry_cap = twel_entry_gate_enabled
+        ? fmin(side.allowed_wel, gate_cap) : side.allowed_wel;
     side.twel_enforcer_threshold = twel_threshold;
     side.twel_enforcer_enabled = params[po + 16] > 0.5f;
     side.unstuck_enabled = params[po + 17] > 0.5f;

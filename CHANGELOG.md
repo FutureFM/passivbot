@@ -6,6 +6,10 @@ since the latest release tag; these features may already be available when insta
 
 ## Unreleased
 
+- Write `quantstats_report.html` after each backtest: a QuantStats tearsheet of daily
+  strategy-equity returns (no benchmark, offline). Disable with `-dp quantstats`. Daily closes
+  understate intraday drawdowns; the analysis metrics remain the risk reference.
+
 - Add optional 1-day and 3-day horizons to divergence protection
   (`bot.<side>.risk.divergence_extended_horizons`, default off). A coin that collapsed and then
   traded sideways stays flagged instead of losing protection once the 5–240 minute horizons
@@ -20,9 +24,10 @@ since the latest release tag; these features may already be available when insta
 
 - Time-stop partial reductions capped by `time_stop_close_we_max` no longer shrink when
   divergence protection lowers the WEL of the same coin. Divergence, time stops, historical
-  selection and the `ema_anchor` exposure cap are CPU-only. GPU optimization rejects configs
-  that enable the first three; `ema_anchor` GPU screening warns that it ranks candidates
-  without the exposure cap, which exact CPU validation of accepted results applies.
+  selection are not modeled by GPU screening. GPU optimization warns and ranks candidates
+  without them, while exact CPU validation of accepted results applies them; searchable
+  divergence/time-stop bounds are pinned to their configured values with a warning. GPU
+  screening models the `ema_anchor` exposure cap in both single-coin and multi-coin kernels.
 
 - Add optional time-based position reductions for every strategy and both sides.
   Stops complete a configured fraction with reduce-only market orders, may realize losses

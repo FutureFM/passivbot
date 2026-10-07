@@ -55,7 +55,7 @@ price or PnL. EMA-anchor quotes retain their existing geometry.
 
 The adaptive entry cooldown (`bot.<side>.entry_cooldown`) still applies; this feature adds
 no separate reentry cooldown after flattening. Stop duration has no 24-hour strategy cap.
-Time stops are CPU-only; GPU optimization rejects configs or bounds that enable them.
+GPU screening does not model time stops: it warns, pins their bounds to the configured values, and exact CPU validation of accepted results applies them.
 
 Optimizer bounds use the same nested paths under `optimize.bounds.<side>.risk`.
 Default stop bounds are fixed at disabled settings. Set explicit bounds when tuning

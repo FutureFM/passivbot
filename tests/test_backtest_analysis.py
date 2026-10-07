@@ -1022,13 +1022,18 @@ def test_parse_disabled_plot_groups_accepts_summary_alias_and_commas():
         "twe",
         "pnl",
         "hard_stop",
+        "quantstats",
         "coin_fills",
     }
 
 
 def test_disable_plotting_help_lists_every_plot_group():
     assert "hard_stop" in DISABLE_PLOTTING_HELP
-    assert "summary disables balance, twe, pnl, and hard_stop" in DISABLE_PLOTTING_HELP
+    assert "quantstats" in DISABLE_PLOTTING_HELP
+    assert (
+        "summary disables balance, twe, pnl, hard_stop and the quantstats HTML report"
+        in DISABLE_PLOTTING_HELP
+    )
     assert "coin_fills disables per-coin fill plots only" in DISABLE_PLOTTING_HELP
 
 

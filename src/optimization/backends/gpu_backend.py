@@ -463,6 +463,11 @@ GPU_SUPPORTED_SUITE_NON_BOT_OVERRIDE_PATHS = {
     ("backtest", "limit_order_fill_buffer_pct"),
     ("backtest", "maker_fee_override"),
     ("backtest", "market_order_slippage_pct"),
+    # Historical selection restricts the scenario universe before data preparation;
+    # GPU screening trades that union without daily eligibility, exact CPU applies it.
+    ("backtest", "organillo_carton_hash"),
+    ("backtest", "organillo_carton_path"),
+    ("backtest", "organillo_mode"),
     ("backtest", "starting_balance"),
     ("backtest", "taker_fee_override"),
     ("coin_overrides",),
@@ -476,40 +481,74 @@ GPU_SUPPORTED_SUITE_NON_BOT_OVERRIDE_PATHS = {
 }
 
 
-def _reject_cpu_only_features(config: dict, strategy_kind: str) -> None:
-    """GPU kernels do not model these CPU features; screening without them is unsafe."""
+CPU_ONLY_RISK_BOUND_PREFIXES = ("divergence_", "time_stop_")
+_WARNED_CPU_ONLY_FEATURES: set[str] = set()
 
-    unsupported = []
+
+def pin_cpu_only_feature_bounds(config: dict) -> list[str]:
+    """Pin searchable bounds of CPU-only features to their configured values.
+
+    GPU screening cannot search them; pinning keeps the configured value in both the
+    proxy and the exact CPU validation instead of failing the whole run.
+    """
+
+    pinned = []
+    bounds = config.get("optimize", {}).get("bounds", {}) or {}
+    for side in ("long", "short"):
+        risk_bounds = (bounds.get(side, {}) or {}).get("risk", {}) or {}
+        risk = config.get("bot", {}).get(side, {}).get("risk", {}) or {}
+        for key, bound in list(risk_bounds.items()):
+            if not key.startswith(CPU_ONLY_RISK_BOUND_PREFIXES):
+                continue
+            if not isinstance(bound, (list, tuple)) or len(bound) < 2:
+                continue
+            low, high = float(bound[0]), float(bound[1])
+            if high <= low:
+                continue
+            value = min(max(float(risk.get(key, low)), low), high)
+            risk_bounds[key] = [value, value]
+            pinned.append(f"{side}.risk.{key}={value:g}")
+    if pinned:
+        logging.warning(
+            "GPU optimization cannot search CPU-only feature bounds; pinned to configured "
+            "values: %s. Use optimize.backend='pymoo' to search them.",
+            ", ".join(pinned),
+        )
+    return pinned
+
+
+def _warn_cpu_only_features(config: dict, strategy_kind: str) -> None:
+    """GPU screening does not model these CPU features; exact CPU validation does."""
+
+    unmodeled = []
     if bool(config.get("backtest", {}).get("organillo_mode", False)):
-        unsupported.append("backtest.organillo_mode (historical coin selection)")
-    bounds = config.get("optimize", {}).get("bounds", {})
+        unmodeled.append("historical coin selection (backtest.organillo_mode)")
     for side in ("long", "short"):
         risk = config.get("bot", {}).get(side, {}).get("risk", {}) or {}
         if bool(risk.get("divergence_filter_enabled", False)):
-            unsupported.append(f"bot.{side}.risk.divergence_filter_enabled")
-        side_risk_bounds = (bounds.get(side, {}) or {}).get("risk", {}) or {}
-        age_bound = side_risk_bounds.get("time_stop_max_age_days")
-        if float(risk.get("time_stop_max_age_days", 0.0) or 0.0) > 0.0 or (
-            isinstance(age_bound, (list, tuple)) and len(age_bound) >= 2
-            and float(age_bound[1]) > 0.0
-        ):
-            unsupported.append(f"bot.{side}.risk.time_stop_* (time-based stops)")
-    for coin, override in (config.get("coin_overrides") or {}).items():
-        for side in ("long", "short"):
-            risk = (((override or {}).get("bot") or {}).get(side) or {}).get("risk") or {}
-            if float(risk.get("time_stop_max_age_days", 0.0) or 0.0) > 0.0:
-                unsupported.append(f"coin_overrides.{coin}.bot.{side}.risk.time_stop_*")
-    if unsupported:
-        raise ValueError(
-            "GPU optimization does not model these CPU-only features: "
-            + "; ".join(unsupported)
-            + ". Use optimize.backend='pymoo' or 'deap'."
+            unmodeled.append(f"bot.{side}.risk divergence protection")
+        if float(risk.get("time_stop_max_age_days", 0.0) or 0.0) > 0.0:
+            unmodeled.append(f"bot.{side}.risk time-based stops")
+    if any(
+        float(
+            (((override or {}).get("bot") or {}).get(side) or {}).get("risk", {}).get(
+                "time_stop_max_age_days", 0.0
+            )
+            or 0.0
         )
-    if strategy_kind == "ema_anchor":
+        > 0.0
+        for override in (config.get("coin_overrides") or {}).values()
+        for side in ("long", "short")
+    ):
+        unmodeled.append("coin_overrides time-based stops")
+    message = "; ".join(dict.fromkeys(unmodeled))
+    if unmodeled and message not in _WARNED_CPU_ONLY_FEATURES:
+        _WARNED_CPU_ONLY_FEATURES.add(message)
         logging.warning(
-            "GPU screening does not model the ema_anchor per-position exposure cap; "
-            "candidates are ranked without it, while exact CPU validation of accepted "
-            "results applies it. Use optimize.backend='pymoo' for an exact search."
+            "GPU screening does not model %s; candidates are ranked without them, while "
+            "exact CPU validation of accepted results applies them. Use "
+            "optimize.backend='pymoo' for an exact search.",
+            message,
         )
 
 
@@ -520,7 +559,7 @@ def _validate_gpu_static_scope(config: dict) -> str:
         config.get("backtest", {}).get("limit_order_fill_buffer_pct", 0.0)
     )
     strategy_kind = str(config.get("live", {}).get("strategy_kind", "")).strip().lower()
-    _reject_cpu_only_features(config, strategy_kind)
+    _warn_cpu_only_features(config, strategy_kind)
     if strategy_kind not in GPU_SUPPORTED_STRATEGY_KINDS:
         detail = (
             "trailing_grid_v7 is deliberately outside the Apple MPS scope"

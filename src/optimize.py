@@ -3494,6 +3494,9 @@ def _run_gpu_preparation_preflight(
         validate_gpu_preparation_scope,
     )
 
+    from optimization.backends.gpu_backend import pin_cpu_only_feature_bounds
+
+    pin_cpu_only_feature_bounds(config)
     effective_config = materialize_gpu_preparation_config(config)
     normalized_suite_cfg = dict(suite_cfg)
     if bool(normalized_suite_cfg.get("enabled")):
