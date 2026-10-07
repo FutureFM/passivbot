@@ -6,6 +6,7 @@ import pytest
 
 from quantstats_report import (
     QUANTSTATS_REPORT_FILENAME,
+    daily_btc_returns,
     daily_strategy_returns,
     write_quantstats_report,
 )
@@ -14,7 +15,15 @@ from quantstats_report import (
 def hourly_equity(days=40, start=10_000.0):
     index = pd.date_range("2025-01-01", periods=days * 24, freq="1h")
     growth = np.cumprod(np.full(len(index), 1.0002))
-    return pd.DataFrame({"strategy_equity": start * growth, "usd_total_balance": start}, index=index)
+    btc_price = 50_000.0 * np.cumprod(np.full(len(index), 0.9999))
+    return pd.DataFrame(
+        {
+            "strategy_equity": start * growth,
+            "usd_total_balance": start,
+            "btc_total_balance": start / btc_price,
+        },
+        index=index,
+    )
 
 
 def test_daily_returns_use_last_strategy_equity_of_each_utc_day():
@@ -59,3 +68,24 @@ def test_missing_strategy_equity_or_library_error_never_fails(tmp_path, monkeypa
     monkeypatch.setattr(qs.reports, "html", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
     assert write_quantstats_report(hourly_equity(), str(tmp_path), title="x") is None
     assert "failed to write" in caplog.text and "boom" in caplog.text
+
+
+def test_btc_benchmark_comes_from_the_backtest_btc_conversion():
+    bal_eq = hourly_equity(days=5)
+    returns = daily_btc_returns(bal_eq)
+    price = (bal_eq["usd_total_balance"] / bal_eq["btc_total_balance"]).resample("1D").last()
+    assert returns.name == "BTC"
+    assert returns.iloc[0] == pytest.approx(price.iloc[1] / price.iloc[0] - 1)
+
+
+def test_missing_or_flat_btc_price_means_no_benchmark():
+    bal_eq = hourly_equity(days=5)
+    assert daily_btc_returns(bal_eq.drop(columns="btc_total_balance")) is None
+    bal_eq["btc_total_balance"] = bal_eq["usd_total_balance"]  # constant price of 1
+    assert daily_btc_returns(bal_eq) is None
+
+
+def test_report_includes_btc_benchmark(tmp_path):
+    write_quantstats_report(hourly_equity(), str(tmp_path), title="bench")
+    html = (tmp_path / QUANTSTATS_REPORT_FILENAME).read_text(encoding="utf-8")
+    assert "BTC" in html

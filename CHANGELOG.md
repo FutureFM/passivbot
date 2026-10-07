@@ -7,7 +7,7 @@ since the latest release tag; these features may already be available when insta
 ## Unreleased
 
 - Write `quantstats_report.html` after each backtest: a QuantStats tearsheet of daily
-  strategy-equity returns (no benchmark, offline). Disable with `-dp quantstats`. Daily closes
+  strategy-equity returns benchmarked against BTC, using the backtest's own BTC prices (offline). Disable with `-dp quantstats`. Daily closes
   understate intraday drawdowns; the analysis metrics remain the risk reference.
 
 - Add optional 1-day and 3-day horizons to divergence protection

@@ -1,6 +1,7 @@
 """QuantStats HTML tearsheet of a backtest's daily strategy-equity returns."""
 
 import logging
+import math
 import os
 
 import pandas as pd
@@ -19,6 +20,27 @@ def daily_strategy_returns(bal_eq: pd.DataFrame) -> pd.Series:
     daily = pd.Series(equity.to_numpy(), index=index).resample("1D").last().dropna()
     returns = daily.pct_change().dropna()
     returns.name = "strategy"
+    return returns
+
+
+def daily_btc_returns(bal_eq: pd.DataFrame) -> pd.Series | None:
+    """Daily BTC/USD returns implied by the simulation's own BTC conversion.
+
+    `usd_total_balance / btc_total_balance` is the BTC price used by the backtest, so the
+    benchmark needs no download. Returns None when that price is unavailable or constant.
+    """
+    if not {"usd_total_balance", "btc_total_balance"}.issubset(bal_eq.columns):
+        return None
+    usd = pd.to_numeric(bal_eq["usd_total_balance"], errors="coerce")
+    btc = pd.to_numeric(bal_eq["btc_total_balance"], errors="coerce")
+    price = (usd / btc).where((usd > 0) & (btc > 0))
+    index = pd.DatetimeIndex(pd.to_datetime(bal_eq.index))
+    daily = pd.Series(price.to_numpy(), index=index).resample("1D").last().dropna()
+    daily = daily[daily.map(math.isfinite)]
+    if len(daily) < 3 or daily.max() == daily.min():
+        return None
+    returns = daily.pct_change().dropna()
+    returns.name = "BTC"
     return returns
 
 
@@ -46,10 +68,14 @@ def write_quantstats_report(bal_eq: pd.DataFrame, results_path: str, *, title: s
         )
         return None
     path = os.path.join(results_path, QUANTSTATS_REPORT_FILENAME)
-    # No benchmark: a ticker benchmark would make the report download market data.
+    # A ticker string would make quantstats download market data; pass the series instead.
+    benchmark = daily_btc_returns(bal_eq)
+    if benchmark is None:
+        logging.info("%s: no BTC price series; writing it without benchmark", QUANTSTATS_REPORT_FILENAME)
     try:
         qs.reports.html(
             returns,
+            benchmark=benchmark,
             output=path,
             title=title,
             periods_per_year=PERIODS_PER_YEAR,

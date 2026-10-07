@@ -152,8 +152,10 @@ Organillo and is disabled together with the other PnL plots by `-dp pnl`,
 `-dp summary`, or `-dp`.
 
 Each backtest also writes `quantstats_report.html`, a [QuantStats](https://github.com/ranaroussi/quantstats)
-tearsheet of daily `strategy_equity` returns (UTC calendar-day closes, 365 periods per year, no
-benchmark, so it needs no network access). Daily closes hide intraday moves: its drawdown and
+tearsheet of daily `strategy_equity` returns (UTC calendar-day closes, 365 periods per year) with
+BTC as benchmark. The BTC series is the backtest's own BTC/USD price
+(`usd_total_balance / btc_total_balance`), so the report needs no network access; without a valid
+BTC price it is written without benchmark. Daily closes hide intraday moves: its drawdown and
 volatility figures can be far smaller than Passivbot's minute-resolution
 `drawdown_worst_strategy_eq`, so use the analysis metrics for intraday risk. Disable it with
 `-dp quantstats`, `-dp summary` or `-dp`. It requires `quantstats` (in `requirements-full.txt`);
