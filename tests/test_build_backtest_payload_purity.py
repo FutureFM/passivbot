@@ -14,12 +14,14 @@ from copy import deepcopy
 import numpy as np
 import pytest
 
+import backtest
 from backtest import (
     _apply_market_settings_override,
     _validate_hlcvs_valid_windows,
     build_backtest_payload,
 )
 from config_utils import get_template_config
+from ohlcv_utils import aggregate_hlcvs
 import utils
 
 
@@ -119,6 +121,8 @@ def test_build_backtest_payload_keeps_per_side_approved_coin_universe():
 
     assert payload.bot_params_list[coin4_idx]["long"]["wallet_exposure_limit"] == 0.0
     assert payload.bot_params_list[coin4_idx]["short"]["wallet_exposure_limit"] != 0.0
+    assert payload.bot_params_list[coin4_idx]["long"]["entry_eligible"] is False
+    assert payload.bot_params_list[coin4_idx]["short"]["entry_eligible"] is True
 
 
 def test_market_settings_overrides_match_exact_and_alias_keys(tmp_path, monkeypatch):
@@ -490,9 +494,9 @@ def test_build_backtest_payload_uses_global_warmup_floor(monkeypatch):
     hlcvs, btc, timestamps = _synthetic_1m_hlcvs(n_minutes, start_ts)
     monkeypatch.setattr(
         "backtest.compute_per_coin_warmup_minutes",
-        lambda _config: {"__default__": 30, "BTC": 30},
+        lambda _config, **_kwargs: {"__default__": 30, "BTC": 30},
     )
-    monkeypatch.setattr("backtest.compute_backtest_warmup_minutes", lambda _config: 100)
+    monkeypatch.setattr("backtest.compute_backtest_warmup_minutes", lambda _config, **_kwargs: 100)
 
     payload = build_backtest_payload(hlcvs, mss, config, "binance", btc, timestamps)
 
@@ -590,6 +594,218 @@ def test_hlcvs_valid_window_rejects_nonfinite_volume_inside_valid_window():
             [mss["BTC"]["first_valid_index"]],
             [mss["BTC"]["last_valid_index"]],
         )
+
+
+def test_gpu_hlcvs_validation_allows_internal_all_nan_hlc_gap_only_when_enabled():
+    start_ts = 1609459200000
+    n_minutes = 10
+    config = _base_config(candle_interval_minutes=1)
+    mss = _base_mss(start_ts)
+    mss["BTC"]["first_valid_index"] = 0
+    mss["BTC"]["last_valid_index"] = n_minutes - 1
+    hlcvs, btc, timestamps = _synthetic_1m_hlcvs(n_minutes, start_ts)
+    hlcvs[4, 0, :] = np.nan
+
+    with pytest.raises(ValueError, match=r"coin=BTC .* k=4 .* field=high"):
+        _validate_hlcvs_valid_windows(
+            hlcvs,
+            timestamps,
+            ["BTC"],
+            [mss["BTC"]["first_valid_index"]],
+            [mss["BTC"]["last_valid_index"]],
+        )
+    _validate_hlcvs_valid_windows(
+        hlcvs,
+        timestamps,
+        ["BTC"],
+        [mss["BTC"]["first_valid_index"]],
+        [mss["BTC"]["last_valid_index"]],
+        allow_internal_nan_gaps=True,
+    )
+
+    payload = build_backtest_payload(
+        hlcvs,
+        mss,
+        config,
+        "binance",
+        btc,
+        timestamps,
+    )
+
+    assert np.isnan(payload.bundle.hlcvs[4, 0, :3]).all()
+
+
+@pytest.mark.asyncio
+async def test_prepare_hlcvs_mss_requires_explicit_gpu_nan_gap_context(
+    monkeypatch, tmp_path
+):
+    start_ts = 1609459200000
+    n_minutes = 10
+    config = _base_config(candle_interval_minutes=1)
+    config["backtest"]["base_dir"] = str(tmp_path)
+    config["optimize"]["backend"] = "gpu"
+    mss = _base_mss(start_ts)
+    mss["BTC"]["first_valid_index"] = 0
+    mss["BTC"]["last_valid_index"] = n_minutes - 1
+    hlcvs, btc, timestamps = _synthetic_1m_hlcvs(n_minutes, start_ts)
+    hlcvs[4, 0, :] = np.nan
+    monkeypatch.setattr(
+        backtest,
+        "load_hlcvs_data_override",
+        lambda _config, _exchange: (
+            tmp_path,
+            ["BTC"],
+            hlcvs,
+            mss,
+            str(tmp_path),
+            btc,
+            timestamps,
+        ),
+    )
+
+    with pytest.raises(ValueError, match=r"coin=BTC .* k=4 .* field=high"):
+        await backtest.prepare_hlcvs_mss(config, "binance")
+
+    result = await backtest.prepare_hlcvs_mss(
+        config,
+        "binance",
+        allow_internal_nan_gaps=True,
+    )
+    assert np.isnan(result[1][4, 0, :3]).all()
+
+
+def test_hlcvs_valid_window_rejects_internal_all_infinite_hlc_row():
+    start_ts = 1609459200000
+    n_minutes = 10
+    mss = _base_mss(start_ts)
+    mss["BTC"]["first_valid_index"] = 0
+    mss["BTC"]["last_valid_index"] = n_minutes - 1
+    hlcvs, _btc, timestamps = _synthetic_1m_hlcvs(n_minutes, start_ts)
+    hlcvs[4, 0, :3] = np.inf
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"non-finite HLCV value inside valid backtest window: "
+            r"coin=BTC .* k=4 .* field=high"
+        ),
+    ):
+        _validate_hlcvs_valid_windows(
+            hlcvs,
+            timestamps,
+            ["BTC"],
+            [mss["BTC"]["first_valid_index"]],
+            [mss["BTC"]["last_valid_index"]],
+            allow_internal_nan_gaps=True,
+        )
+
+
+def test_gpu_gap_aggregation_ignores_only_complete_nan_hlc_rows():
+    hlcvs = np.array(
+        [
+            [[10.0, 8.0, 9.0, 2.0]],
+            [[np.nan, np.nan, np.nan, np.nan]],
+            [[12.0, 7.0, 11.0, 3.0]],
+            [[np.nan, np.nan, np.nan, np.nan]],
+            [[np.nan, np.nan, np.nan, np.nan]],
+            [[np.nan, np.nan, np.nan, np.nan]],
+        ],
+        dtype=np.float64,
+    )
+
+    aggregated = aggregate_hlcvs(
+        hlcvs,
+        3,
+        preserve_internal_nan_gaps=True,
+    )
+
+    np.testing.assert_allclose(aggregated[0, 0], [12.0, 7.0, 11.0, 5.0])
+    assert np.isnan(aggregated[1, 0, :3]).all()
+    assert aggregated[1, 0, 3] == 0.0
+
+    partial = hlcvs[:3].copy()
+    partial[1, 0] = [np.nan, 8.0, 9.0, 1.0]
+    partial_aggregated = aggregate_hlcvs(
+        partial,
+        3,
+        preserve_internal_nan_gaps=True,
+    )
+    assert np.isnan(partial_aggregated[0, 0, 0])
+    assert np.isnan(partial_aggregated[0, 0, 2])
+    assert np.isfinite(partial_aggregated[0, 0, [1, 3]]).all()
+
+
+@pytest.mark.parametrize(
+    "malformed_hlc",
+    [
+        [10.0, 8.0, 0.0],
+        [10.0, 8.0, -1.0],
+        [np.inf, 8.0, 9.0],
+        [10.0, 8.0, float(np.finfo(np.float32).max) * 2.0],
+        [10.0, 8.0, float(np.nextafter(0.0, 1.0))],
+    ],
+)
+def test_gpu_gap_aggregation_preserves_malformed_non_gap_rows(malformed_hlc):
+    hlcvs = np.array(
+        [
+            [[*malformed_hlc, 1.0]],
+            [[12.0, 7.0, 11.0, 2.0]],
+        ],
+        dtype=np.float64,
+    )
+
+    aggregated = aggregate_hlcvs(
+        hlcvs,
+        2,
+        preserve_internal_nan_gaps=True,
+    )
+
+    assert np.isnan(aggregated[0, 0, 2])
+
+
+def test_gpu_hlcvs_validation_rejects_nan_first_valid_boundary():
+    hlcvs = np.ones((4, 1, 4), dtype=np.float64)
+    hlcvs[1, 0, :3] = np.nan
+
+    with pytest.raises(ValueError, match="all-NaN H/L/C.*first-valid boundary"):
+        _validate_hlcvs_valid_windows(
+            hlcvs,
+            None,
+            ["BTC"],
+            [1],
+            [3],
+            allow_internal_nan_gaps=True,
+        )
+
+
+def test_gpu_hlcvs_validation_rejects_nan_forced_delist_endpoint():
+    hlcvs = np.ones((1402, 1, 4), dtype=np.float64)
+    hlcvs[1, 0] = np.nan
+
+    with pytest.raises(ValueError, match="all-NaN H/L/C.*forced-delist endpoint"):
+        _validate_hlcvs_valid_windows(
+            hlcvs,
+            None,
+            ["BTC"],
+            [0],
+            [1],
+            allow_internal_nan_gaps=True,
+        )
+
+
+def test_gpu_hlcvs_raw_delist_gate_scales_with_candle_interval():
+    hlcvs = np.ones((1502, 1, 4), dtype=np.float64)
+    hlcvs[1, 0, :3] = np.nan
+
+    _validate_hlcvs_valid_windows(
+        hlcvs,
+        None,
+        ["BTC"],
+        [0],
+        [1],
+        allow_internal_nan_gaps=True,
+        candle_interval_minutes=5,
+    )
 
 
 def test_build_backtest_payload_allows_sparse_nan_outside_valid_window():
@@ -745,6 +961,105 @@ def test_build_backtest_payload_reports_active_source_column_for_nonfinite_price
             [mss["BTC"]["last_valid_index"]],
             coin_indices=[2],
         )
+
+
+def test_hlcvs_valid_window_chunking_preserves_coin_first_error_order():
+    start_ts = 1609459200000
+    n_minutes = 12
+    coins = ["BTC", "ETH"]
+    hlcvs = np.ones((n_minutes, len(coins), 4), dtype=np.float64)
+    timestamps = np.arange(
+        start_ts, start_ts + n_minutes * 60_000, 60_000, dtype=np.int64
+    )
+    # The legacy validator traverses coins first, so BTC's later bad row must
+    # still win over ETH's earlier bad row after switching to time-major chunks.
+    hlcvs[10, 0, 3] = np.nan
+    hlcvs[1, 1, 0] = np.inf
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"non-finite HLCV value inside valid backtest window: "
+            r"coin=BTC payload_index=0 source_column=0 k=10 .* field=volume"
+        ),
+    ):
+        _validate_hlcvs_valid_windows(
+            hlcvs,
+            timestamps,
+            coins,
+            [0, 0],
+            [n_minutes - 1, n_minutes - 1],
+            target_chunk_bytes=2 * len(coins) * 4 * np.dtype(np.float64).itemsize,
+        )
+
+
+def test_hlcvs_valid_window_chunking_ignores_nonfinite_outside_each_coin_window():
+    n_minutes = 12
+    hlcvs = np.ones((n_minutes, 2, 4), dtype=np.float64)
+    hlcvs[:3, 0, :] = np.nan
+    hlcvs[9:, 0, :] = np.nan
+    hlcvs[:5, 1, :] = np.nan
+    hlcvs[11:, 1, :] = np.nan
+
+    _validate_hlcvs_valid_windows(
+        hlcvs,
+        None,
+        ["BTC", "ETH"],
+        [3, 5],
+        [8, 10],
+        target_chunk_bytes=2 * 2 * 4 * np.dtype(np.float64).itemsize,
+    )
+
+
+def test_hlcvs_valid_window_chunking_scans_only_active_rows_and_columns(monkeypatch):
+    n_minutes = 10
+    hlcvs = np.empty((n_minutes, 4, 4), dtype=np.float64)
+    for col in range(4):
+        hlcvs[:, col, :] = float(col)
+    observed_chunks = []
+    original_isfinite = np.isfinite
+
+    def recording_isfinite(values):
+        arr = np.asarray(values)
+        observed_chunks.append((arr.shape, tuple(np.unique(arr[:, :, 0]))))
+        return original_isfinite(values)
+
+    monkeypatch.setattr(np, "isfinite", recording_isfinite)
+    _validate_hlcvs_valid_windows(
+        hlcvs,
+        None,
+        ["BTC", "EMPTY", "SOL"],
+        [2, n_minutes, 4],
+        [4, n_minutes - 1, 6],
+        coin_indices=[0, 1, 3],
+        target_chunk_bytes=1024,
+    )
+
+    # BTC covers rows 2..4 and SOL covers 4..6. The sweep therefore scans
+    # BTC alone, both columns for their one-row overlap, and SOL alone. The
+    # empty symbol, unused column 2, and rows outside the union are untouched.
+    assert observed_chunks == [
+        ((2, 1, 4), (0.0,)),
+        ((1, 2, 4), (0.0, 3.0)),
+        ((2, 1, 4), (3.0,)),
+    ]
+
+
+def test_hlcvs_valid_window_chunking_skips_scan_when_all_windows_are_empty(monkeypatch):
+    n_minutes = 10
+    hlcvs = np.full((n_minutes, 2, 4), np.nan, dtype=np.float64)
+
+    def fail_if_scanned(_values):
+        raise AssertionError("empty valid windows must not scan the HLCV payload")
+
+    monkeypatch.setattr(np, "isfinite", fail_if_scanned)
+    _validate_hlcvs_valid_windows(
+        hlcvs,
+        None,
+        ["BTC", "ETH"],
+        [n_minutes, n_minutes],
+        [n_minutes - 1, n_minutes - 1],
+    )
 
 
 def test_build_backtest_payload_aggregation_recomputes_effective_start_ts_over_stale_mss():

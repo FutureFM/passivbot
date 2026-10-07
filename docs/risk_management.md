@@ -68,10 +68,21 @@ Instead of a traditional stop-loss that closes the entire position at a massive 
 Auto-unstuck works best when running multiple coins:
 * **Prioritization:** It prioritizes unstucking the **least underwater** coin first, quickly returning it to profitability.
 * **Profit Offsetting:** While one coin realizes losses to unstuck, the other active coins continue generating profit, smoothing out the equity curve.
-* **Capped Drawdown:** Total unstuck losses are capped at a configurable percentage below the historical peak balance (e.g., 1%). After the loss allowance is consumed, further losses can only be taken after other positions have made profits.
+* **Loss Pacing:** A realized-loss allowance limits how quickly auto-unstuck takes losses relative to a reconstructed balance peak. Exchange minimum sizing can exceed the remaining allowance; later realized profits can rebuild it, as described below.
 
 #### Weakness of Auto-Unstuck
 Extreme black-swan events (exchange failure, stablecoin depeg, delisting, and other causes of prolonged unilateral price movement) may cause the auto-unstuck mechanism to keep taking losses and re-entering continually on an adversely moving coin. The only realistic solution to these edge cases is **human intervention** as the final backstop.
+
+#### Auto-Unstuck Threshold And Close Size
+
+`bot.<side>.unstuck.threshold` is an eligibility trigger: the position's wallet exposure divided
+by its effective WEL must be strictly greater than the threshold. It does not specify a target
+remaining position or prevent a close from crossing below that threshold.
+
+`unstuck.close_pct` sizes each chunk from `balance * effective_wel` at the close order's price,
+while wallet exposure uses average entry price. The chunk can therefore reduce the exposure ratio
+by more or less than `close_pct`, before accounting for rounding, exchange minimums, loss allowance
+and balance changes. See the [auto-unstuck formulas](config.bot.md#auto-unstucking) for details.
 
 #### Auto-Unstuck Loss-Allowance Contract
 
@@ -133,18 +144,20 @@ unstuck's EMA gate or loss allowance.
 #### Excess Allowance (`risk_we_excess_allowance_pct`)
 In practice, the bot rarely fills all positions simultaneously. Therefore, the bot can be configured to allow exceeding individual WELs by setting `risk_we_excess_allowance_pct > 0.0` (e.g., 20% excess allowance). This can be thought of as the bot "borrowing" capacity from unfilled positions. The per-position WEL enforcer respects this expanded limit and only trims when the *effective* WEL is breached.
 
-With the default `we_excess_allowance_mode = "bounded"`, the raw excess is capped before use so a single position cannot receive more headroom than the side's total configured exposure:
+The excess allowance is always bounded. The raw excess is capped before use so a single position cannot receive more headroom than the side's total configured exposure:
 
 `effective_we_excess_allowance_pct = min(max(0, risk_we_excess_allowance_pct), max(0, total_wallet_exposure_limit / wallet_exposure_limit - 1))`
 
 `effective_limit = wallet_exposure_limit * (1 + effective_we_excess_allowance_pct)`
 
-If `wallet_exposure_limit` is non-positive or non-finite, bounded mode treats
+If `wallet_exposure_limit` is non-positive or non-finite, Passivbot treats
 the effective excess allowance and effective limit as zero. If
 `total_wallet_exposure_limit` is non-positive or non-finite, bounded mode
 grants no excess headroom.
 
-Set `we_excess_allowance_mode = "legacy_raw"` only when intentionally preserving v7-style behavior where the configured excess percentage is used raw and may expand one symbol above side TWEL.
+In coin HSL mode, `bot.<side>.hsl.scale_budget_with_excess_allowance=true` also
+multiplies the balance budget by `1 + effective_we_excess_allowance_pct`. It defaults
+to `false`; see [HSL budgets](equity_hard_stop_loss.md#signals-and-scopes).
 
 * **Example:** If WEL is `0.20` and allowance is `0.10` (10%), the position can grow to `0.22` before the bot considers it "full."
 * **Motivation:** In a multi-coin setup, this lets the bot boost performance on active positions by utilizing the unused capacity of inactive positions.
@@ -176,8 +189,9 @@ Set `we_excess_allowance_mode = "legacy_raw"` only when intentionally preserving
 > With `n_positions=1`, the effective excess is capped at `0.0`: `min(1 - 1, excess_allowance)`. The single position's per-position allowance therefore remains `TWEL`; raw excess does not increase it.
 >
 > **Auto-Unstuck Trigger:**
-> Auto unstuck will begin at `effective_we_limit * unstuck_threshold`:
-> `0.375 * 0.48 == 0.18` (or 48% of the full position).
+> The exposure eligibility boundary is `effective_we_limit * unstuck_threshold`:
+> `0.375 * 0.48 == 0.18`. Wallet exposure must be strictly above this boundary,
+> and the other unstuck gates must pass. This is not a target remaining exposure.
 
 
 
@@ -248,64 +262,27 @@ Operational notes:
 * The gate uses fill/PnL history from `live.pnls_max_lookback_days`; it is not
   limited to fills created by the current bot process.
 
-### D. Equity Hard Stop Loss (`bot.{long,short}.hsl.*`)
-This is a side-specific circuit breaker based on reconstructed strategy drawdown, not just raw exchange equity.
+### D. Equity Hard Stop Loss
 
-It exists for cases where:
+HSL uses one Rust evaluator in live trading, backtesting and optimization. Coin mode
+uses one signal per coin and position side; pside mode uses one per active side;
+unified mode uses one explicit portfolio policy under `bot.hsl`.
 
-1. auto-unstuck is too slow
-2. the realized-loss gate is still allowing the bot to operate in a clearly degraded state
-3. you want a final supervisory backstop that can close all positions on one `pside` and halt that `pside`
+The current signal is the minimum of raw episode-equity drawdown and its EMA.
+Equity history anchors to the current scope balance budget plus current unrealized
+PnL. Only a current threshold breach authorizes panic orders; recovery immediately
+retires them. The episode ends when its whole scope becomes flat. Cooldown depends
+on the last episode's terminal signal, expires within the configured lookback, and
+clears immediately if exposure returns.
 
-Behavior:
+Current account facts and acted-on marks must be valid and fresh. Missing or damaged
+historical fills/candles instead use the documented best-effort Rust reconstruction,
+with visible approximation diagnostics. A local journal never preserves a past
+panic decision. Config or balance changes can change the reconstructed current
+signal and cooldown; assess them as risk-policy changes.
 
-1. `yellow`: warning tier
-2. `orange`: reduced-risk mode (`graceful_stop` or `tp_only_with_active_entry_cancellation`) for that `pside`
-3. `red`: force panic exits, wait until all positions on that `pside` are fully closed, and halt that `pside`
-
-Operational notes:
-
-1. HSL is configured separately under `bot.long.hsl.*` and `bot.short.hsl.*`.
-2. `live.hsl_signal_mode` defaults to the per-coin slot signal (`coin`), with `unified` available for shared account-level signals and `pside` available for side-local strategy signals.
-3. RED can auto-restart after `hsl_cooldown_minutes_after_red`. Terminal no-restart uses persistent cross-restart HSL drawdown.
-4. In backtests, simulated market panic closes use `backtest.market_order_slippage_pct`; live market panic closes use the exchange adapter's order semantics and live exchange/CCXT slippage controls.
-5. Backtests export canonical strategy-equity metrics under `*_strategy_eq`, including side-specific `*_strategy_eq_long` / `*_strategy_eq_short` metrics. Deprecated `*_hsl` metric names remain accepted as aliases for older configs/results.
-
-#### HSL Statelessness And Startup Caveats
-
-HSL state is reconstructed from exchange state, fill history, candle history,
-config, and current time. Local caches may make reconstruction faster, but they
-must not become authoritative trading state. A fresh VPS with the same exchange
-history and config should reconstruct the same HSL decisions, even if it takes
-longer.
-
-This stateless contract has important operational consequences:
-
-1. Enabling HSL on an account with existing positions can immediately place
-   panic orders if reconstructed current-episode drawdown is already RED.
-2. For `coin` mode, live HSL uses the configured `n_positions` slot budget,
-   not current dynamic coin eligibility and not TWEL/excess allowance, so the
-   configured RED percentage remains a drawdown percentage.
-3. `pside` and `unified` modes reconstruct broader equity history and may need
-   candle data for symbols with relevant fills.
-4. `live.pnls_max_lookback_days` controls the fill/PnL window used by HSL,
-   realized-loss gating, and auto-unstuck allowance. Shortening it reduces
-   historical memory; lengthening it can expose older drawdown or cooldown
-   events.
-5. Changing HSL thresholds, signal mode, `n_positions`, TWEL activation
-   (zero/non-zero), or lookback settings can retroactively change reconstructed
-   RED, cooldown, and no-restart decisions. Positive TWEL magnitude does not
-   scale coin-HSL sensitivity. Review these changes as risk-policy changes, not
-   just parameter tuning.
-6. If HSL replay data is missing or incomplete, the bot should fail or defer
-   visibly rather than substituting a safe-looking neutral drawdown.
-7. HSL episodes end when their configured scope becomes fully flat, by any
-   close type. The tracker resets after that fill, and a RED cooldown begins
-   there; current time is not a valid fallback for missing fill evidence.
-
-See the dedicated guide:
-
-1. [Equity Hard Stop Loss](equity_hard_stop_loss.md)
+See [Equity Hard Stop Loss](equity_hard_stop_loss.md) for formulas, scope budgets,
+configuration migration, restart policies, execution and diagnostics.
 
 ---
 

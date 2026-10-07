@@ -24,8 +24,19 @@ def staged_planner_required_surfaces(
     bot, *, include_market_snapshot: bool = True
 ) -> frozenset[str]:
     """Return live input surfaces required before staged order planning may proceed."""
-    del bot
     surfaces = set(ACCOUNT_SURFACES)
+    from config.pnl_lookback import parse_pnls_max_lookback_days
+
+    now = int(bot.get_exchange_time())
+    start = parse_pnls_max_lookback_days(
+        bot.config["live"]["pnls_max_lookback_days"]
+    ).event_history_start_ms(now)
+    required, _ = bot._required_fill_history_start_ms(now, pnl_start_ms=start)
+    if not required:
+        # HSL can estimate history. Other enabled fill/PnL
+        # consumers retain the canonical strict surface; trailing input
+        # availability is scoped separately by the strategy reader.
+        surfaces.discard("fills")
     if include_market_snapshot:
         surfaces.add("market_snapshot")
     return frozenset(surfaces)
@@ -134,26 +145,17 @@ def format_staged_execution_defer_message(bot, details: dict) -> str:
     missing = tuple(details.get("missing", ()))
     invalid = details.get("invalid") or {}
     context = str(details.get("context") or "planning")
-    retry_note = "will_retry=automatic"
-    scope_note = "scope=planner_cycle"
-    headline = "staged planning deferred"
     dependency = ",".join(missing) if missing else "unknown"
-    extra_parts = []
-    if "completed_candles" in missing:
-        headline = "staged planning deferred: completed candle target changed or missing"
-        dependency = "completed_candles"
-        extra_parts.append("action=refresh_candles_then_retry")
-    elif missing:
-        extra_parts.append("action=refresh_required_surfaces_then_retry")
     parts = [
-        headline,
+        "staged planning deferred",
         f"context={context}",
         f"dependency={dependency}",
-        scope_note,
-        retry_note,
+        "scope=planner_cycle",
+        "will_retry=automatic",
         f"epoch={int(details.get('epoch', 0) or 0)}",
     ]
-    parts.extend(extra_parts)
+    if missing:
+        parts.append("action=refresh_required_surfaces_then_retry")
     if invalid:
         summaries = []
         for surface, items in invalid.items():
@@ -165,38 +167,9 @@ def format_staged_execution_defer_message(bot, details: dict) -> str:
                 summaries.append(f"{surface}:{type(first).__name__}")
                 continue
             reason = first.get("reason") or "invalid"
-            if reason == "signature_mismatch":
-                mismatch_type = str(first.get("mismatch_type") or "unknown")
-                changed_symbols = list(first.get("changed_symbols") or [])
-                missing_symbols = list(first.get("missing_symbols") or [])
-                extra_symbols = list(first.get("extra_symbols") or [])
-                symbol_bits = []
-                if changed_symbols:
-                    symbol_bits.append(
-                        "changed="
-                        + "|".join(bot._log_symbol(sym) for sym in changed_symbols[:4])
-                    )
-                if missing_symbols:
-                    symbol_bits.append(
-                        "missing="
-                        + "|".join(bot._log_symbol(sym) for sym in missing_symbols[:4])
-                    )
-                if extra_symbols:
-                    symbol_bits.append(
-                        "extra="
-                        + "|".join(bot._log_symbol(sym) for sym in extra_symbols[:4])
-                    )
-                summaries.append(
-                    f"{surface}:{mismatch_type}"
-                    f" expected={int(first.get('expected_count') or 0)}"
-                    f" stamped={int(first.get('stamped_count') or 0)}"
-                    f" changed={int(first.get('changed_count') or 0)}"
-                    + (f" {' '.join(symbol_bits)}" if symbol_bits else "")
-                )
-            else:
-                symbol = first.get("symbol")
-                suffix = f":{bot._log_symbol(symbol)}" if symbol else ""
-                summaries.append(f"{surface}:{reason}{suffix}")
+            symbol = first.get("symbol")
+            suffix = f":{bot._log_symbol(symbol)}" if symbol else ""
+            summaries.append(f"{surface}:{reason}{suffix}")
         if summaries:
             parts.append("details=" + ",".join(summaries[:4]))
     return " | ".join(parts)
@@ -229,13 +202,10 @@ def log_staged_execution_defer(bot, details: dict) -> None:
     required = tuple(details.get("required", ()))
     context = str(details.get("context") or "planning")
     invalid = details.get("invalid") or {}
-    routine_candle_target = bot._is_routine_completed_candle_target_defer(details)
-    if routine_candle_target:
-        bot._record_routine_completed_candle_defer(details)
     log_key = (context, missing, required, tuple(sorted(invalid)))
     now_ms = _utc_ms()
     last_log_ms = int(getattr(bot, "_staged_execution_defer_last_log_ms", 0) or 0)
-    throttle_ms = 60_000 if routine_candle_target else 15_000
+    throttle_ms = 15_000
     if (
         log_key == getattr(bot, "_staged_execution_defer_last_log_key", None)
         and now_ms - last_log_ms < throttle_ms
@@ -249,103 +219,9 @@ def log_staged_execution_defer(bot, details: dict) -> None:
             "emit planning_unavailable diagnostic",
             lambda: emitter(details),
         )
-    logging.log(
-        logging.DEBUG if routine_candle_target else logging.INFO,
-        "[state] %s",
-        bot._format_staged_execution_defer_message(details),
-    )
+    logging.info("[state] %s", bot._format_staged_execution_defer_message(details))
     if invalid:
         logging.debug("[state] staged execution deferred details | invalid=%s", invalid)
-
-
-def is_routine_completed_candle_target_defer(bot, details: dict) -> bool:
-    """Return true for self-recovering minute-boundary candle target changes."""
-    del bot
-    missing = set(details.get("missing") or ())
-    if missing != {"completed_candles"}:
-        return False
-    invalid = details.get("invalid") or {}
-    items = invalid.get("completed_candles") if isinstance(invalid, dict) else None
-    if not isinstance(items, list) or not items:
-        return False
-    first = items[0]
-    return (
-        isinstance(first, dict)
-        and first.get("reason") == "signature_mismatch"
-        and first.get("mismatch_type") == "completed_candle_target_changed"
-    )
-
-
-def record_routine_completed_candle_defer(bot, details: dict) -> None:
-    """Aggregate routine completed-candle target defers into periodic INFO summaries."""
-    try:
-        now_ms = _utc_ms()
-        state = getattr(bot, "_routine_completed_candle_defer_summary", None)
-        if not isinstance(state, dict):
-            state = {
-                "window_start_ms": now_ms,
-                "last_log_ms": 0,
-                "count": 0,
-                "symbols": set(),
-            }
-        invalid = details.get("invalid") or {}
-        items = invalid.get("completed_candles") if isinstance(invalid, dict) else []
-        symbols: set[str] = set()
-        if isinstance(items, list) and items and isinstance(items[0], dict):
-            first = items[0]
-            for key in ("changed_symbols", "missing_symbols", "extra_symbols"):
-                for symbol in first.get(key) or []:
-                    if symbol:
-                        symbols.add(str(symbol))
-        state["count"] = int(state.get("count", 0) or 0) + 1
-        state_symbols = state.get("symbols")
-        if not isinstance(state_symbols, set):
-            state_symbols = set(state_symbols or [])
-        state_symbols.update(symbols)
-        state["symbols"] = state_symbols
-        state["last_seen_ms"] = now_ms
-        window_start_raw = state.get("window_start_ms", now_ms)
-        window_start_ms = (
-            int(window_start_raw) if window_start_raw is not None else now_ms
-        )
-        last_log_ms = int(state.get("last_log_ms", 0) or 0)
-        should_log = (
-            int(state["count"]) >= 20 and now_ms - last_log_ms >= 30 * 60_000
-        ) or now_ms - window_start_ms >= 30 * 60_000
-        bot._routine_completed_candle_defer_summary = state
-        if not should_log:
-            return
-        window_s = max(1, int((now_ms - window_start_ms) / 1000))
-        logging.info(
-            "[state] staged planning deferred summary | reason=completed_candle_target_changed count=%d window=%ds symbols=%s will_retry=automatic action=refresh_candles_then_retry",
-            int(state.get("count", 0) or 0),
-            window_s,
-            bot._log_symbols(tuple(sorted(state_symbols)), limit=8),
-        )
-        emitter = getattr(bot, "_emit_planning_defer_summary_event", None)
-        if callable(emitter):
-            run_diagnostic_step(
-                "emit planning.defer_summary event",
-                lambda: emitter(
-                    reason_code="completed_candle_target_changed",
-                    count=int(state.get("count", 0) or 0),
-                    window_s=window_s,
-                    symbols=tuple(sorted(state_symbols)),
-                    details=details,
-                ),
-            )
-        bot._routine_completed_candle_defer_summary = {
-            "window_start_ms": now_ms,
-            "last_log_ms": now_ms,
-            "count": 0,
-            "symbols": set(),
-        }
-    except Exception as exc:
-        logging.debug(
-            "[state] staged defer summary log failed | error_type=%s error=%s",
-            type(exc).__name__,
-            exc,
-        )
 
 
 async def defer_staged_execution_cycle(bot, details: dict, loop_start_ms: int) -> None:
@@ -360,7 +236,9 @@ async def defer_staged_execution_cycle(bot, details: dict, loop_start_ms: int) -
     bot._set_log_silence_watchdog_context(
         phase="runtime", stage="staged_precondition_delay"
     )
-    await asyncio.sleep(bot._authoritative_confirmation_retry_delay_seconds(details=details))
+    await asyncio.sleep(
+        bot._authoritative_confirmation_retry_delay_seconds(details=details)
+    )
 
 
 def build_staged_planning_snapshot(
@@ -391,6 +269,9 @@ def build_staged_planning_snapshot(
     if not isinstance(data_packets, dict):
         data_packets = {}
     snapshot = PlanningSnapshot.capture(
+        account_invalidation_generation=int(
+            getattr(bot, "_account_invalidation_generation", 0) or 0
+        ),
         ts_ms=_utc_ms(),
         exchange=str(getattr(bot, "exchange", "")),
         user=str(bot.config_get(["live", "user"]) or ""),
@@ -419,7 +300,7 @@ def build_protective_planning_snapshot(
     ordered_symbols = tuple(
         sorted(dict.fromkeys(str(symbol) for symbol in symbols if symbol))
     )
-    required = frozenset({"balance", "positions", "open_orders", "market_snapshot"})
+    required = frozenset({"positions", "open_orders", "market_snapshot"})
     ledger = bot._ensure_freshness_ledger()
     current_epoch = int(ledger.epoch)
     required_epoch = max(1, current_epoch)
@@ -456,6 +337,9 @@ def build_protective_planning_snapshot(
     if not isinstance(data_packets, dict):
         data_packets = {}
     snapshot = PlanningSnapshot.capture(
+        account_invalidation_generation=int(
+            getattr(bot, "_account_invalidation_generation", 0) or 0
+        ),
         ts_ms=_utc_ms(),
         exchange=str(getattr(bot, "exchange", "")),
         user=str(bot.config_get(["live", "user"]) or ""),
@@ -480,10 +364,14 @@ def build_protective_planning_snapshot(
 
 
 def current_planning_snapshot_invalid_for_creations(
-    bot, symbols: Iterable[str]
+    bot,
+    symbols: Iterable[str],
+    *,
+    snapshot=None,
 ) -> list[dict]:
-    """Return reasons the current staged planning snapshot is unsafe for creations."""
-    snapshot = getattr(bot, "_current_planning_snapshot", None)
+    """Return reasons the supplied/current planning snapshot is unsafe for creations."""
+    if snapshot is None:
+        snapshot = getattr(bot, "_current_planning_snapshot", None)
     ordered_symbols = tuple(
         sorted(dict.fromkeys(str(symbol) for symbol in symbols if symbol))
     )

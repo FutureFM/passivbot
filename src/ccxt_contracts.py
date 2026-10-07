@@ -15,7 +15,7 @@ import ccxt
 
 from config.load import prepare_config
 from config.schema import get_template_config
-from passivbot import setup_bot
+from passivbot import BOT_CLOSE_TIMEOUT_SECONDS, setup_bot
 from utils import _build_coin_symbol_maps, filter_markets
 
 
@@ -125,6 +125,10 @@ def get_bot_class(exchange: str):
         from exchanges.okx import OKXBot
 
         return OKXBot
+    if exchange == "lighter":
+        from exchanges.lighter import LighterBot
+
+        return LighterBot
     if exchange == "weex":
         from exchanges.weex import WeexBot
 
@@ -209,7 +213,9 @@ def derive_market_contracts(exchange: str, quote: str, markets: dict[str, dict])
 
 def summarize_market_snapshot(exchange: str, quote: str, markets: dict[str, dict]) -> dict[str, Any]:
     eligible, ineligible, reasons = filter_markets(markets, exchange, quote=quote)
-    coin_to_symbol_map, symbol_to_coin_map = _build_coin_symbol_maps(markets, quote)
+    coin_to_symbol_map, symbol_to_coin_map = _build_coin_symbol_maps(
+        markets, quote, exchange=exchange
+    )
     return sanitize_for_json(
         {
             "contracts": derive_market_contracts(exchange, quote, markets),
@@ -376,7 +382,7 @@ async def capture_contract_snapshot(
         return snapshot
     finally:
         try:
-            await asyncio.wait_for(bot.close(), timeout=3.0)
+            await asyncio.wait_for(bot.close(), timeout=BOT_CLOSE_TIMEOUT_SECONDS)
         except Exception:
             pass
 

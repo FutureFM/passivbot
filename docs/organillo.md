@@ -26,7 +26,7 @@ passivbot backtest configs/examples/backtest_organillo.json -dp
 passivbot optimize configs/examples/backtest_organillo.json
 ```
 
-These commands may download public candles and market metadata. The example illustrates input
+Historical selection is CPU-only: use `optimize.backend` `pymoo` or `deap`; the GPU backend rejects it. These commands may download public candles and market metadata. The example illustrates input
 format and wiring; it is not an optimized strategy. Relative carton paths resolve from the current
 working directory. Both `.csv` and `.csv.gz` are supported.
 

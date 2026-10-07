@@ -113,9 +113,6 @@ class CoinFilterHarness(Passivbot):
     def live_value(self, key):
         return self._live_flags.get(key, False)
 
-    async def calc_volumes(self, _pside, symbols):
-        return {sym: self._volumes[sym] for sym in symbols}
-
     async def calc_volumes_and_log_ranges(
         self, _pside, symbols, max_age_ms=None, max_network_fetches=None
     ):
@@ -611,10 +608,11 @@ def test_min_effective_cost_structured_console_keeps_aggregate_summary(caplog):
         for message in info_messages
         if "initial entry blocked by min effective cost | SYM" in message
     ]
-    assert sum(
-        "initial entries blocked by min effective cost summary" in message
-        for message in info_messages
-    ) == 1
+    summaries = [message for message in info_messages if "[entry] min-cost gate" in message]
+    assert len(summaries) == 1
+    assert "blocked=5 detailed=3 suppressed=0" in summaries[0]
+    assert "examples=SYM0:long,SYM1:long,SYM2:long" in summaries[0]
+    assert "SYM3" not in summaries[0] and "SYM4" not in summaries[0]
     events = [
         event
         for event in sink.events

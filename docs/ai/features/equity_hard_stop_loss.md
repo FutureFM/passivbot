@@ -1,77 +1,99 @@
-# Equity Hard Stop Loss Episode Contract
+# Equity Hard Stop Loss contract
 
-HSL drawdown state is scoped by `live.hsl_signal_mode`:
+HSL uses one Rust-owned, best-effort reconstruction and controller across live,
+backtest and optimizer paths. Python acquires facts and enforces execution admission;
+it does not own a second drawdown formula or retain an earlier panic decision.
+The [user guide](../../equity_hard_stop_loss.md) defines configuration and examples.
 
-| Mode | Episode scope | Episode ends when |
-|---|---|---|
-| `coin` | one `coin+pside` | that position is fully closed |
-| `pside` | all positions on one `pside` | every position on that side is fully closed |
-| `unified` | the whole account | every position is fully closed |
+## Signal authority
 
-## Invariants
+- Coin has one controller per symbol/position side; pside has one per side;
+  unified has one portfolio controller with an explicit `bot.hsl` policy.
+- Reconstruct retained net realized cashflows and UPNL, anchor to current equity
+  (balance budget plus current UPNL), and measure drawdown from the episode peak.
+  EMA smooths raw drawdown, seeded by the first raw sample. Fractional spans remain floats.
+- Current RED means `min(raw_drawdown, ema_drawdown) > red_threshold`. Historical
+  breaches alone have no authority. GREEN immediately retires outstanding panic intent.
+- A partial close retains the current episode; its updated current signal decides
+  whether to continue closing. There are no retained RED commitments or emergency journals.
+- Rust's reconciler is the sole authority for estimated history and episode boundaries.
+  Missing or ambiguous historical facts produce bounded documented approximations and
+  diagnostics, not a correctness-proof barrier to a current decision.
+- With no useful history, current size, basis, mark and budget define the single-sample
+  loss signal. This is part of the same evaluator, not a separately timed UPNL fallback.
+  Missing/unusable current facts remain unavailable; they are not invented.
 
-1. The drawdown tracker resets after every proven episode end. The next episode begins after the
-   flattening fill timestamp.
-2. A flattening fill ends the episode regardless of its order type or origin. Panic, take-profit,
-   grid-close, manual, and external exchange fills have identical boundary semantics.
-3. A RED-seen episode remains entry-blocked until its scope is confirmed flat. Its cooldown begins
-   at the flattening fill, not at the RED sample, order submission, bot restart, or observation time.
-4. Compact replay derives non-flat/flat transitions from fill events independently of candle or
-   unrealized-PnL availability. Multiple boundaries inside one replay minute retain their exact
-   fill order, realized PnL, fees, and account balance at each boundary. Missing price replay may
-   defer drawdown evaluation, but it must not hide an episode boundary.
-5. Current flat state is not a timestamp. If the flattening fill is not yet available, live
-   finalization and cooldown anchoring defer visibly while protective entry blocking remains active;
-   they never substitute the current time. Cooldown re-panic finalization must replay fills from a
-   proven non-flat intervention snapshot; an entry or partial-close fill is not flatten evidence.
-6. Restart reconstruction uses exchange state, fill/PnL history, candles where required, config, and
-   current time. Local latch and replay-cache files are accelerators or diagnostics, not authority.
-7. Replay-cache write, reuse, and completed-replay persistence failures are nonfatal performance
-   outcomes. They retain only a bounded exception type in diagnostics and fall back to authoritative
-   replay when reuse is unavailable. Coin replay failures retain the same bounded classification
-   without changing exception propagation or held-pair protection and flat-pair entry blocking.
-8. `bot.{pside}.hsl.panic_close_order_type = "market"` is an explicit protective execution
-   override when HSL is enabled. Rust may emit that side's `close_panic_*` as a market order even
-   when `live.market_orders_allowed = false`; the live flag gates non-panic market execution and
-   must not downgrade an explicitly configured HSL panic close to a limit order. The live producer
-   boundary validates this panic execution choice in both directions against the submitted config;
-   it must reject either a limit-for-market or market-for-limit mismatch as malformed Rust output.
-9. For an open coin scope using `restart_after_red_policy=always`, a fill-proven current episode
-   may discard older closed episodes after a flat gap longer than the configured RED cooldown.
-   Replay retains preceding episodes while their cooldown horizons overlap the next episode, so a
-   chain of possible cooldown interventions remains strict. An ambiguous fill sequence, a position
-   size mismatch, `threshold`/`never`, or a missing current-episode boundary preserves full-lookback
-   replay. The cumulative realized PnL of discarded episodes becomes the new replay baseline, so
-   their gains, losses, and fees cannot affect the retained episode. Unavailable candles before the
-   resulting boundary cannot strand an otherwise provable held episode; unavailable required
-   candles at or after it still fail closed.
-   Live fill-history readiness uses that same fill-derived boundary as its only held-episode owner
-   and also proves every enabled side's flat-scope cooldown horizon. A recent fill for a currently
-   flat pair may still own a RED cooldown and therefore preserves the full configured lookback.
-   Ambiguous or delayed held evidence also preserves or restores the full requirement before fills
-   become authoritative. PnL blockers are evaluated against each held pair's own canonical episode
-   boundary; the aggregate earliest boundary exists only to fetch and prove coverage. Coin stop
-   finalization consumes pair metrics and must not add an account-wide PnL dependency. Coin mode
-   evaluates each configured coin's effective HSL enablement, restart policy, and cooldown.
-   `threshold`, `never`, pside, and unified modes remain full-lookback strict.
-10. Restart price reconstruction fetches 1m history first. When an exchange cannot provide the
-   older leading portion, it may use 5m, then 15m, then 1h candles for that prefix. This is an
-   explicitly approximate price path: the finest source wins and its contribution is reported.
-   Coarser candles never repair missing rows at or after the first available 1m candle. Fill-based
-   episode boundaries, realized PnL, and fees remain exact.
+## Episodes and lifecycle
 
-## Failure Semantics
+Only the current or latest completed episode matters. Current exchange positions are
+flatness authority, including when the final fill is delayed or absent. Only a RED
+terminal accounting sample, including final PnL/fees, starts cooldown; order type is
+irrelevant. Use the reconstructed final timestamp, or the latest retained causal fill
+for an estimated missing close. Repeated observations do not renew the timestamp.
+No retained causal fill means no historical cooldown.
 
-Incomplete fill coverage follows `../error_contract.md`. A required episode boundary is unavailable
-until supported by fill evidence. The affected HSL scope remains protective and retries after an
-authoritative refresh; unrelated scopes remain available.
+Any renewed exposure clears preceding cooldown. `always` permits restart after cooldown;
+`never` restricts restart only while the terminal stop remains within lookback. Retained
+history, budget changes or corrected evidence can change terminal RED and thus remaining
+cooldown. Everything outside configured lookback is forgotten. No local artifact can
+preserve an otherwise unreconstructible trading decision after restart.
 
-## Code And Tests
+## Inputs and execution
 
-- Replay and live finalization: `src/passivbot_hsl.py`
-- Live orchestration bindings: `src/passivbot.py`
-- Coin replay and cooldown regressions: `tests/test_hsl_coin_mode.py`
-- Pside/unified finalization coverage: `tests/test_unstucking_safeguards.py`
+Enabled HSL requires explicit supported restart policy and 1–90 days of lookback.
+Coin budgets divide current raw balance by applicable configured slots; inactive zero-slot
+sides do not invent a divisor. Aggregate budgets use raw balance. TWEL does not directly
+scale HSL. `bot.<side>.hsl.scale_budget_with_excess_allowance` defaults to false and
+is global per side. In coin mode only, true multiplies the slot budget by
+`1 + effective_we_excess_allowance_pct`, using each coin's authored WEL and excess
+percentage, or TWEL / applicable slots for automatic WEL. Use the same bounded
+allowance as Rust entry sizing; actual exposure does not determine this multiplier.
+Both current and terminal replay use the current budget. Changed balance, slots or
+headroom invalidates cached signals and can reclassify terminal cooldown without
+renewing the original flatten timestamp. Reject true for aggregate modes and reject
+coin overrides of this switch.
 
-User-facing behavior and configuration are documented in `../../equity_hard_stop_loss.md` and
-`../../equity_hard_stop_loss_cooldown_contracts.md`.
+Use minute closes in live and backtest reconstruction. Historical coarser candles use the
+shared deterministic OHLC expansion; remaining gaps forward-fill then backfill a missing
+prefix. Current held exposure requires fresh usable marks, positions and balance.
+An unquoted, candle-free flat pair with no usable retained fills needs no mark or contract multiplier;
+reason-only damaged rows remain diagnostics, not valuation inputs.
+preserve its scope for panic retirement without blocking aggregate protection. Fresh complete account
+positions prove flatness even with unknown or skewed fill capture, which remains
+explicit in diagnostics. Retained usable history is never discarded by this rule.
+
+Keep account/order/quote freshness, plan receipts, protection-first scheduling, shutdown
+checks and connector admission. Routine account-change reporting runs after
+protection in one owned background task, with one coalesced pending receipt; slow
+or failed diagnostics cannot become a protective prerequisite. Position-to-fill settling
+is shared with all trading and remains bounded; missing history cannot indefinitely lock that gate. A prior
+permission is never a substitute for current facts before a write. Ordinary strategy,
+unstucking and PnL consumers retain their own readiness contracts.
+
+## Configuration and removal boundary
+
+HSL has one implementation. Old enabled configurations require migration and revalidation
+after CLI mutation, including overrides and scenarios. Disabled legacy configurations warn
+and load with engine selection and restart authorization cleared in the normalized copy.
+Fresh optimizer seeds accept legacy HSL parameter values best effort; activation/restart
+policy belongs to the main config and fitness is reevaluated. This does not relax runtime
+or checkpoint compatibility.
+Retired tier/intervention/terminal-threshold controls cannot silently acquire a different
+meaning; optimization over removed controls is rejected. Unified policy is never hydrated
+from a side or hidden template. Legacy optimizer fitness and checkpoints are not evidence
+for new signal semantics; reevaluate configurations.
+
+## Code and validation
+
+- `passivbot-rust/src/hsl_*`: factual reconciliation, signal and current controller.
+- `passivbot-rust/src/backtest_hsl_*`: simulator integration, disposable caches and reporting.
+- `src/live/hsl_*`: immutable observation, current execution admission and diagnostics.
+- `src/live/position_fill_sync.py`: bounded shared position-to-fill confirmation.
+- `src/config/hsl.py`: canonical policy/configuration validation.
+
+Require shared reference/unit tests, source-verified native caller tests, offline fake-live
+cycles, restart and history-repair cases, current RED recovery, terminal cooldown and
+HSL-disabled trace parity. GPU values are screening estimates; exact Rust validation owns
+retained candidates. Cache loss/rebuild must preserve intent. Performance acceptance compares
+trading traces before timings and includes disabled HSL. Live trials require separate approval;
+offline tests do not establish exchange execution correctness.

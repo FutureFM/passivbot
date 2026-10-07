@@ -31,6 +31,9 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
+from session_artifacts import create_session_dir, date_span, effective_setup_config
+from optimization.prepared_dataset_identity import materialized_dataset_identity
+from optimization.evaluation_implementation import evaluation_implementation_identity
 from prettytable import PrettyTable
 from config import load_prepared_config  # noqa: E402
 
@@ -70,6 +73,7 @@ from utils import (  # noqa: E402
 from metrics_schema import build_scenario_metrics, flatten_metric_stats  # noqa: E402
 from limit_utils import expand_limit_checks, compute_limit_violation  # noqa: E402
 from warmup_utils import compute_backtest_warmup_minutes, compute_per_coin_warmup_minutes  # noqa: E402
+from json_utils import dump_json_streamlined
 
 PENALTY_WEIGHT = 1e6
 
@@ -99,7 +103,7 @@ class MetricInfo:
 @dataclass
 class LimitInfo:
     metric: str
-    stat: str
+    reducer: str
     mode: str
     metric_key: str
     value: Optional[float]
@@ -539,12 +543,41 @@ class IterativeBacktestSession:
         self.backtest_exchanges = list(require_config_value(config, "backtest.exchanges"))
         self.combine_ohlcvs = len(self.backtest_exchanges) > 1
         self.backtest_signature = make_backtest_signature(config)
-        base_dir = require_config_value(config, "backtest.base_dir")
-        session_label = time.strftime("iterative_%Y%m%d_%H%M%S")
-        session_path = Path(make_get_filepath(os.path.join(base_dir, "iterative", session_label, "")))
-        self.session_dir = Path(session_path)
         self.datasets = await self._prepare_datasets(config)
+        self._create_session_output(config)
         logging.info("Loaded OHLCV data for %s", ", ".join(sorted(self.datasets.keys())))
+
+    def _create_session_output(self, config: Dict[str, Any]) -> None:
+        base_dir = require_config_value(config, "backtest.base_dir")
+        data_identity = {
+            exchange: materialized_dataset_identity(
+                dataset.coins,
+                dataset.hlcvs,
+                dataset.btc_usd_prices,
+                dataset.timestamps,
+                dataset.mss,
+            )
+            for exchange, dataset in sorted(self.datasets.items())
+        }
+        coins = sorted(
+            {coin for dataset in self.datasets.values() for coin in dataset.coins}
+        )
+        source = "combined" if self.combine_ohlcvs else self.backtest_exchanges[0]
+        span, span_metadata = date_span([config])
+        self.session_dir, _metadata = create_session_dir(
+            Path(base_dir) / "iterative",
+            coins=coins,
+            source=source,
+            span=span,
+            setup={
+                "version": 1,
+                "config": effective_setup_config(config),
+                "scoring": config["optimize"]["scoring"],
+                "data": data_identity,
+                "implementation": evaluation_implementation_identity(),
+            },
+            metadata={"kind": "iterative_backtest", "coins": coins, **span_metadata},
+        )
 
     # ------------------------------------------------------------------
     async def _load_config(self) -> Dict[str, Any]:
@@ -570,7 +603,7 @@ class IterativeBacktestSession:
         )
         # Ensure exchanges have markets loaded and live coin lists expanded
         for ex in require_config_value(config, "backtest.exchanges"):
-            await load_markets(ex, verbose=False)
+            await load_markets(ex, verbose=False, offline=config["backtest"].get("offline", False))
         await format_approved_ignored_coins(
             config,
             require_config_value(config, "backtest.exchanges"),
@@ -636,6 +669,10 @@ class IterativeBacktestSession:
     # ------------------------------------------------------------------
     async def reload_datasets(self, config: Dict[str, Any]) -> None:
         logging.info("Dataset-affecting configuration changed; reloading datasets...")
+        self.backtest_exchanges = list(require_config_value(config, "backtest.exchanges"))
+        self.combine_ohlcvs = len(self.backtest_exchanges) > 1
+        self.datasets = await self._prepare_datasets(config)
+        self._create_session_output(config)
         self.history.clear()
         self.best_run_index = None
         self.config_cache.clear()
@@ -644,7 +681,6 @@ class IterativeBacktestSession:
         self.backtest_durations.clear()
         self.scoring_keys = []
         self.scoring_specs = []
-        self.datasets = await self._prepare_datasets(config)
         self.backtest_signature = make_backtest_signature(config)
         logging.info("Datasets reloaded.")
 
@@ -736,7 +772,7 @@ class IterativeBacktestSession:
             limit_metrics.append(
                 LimitInfo(
                     metric=check["metric"],
-                    stat=check.get("stat", ""),
+                    reducer=check.get("reducer", ""),
                     mode=check["mode"],
                     metric_key=check["metric_key"],
                     value=val,
@@ -917,7 +953,7 @@ class IterativeBacktestSession:
         payload["limits"] = [
             {
                 "metric": info.metric,
-                "stat": info.stat,
+                "reducer": info.reducer,
                 "mode": info.mode,
                 "metric_key": info.metric_key,
                 "value": info.value,
@@ -957,9 +993,8 @@ class IterativeBacktestSession:
     ) -> Path:
         if self.session_dir is None:
             raise RuntimeError("session directory not initialised")
-        timestamp_str = format_timestamp(run_ts).replace(" ", "_").replace(":", "")
-        run_dir = self.session_dir / f"run_{run_index:03d}_{timestamp_str}"
-        run_dir.mkdir(parents=True, exist_ok=True)
+        run_dir = self.session_dir / f"run_{run_index:06d}"
+        run_dir.mkdir()
         payload = {
             "timestamp_ms": run_ts,
             "score_vector": score_vector,
@@ -975,7 +1010,7 @@ class IterativeBacktestSession:
         config_copy = denumpyize(config)
         cfg_path = run_dir / "config_used.json"
         with cfg_path.open("w", encoding="utf-8") as fh:
-            json.dump(config_copy, fh, indent=2, sort_keys=True)
+            dump_json_streamlined(config_copy, fh, indent=2, sort_keys=True)
 
         return run_dir
 
@@ -1101,8 +1136,8 @@ class IterativeBacktestSession:
             rows: List[Tuple[int, List[str]]] = []
             for info in run.limit_metrics:
                 label = info.metric
-                if info.stat:
-                    label = f"{label} ({info.stat})"
+                if info.reducer:
+                    label = f"{label} ({info.reducer})"
                 constraint, delta, status = summarize_limit(info)
                 row = [
                     label,

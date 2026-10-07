@@ -2,6 +2,13 @@
 
 ## Contract
 
+All trading writes also share the [bounded position-to-fill settling gate](equity_hard_stop_loss.md#bounded-position-to-fill-settling).
+It schedules tail fetches after position changes and temporarily defers affected coin-sides;
+it is not the trailing reconstruction or historical-PnL proof described below. A successful
+qualifying fetch need not contain the expected fill. Its 15-second maximum cannot be renewed by
+repeated changes, failures or a hung request. Expiry releases the settling gate, not required
+strategy inputs; HSL still uses the Rust best-effort reconciler independently.
+
 1. Build a deduplicated fill-event stream per exchange/account.
 2. Preserve source data needed for realized PnL reconstruction.
 3. Keep fetch behavior explicit and observable during investigations.
@@ -13,6 +20,17 @@
    non-quote fee converted by a fresh ticker, reported fee rate, then
    `live.fee_pct_fallback`. Every fill is sanity-checked by fee/notional ratio
    against `live.fee_pct_sanity_abs_max`; outliers use the fallback percentage.
+   Explicit finite zero fees and fully resolved zero-sum fee lists are authoritative amounts.
+   Loading a cached fallback or rate estimate rechecks retained amounts and persists a resolved fee;
+   unresolved historical estimates retain their original policy. Same-currency offsetting
+   fees need no ticker when their net amount is zero.
+   Coalescing preserves missing or malformed fee amounts for fallback resolution.
+   A zero non-quote fee needs no ticker and records `fee_conversion_source=zero_amount`.
+   Cached conversion quotes remain subject to `live.fee_conversion_max_age_ms` against the
+   current time, fetch time, and each fill timestamp. Failed conversion lookups retry after
+   at most one minute, bounded further by that same configured age. A batch reuses an identical
+   pair/fill-time lookup, including an unavailable result. A quote rejected only for one fill
+   timestamp must not create a pair-wide failed lookup.
 6. Do not mix legacy/missing-contract cache rows with current rows. Repair or
    rebuild legacy fill-event caches before using trading-critical accounting.
 7. Newly discovered fills may carry immutable `provenance` with attribution
@@ -26,8 +44,8 @@
    Preserving that distinction ensures the next incremental refresh covers fills
    after a repaired historical range and fills which occurred while the bot was
    offline.
-9. A position whose latest fill identity or reconstructed after-state does not
-   match the authoritative exchange position remains nontradable. Live orchestration
+9. Trailing-dependent ordinary planning requires its latest fill identity and reconstructed
+   after-state to match the authoritative exchange position. Live orchestration
    retries from the position/fill anchor with bounded in-memory backoff. Direction,
    quantity, and price alone do not prove a flat-to-position transition when truncated
    history has polluted reconstructed `psize`/`pprice`. An explicit exchange position
@@ -72,7 +90,7 @@
     Structured `cycle.degraded` diagnostics preserve bounded `pending_pnl_count` and
     `degraded_pnl_count` fields through the centralized payload sanitizer.
 11. `FillEventsManager` owns the canonical fill-history coverage verdict used by
-    refresh, staged readiness, HSL replay, and realized-PnL consumers. Orchestration
+    refresh, staged readiness, HSL reconstruction, and realized-PnL consumers. Orchestration
     may choose retry timing or whether a proven-incomplete history is explicitly
     allowed, but it must not reinterpret cache metadata or known gaps. Metadata
     claiming cached rows when no rows loaded, and malformed known-gap bounds, are
@@ -98,6 +116,14 @@
     requirements after fetching so delayed fills cannot be accepted under the
     earlier boundary and older discarded episodes cannot remain PnL blockers.
 
+## Empty-refresh replay reuse
+
+A successful empty fetch may skip reconstruction only after a full replay proved the same history
+was unchanged, with the same fee policy and no new PnL observations. The disposable proof owns a
+deep copy including mutable raw/fee/provenance data. Fetched duplicates and all enrichment still
+use the full path. Fetches, failure propagation, coverage repair, metadata and refresh checkpoints
+remain unconditional; restart or loss of the proof simply repeats full reconstruction.
+
 ## Runtime Provenance
 
 The optional fill provenance record contains the runtime run id, Passivbot
@@ -122,6 +148,7 @@ logs, runtime windows, and immutable manifests.
 | OKX | `fetch_my_trades` | positions history |
 | KuCoin | trades + positions history | positions history |
 | Gate.io | `fetch_my_trades` | embedded |
+| Lighter | account-wide perpetual trades with cursor pagination | account-side PnL and raw pre-fill position evidence |
 | WEEX | `fetch_my_trades` in seven-day windows | embedded `realizedPnl` |
 
 ## Non-Obvious Details
@@ -150,7 +177,16 @@ logs, runtime windows, and immutable manifests.
 6. KuCoin position-history PnL is authoritative for a completed position cycle. Overlapping trade
    refreshes may return the same close as pending again; they must preserve an already reconciled
    cycle value. Reapplying an unchanged cycle observation is a no-op, while a changed authoritative
-   total is redistributed across that lifecycle and persisted.
+   total is redistributed across that lifecycle and persisted. Classify trade reductions from
+   `side` and `position_side` before optional order-label enrichment; trade-window estimates
+   are pending until reconstruction against the cached basis or cycle reconciliation.
+   On ordinary current-contract cache load, use the KuCoin doctor to back up and repair
+   trade-derived reductions mislabeled as `authoritative`, including nonzero estimates.
+   Preserve explicit synthetic and cycle-reconciled sources, raw data, provenance, coverage,
+   and the incremental refresh checkpoint. This accounting normalization is automatic;
+   standalone doctor check mode remains read-only. An incomplete basis remains degraded
+   and blocks enabled PnL risk consumers. Repeated loads do not create another backup once
+   the mislabeled rows have been repaired.
 7. Fills sharing one millisecond carry no execution order in exchange responses or caches, yet
    position reconstruction replays them in list order. When the exchange reports the position size
    preceding each fill (Hyperliquid `startPosition`), retain each execution boundary and reorder an

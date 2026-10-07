@@ -109,6 +109,64 @@ async def test_ws_requires_canonical_basis_then_persists_only_finalized_rows(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("fail_first_write", [False, True])
+async def test_ws_finalizes_first_candle_of_new_utc_day(
+    tmp_path, monkeypatch, fail_first_write
+):
+    midnight = 24 * 60 * ONE_MIN_MS
+    symbol = "BTC/USDT:USDT"
+    cm = _manager(tmp_path, now_ms=midnight + ONE_MIN_MS + 1_000)
+    cm._persist_batch(
+        symbol,
+        _candles((midnight - 2 * ONE_MIN_MS, 100, 101, 99, 100, 2)),
+        timeframe="1m",
+        merge_cache=True,
+    )
+    for ts, expected in [(midnight - ONE_MIN_MS, 0), (midnight, 1)]:
+        assert await cm.ingest_live_ws_ohlcv(
+            symbol, [[ts, 100, 101, 99, 100, 2]], now_ms=ts + 1_000
+        ) == expected
+
+    # Yesterday's canonical basis exists, but today's shard does not yet exist.
+    assert cm._load_from_disk(symbol, midnight, midnight, timeframe="1m") is None
+    assert cm.get_last_final_ts(symbol) == midnight - ONE_MIN_MS
+    successor = [[midnight + ONE_MIN_MS, 100, 102, 99, 101, 3]]
+    previous_frame = cm._live_ws_ohlcv_observations[symbol].copy()
+    if fail_first_write:
+        with monkeypatch.context() as patch:
+            def fail_save(*_args, **_kwargs):
+                raise OSError("disk unavailable")
+
+            patch.setattr(cm, "_save_range_incremental", fail_save)
+            with pytest.raises(OSError, match="disk unavailable"):
+                await cm.ingest_live_ws_ohlcv(symbol, successor)
+        assert cm.get_last_final_ts(symbol) == midnight - ONE_MIN_MS
+        assert cm.get_last_live_ws_ohlcv_ts(symbol) == midnight - ONE_MIN_MS
+        assert cm._live_ws_ohlcv_observations[symbol] == previous_frame
+        assert not np.any(cm._ensure_symbol_cache(symbol)["ts"] >= midnight)
+        assert cm._load_from_disk(symbol, midnight, midnight, timeframe="1m") is None
+
+    assert await cm.ingest_live_ws_ohlcv(symbol, successor) == 1
+    expected = _candles((midnight, 100, 101, 99, 100, 2))
+    disk = cm._load_from_disk(
+        symbol, midnight, midnight, timeframe="1m", merge_memory_cache=False
+    )
+    np.testing.assert_array_equal(disk, expected)
+    assert cm.get_last_final_ts(symbol) == midnight
+    assert cm.get_last_live_ws_ohlcv_ts(symbol) == midnight
+    assert not np.any(cm._ensure_symbol_cache(symbol)["ts"] > midnight)
+
+    # A fresh manager reconstructs the same candle from disk after restart.
+    restarted = _manager(tmp_path, now_ms=midnight + ONE_MIN_MS + 1_000)
+    np.testing.assert_array_equal(
+        restarted._load_from_disk(
+            symbol, midnight, midnight, timeframe="1m", merge_memory_cache=False
+        ),
+        expected,
+    )
+
+
+@pytest.mark.asyncio
 async def test_cached_forager_ema_uses_contiguous_ws_tail(tmp_path):
     now_ms = 5 * ONE_MIN_MS + 10_000
     cm = _manager(tmp_path, now_ms=now_ms)
@@ -434,7 +492,7 @@ def test_ws_legacy_shard_noop_cannot_expose_ram_only_correction(
     monkeypatch.setattr(
         cm,
         "_get_legacy_shard_paths",
-        lambda _symbol, _tf: {day_key: str(legacy_path)},
+        lambda _symbol, _tf, **_kwargs: {day_key: str(legacy_path)},
     )
     monkeypatch.setattr(
         cm,
@@ -518,6 +576,222 @@ async def test_ws_persistence_failure_does_not_expose_ram_only_candle(
     assert cm.get_last_live_ws_ohlcv_ts(symbol) == 0
     assert cm._ema_cache[symbol] == {ema_key: ema_value}
     assert cm._projected_open_tail_ema_cache[symbol] == projected_value
+
+
+@pytest.mark.asyncio
+async def test_ws_unavailable_disk_reads_cannot_publish_unverified_rows(tmp_path, monkeypatch):
+    symbol = "BTC/USDT:USDT"
+    cm = _manager(tmp_path, now_ms=4 * ONE_MIN_MS)
+    basis = _candles((ONE_MIN_MS, 100, 100, 100, 100, 1))
+    cm._persist_batch(symbol, basis, timeframe="1m", merge_cache=True)
+
+    # A failed readback cannot prove persistence even when the write succeeds.
+    load_from_disk = cm._load_from_disk
+
+    def unavailable_readback(*args, **kwargs):
+        if not kwargs.get("merge_memory_cache", True):
+            return None
+        return load_from_disk(*args, **kwargs)
+
+    monkeypatch.setattr(cm, "_load_from_disk", unavailable_readback)
+    with pytest.raises(OSError, match="persistence verification failed"):
+        await _prime_and_finalize_ws_row(
+            cm, symbol, [2 * ONE_MIN_MS, 100, 101, 99, 100.5, 2]
+        )
+    np.testing.assert_array_equal(cm._ensure_symbol_cache(symbol), basis)
+    assert cm.get_last_live_ws_ohlcv_ts(symbol) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("storage", ["primary", "legacy", "mixed_primary", "mixed_legacy"])
+@pytest.mark.parametrize("failure", ["corrupt", "unreadable"])
+async def test_ws_failed_existing_shard_read_preserves_history(
+    tmp_path, monkeypatch, storage, failure
+):
+    symbol = "BTC/USDT:USDT"
+    midnight = 24 * 60 * ONE_MIN_MS
+    cm = _manager(tmp_path, now_ms=midnight + 4 * ONE_MIN_MS)
+    basis = _candles(
+        (ONE_MIN_MS, 100, 100, 100, 100, 1),
+        (midnight + ONE_MIN_MS, 100, 100, 100, 100, 1),
+    )
+    cm._persist_batch(symbol, basis, timeframe="1m", merge_cache=True)
+    primary = Path(cm._shard_path(symbol, "1970-01-02", timeframe="1m"))
+    shard = primary
+    legacy = None
+    if storage != "primary":
+        legacy_dir = tmp_path / "legacy"
+        legacy_dir.mkdir()
+        legacy = legacy_dir / primary.name
+        if storage == "legacy":
+            primary.rename(legacy)
+        else:
+            np.save(legacy, _candles((midnight, 99, 100, 98, 99, 1)))
+        shard = primary if storage == "mixed_primary" else legacy
+        monkeypatch.setattr(cm, "_legacy_shard_dirs", lambda *_args: [str(legacy_dir)])
+        cm._legacy_shard_paths_cache.clear()
+        cm._invalidate_shard_paths_cache(symbol, tf="1m")
+    if failure == "corrupt":
+        shard.write_bytes(b"invalid numpy shard")
+    else:
+        load = np.load
+
+        def unreadable(file, *args, **kwargs):
+            if Path(file.name) == shard:
+                raise PermissionError("unreadable fixture")
+            return load(file, *args, **kwargs)
+
+        monkeypatch.setattr(np, "load", unreadable)
+    original_bytes = {path: path.read_bytes() for path in [primary, legacy] if path and path.exists()}
+    expected_error = ValueError if failure == "corrupt" else PermissionError
+    with pytest.raises(expected_error):
+        await _prime_and_finalize_ws_row(
+            cm, symbol, [midnight + 2 * ONE_MIN_MS, 100, 101, 99, 100.5, 2]
+        )
+
+    assert {path: path.read_bytes() for path in original_bytes} == original_bytes
+    if storage == "legacy":
+        assert not primary.exists()
+    np.testing.assert_array_equal(cm._ensure_symbol_cache(symbol), basis)
+    assert cm.get_last_live_ws_ohlcv_ts(symbol) == 0
+
+
+@pytest.mark.asyncio
+async def test_ws_merge_read_failure_after_successful_canonical_read(tmp_path, monkeypatch):
+    symbol = "BTC/USDT:USDT"
+    cm = _manager(tmp_path, now_ms=4 * ONE_MIN_MS)
+    basis = _candles((ONE_MIN_MS, 100, 100, 100, 100, 1))
+    cm._persist_batch(symbol, basis, timeframe="1m", merge_cache=True)
+    shard = Path(cm._shard_path(symbol, "1970-01-01", timeframe="1m"))
+    original_bytes = shard.read_bytes()
+    load = np.load
+    reads = 0
+
+    def fail_second_read(file, *args, **kwargs):
+        nonlocal reads
+        reads += 1
+        if reads == 2:
+            raise PermissionError("merge read unavailable")
+        return load(file, *args, **kwargs)
+
+    monkeypatch.setattr(np, "load", fail_second_read)
+    with pytest.raises(PermissionError):
+        await _prime_and_finalize_ws_row(
+            cm, symbol, [2 * ONE_MIN_MS, 100, 101, 99, 100.5, 2]
+        )
+    assert reads == 2
+    assert shard.read_bytes() == original_bytes
+    np.testing.assert_array_equal(cm._ensure_symbol_cache(symbol), basis)
+    assert cm.get_last_live_ws_ohlcv_ts(symbol) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unreadable", [False, True])
+async def test_ws_merge_reads_actual_shard_after_another_manager_publishes_day(
+    tmp_path, monkeypatch, unreadable
+):
+    midnight = 24 * 60 * ONE_MIN_MS
+    symbol = "BTC/USDT:USDT"
+    cm = _manager(tmp_path, now_ms=midnight + 3 * ONE_MIN_MS)
+    basis = _candles((midnight - ONE_MIN_MS, 100, 101, 99, 100, 1))
+    cm._persist_batch(symbol, basis, timeframe="1m", merge_cache=True)
+    # This manager caches discovery before the new day exists.
+    assert "1970-01-02" not in cm._iter_shard_paths(symbol, tf="1m")
+    other = _manager(tmp_path, now_ms=midnight + 3 * ONE_MIN_MS)
+    first_row = _candles((midnight, 100, 102, 99, 101, 2))
+    other._persist_batch(symbol, first_row, timeframe="1m", merge_cache=True)
+    assert "1970-01-02" not in cm._iter_shard_paths(symbol, tf="1m")
+    shard = Path(cm._shard_path(symbol, "1970-01-02", timeframe="1m"))
+    original_bytes = shard.read_bytes()
+    row = [midnight + ONE_MIN_MS, 101, 103, 100, 102, 3]
+    if unreadable:
+        load = np.load
+
+        def fail_read(file, *args, **kwargs):
+            if Path(file.name) == shard:
+                raise PermissionError("newly discovered target unavailable")
+            return load(file, *args, **kwargs)
+
+        monkeypatch.setattr(np, "load", fail_read)
+        with pytest.raises(PermissionError):
+            await _prime_and_finalize_ws_row(cm, symbol, row)
+        assert shard.read_bytes() == original_bytes
+        assert not np.any(cm._ensure_symbol_cache(symbol)["ts"] > midnight)
+        assert cm.get_last_live_ws_ohlcv_ts(symbol) == 0
+    else:
+        assert await _prime_and_finalize_ws_row(cm, symbol, row) == 1
+        expected = np.concatenate([first_row, _candles(tuple(row))])
+        np.testing.assert_array_equal(np.load(shard, allow_pickle=False), expected)
+        restarted = _manager(tmp_path, now_ms=midnight + 3 * ONE_MIN_MS)
+        disk = restarted._load_from_disk(
+            symbol, midnight, midnight + ONE_MIN_MS,
+            timeframe="1m", merge_memory_cache=False,
+        )
+        np.testing.assert_array_equal(disk, expected)
+
+
+@pytest.mark.asyncio
+async def test_ws_refreshes_missing_legacy_discovery_before_verifying_correction(
+    tmp_path, monkeypatch
+):
+    midnight = 24 * 60 * ONE_MIN_MS
+    symbol = "BTC/USDT:USDT"
+    cm = _manager(tmp_path, now_ms=midnight + 2 * ONE_MIN_MS)
+    legacy_dir = tmp_path / "legacy"
+    legacy_dir.mkdir()
+    monkeypatch.setattr(cm, "_legacy_shard_dirs", lambda *_args: [str(legacy_dir)])
+    cm._persist_batch(
+        symbol, _candles((midnight - ONE_MIN_MS, 100, 101, 99, 100, 1)),
+        timeframe="1m", merge_cache=True,
+    )
+    assert cm._get_legacy_shard_paths(symbol, "1m") == {}
+    canonical = _candles((midnight, 90, 91, 89, 90, 2))
+    legacy = legacy_dir / "1970-01-02.npy"
+    np.save(legacy, canonical)
+    original_bytes = legacy.read_bytes()
+
+    # A conflicting correction cannot become canonical in the running manager
+    # while a newly published legacy source wins on a fresh manager's read.
+    with pytest.raises(OSError, match="persistence verification failed"):
+        await _prime_and_finalize_ws_row(
+            cm, symbol, [midnight, 100, 101, 99, 100, 2]
+        )
+    assert legacy.read_bytes() == original_bytes
+    np.testing.assert_array_equal(cm._ensure_symbol_cache(symbol)[-1:], canonical)
+    assert cm.get_last_live_ws_ohlcv_ts(symbol) == 0
+    restarted = _manager(tmp_path, now_ms=midnight + 2 * ONE_MIN_MS)
+    monkeypatch.setattr(restarted, "_legacy_shard_dirs", lambda *_args: [str(legacy_dir)])
+    np.testing.assert_array_equal(
+        restarted._load_from_disk(
+            symbol, midnight, midnight, timeframe="1m", merge_memory_cache=False
+        ),
+        canonical,
+    )
+
+
+@pytest.mark.asyncio
+async def test_ws_legacy_discovery_failure_propagates(tmp_path, monkeypatch):
+    symbol = "BTC/USDT:USDT"
+    cm = _manager(tmp_path, now_ms=4 * ONE_MIN_MS)
+    basis = _candles((ONE_MIN_MS, 100, 100, 100, 100, 1))
+    cm._persist_batch(symbol, basis, timeframe="1m", merge_cache=True)
+    legacy_dir = tmp_path / "legacy"
+    legacy_dir.mkdir()
+    monkeypatch.setattr(cm, "_legacy_shard_dirs", lambda *_args: [str(legacy_dir)])
+    iterdir = Path.iterdir
+
+    def fail_legacy_scan(path):
+        if path == legacy_dir:
+            raise PermissionError("legacy discovery unavailable")
+        return iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", fail_legacy_scan)
+    with pytest.raises(PermissionError):
+        await _prime_and_finalize_ws_row(
+            cm, symbol, [2 * ONE_MIN_MS, 100, 101, 99, 100.5, 2]
+        )
+    np.testing.assert_array_equal(cm._ensure_symbol_cache(symbol), basis)
+    assert cm.get_last_live_ws_ohlcv_ts(symbol) == 0
 
 
 @pytest.mark.asyncio
@@ -763,18 +1037,23 @@ def test_repeated_ws_failures_enter_rest_fallback_cooldown():
 
 
 @pytest.mark.asyncio
-async def test_ingestion_failures_advance_to_rest_fallback_cooldown():
+@pytest.mark.parametrize("failure_stage", ["receive", "ingest"])
+async def test_ws_failures_identify_stage_and_preserve_rest_fallback_cooldown(
+    failure_stage, caplog
+):
     delays = []
 
     class _SuccessfulWatcher:
         has = {"watchOHLCV": True}
 
         async def watch_ohlcv(self, _symbol, _timeframe):
+            if failure_stage == "receive":
+                raise OSError("sensitive transport details")
             return [[ONE_MIN_MS, 1, 1, 1, 1, 1]]
 
     class _FailingManager:
         async def ingest_live_ws_ohlcv(self, _symbol, _rows):
-            raise OSError("persistence unavailable")
+            raise OSError("sensitive persistence details")
 
         def clear_live_ws_ohlcv_state(self, _symbol):
             return None
@@ -797,6 +1076,13 @@ async def test_ingestion_failures_advance_to_rest_fallback_cooldown():
     await candle_ws.watch_forager_ws_symbol(bot, "BTC/USDT:USDT")
 
     assert delays == [1.0, 2.0, 4.0, 8.0, 300.0]
+    warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "forager websocket candle update failed" in warnings[0].message
+    assert f"stage={failure_stage}" in warnings[0].message
+    assert "error_type=OSError" in warnings[0].message
+    assert "action=rest_fallback" in warnings[0].message
+    assert "sensitive" not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -1008,6 +1294,55 @@ async def test_unsubscribe_wakeup_exception_is_consumed_before_watcher_retiremen
     assert task.cancelled() is False
     assert ccp.future.done()
     assert ccp.future.exception() is not None
+
+
+@pytest.mark.asyncio
+async def test_retiring_watcher_does_not_resubscribe_after_inflight_ingestion():
+    ingest_started = asyncio.Event()
+    release_ingest = asyncio.Event()
+    unsubscribe_called = asyncio.Event()
+
+    class _CountingCCP:
+        def __init__(self):
+            self.watch_calls = 0
+
+        async def watch_ohlcv(self, _symbol, _timeframe):
+            self.watch_calls += 1
+            if self.watch_calls > 1:
+                raise AssertionError("retired watcher recreated its subscription")
+            return [[ONE_MIN_MS, 1.0, 1.0, 1.0, 1.0, 1.0]]
+
+        async def un_watch_ohlcv(self, _symbol, _timeframe):
+            unsubscribe_called.set()
+
+    class _BlockingManager:
+        async def ingest_live_ws_ohlcv(self, _symbol, _rows):
+            ingest_started.set()
+            await release_ingest.wait()
+
+    ccp = _CountingCCP()
+    symbol = "BTC/USDT:USDT"
+    bot = SimpleNamespace(
+        ccp=ccp,
+        cm=_BlockingManager(),
+        stop_signal_received=False,
+    )
+    watcher = asyncio.create_task(
+        candle_ws.watch_forager_ws_symbol(bot, symbol)
+    )
+    await asyncio.wait_for(ingest_started.wait(), timeout=1.0)
+    retirement = asyncio.create_task(
+        candle_ws._retire_watcher(bot, symbol, watcher)
+    )
+    await asyncio.wait_for(unsubscribe_called.wait(), timeout=1.0)
+
+    release_ingest.set()
+    await asyncio.wait_for(retirement, timeout=1.0)
+
+    assert watcher.done()
+    assert watcher.cancelled() is False
+    assert ccp.watch_calls == 1
+    assert not candle_ws._watcher_is_retiring(bot, symbol, watcher)
 
 
 @pytest.mark.asyncio
@@ -1436,3 +1771,184 @@ def test_forager_staleness_uses_persisted_ws_canonical_tail():
     now_ms = 13 * ONE_MIN_MS + 10_000
 
     assert Passivbot._candle_staleness_ms(bot, "BTC", now_ms=now_ms) == 0
+
+
+@pytest.mark.asyncio
+async def test_shared_network_failure_preserves_each_symbol_and_recovery(monkeypatch, caplog):
+    from ccxt.base.errors import NetworkError
+    from live.candle_ws_health import observe_receive_status
+    from live.event_bus import EventTypes
+    events = []
+    monkeypatch.setattr('live.candle_ws_health.emit_event', lambda bot, event: events.append(event))
+    bot = SimpleNamespace()
+    with caplog.at_level(logging.INFO):
+        for symbol in ('BTC', 'ETH', 'SOL'):
+            observe_receive_status(bot, symbol, error=NetworkError('secret'), retry_s=1.)
+        for symbol in ('BTC', 'ETH'):
+            observe_receive_status(bot, symbol, recovered=True)
+        assert bot._console_candle_receive is not None
+        observe_receive_status(bot, 'SOL', recovered=True)
+    warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert 'action=rest_fallback' in warnings[0]
+    assert 'receive recovered symbols=3 failures=3' in caplog.text
+    assert 'secret' not in caplog.text
+    assert [e['status'] for e in events] == ['failed']*3 + ['recovered']*3
+    assert all(e['event_type'] == EventTypes.CANDLE_WEBSOCKET_STATUS for e in events)
+    assert bot._console_candle_receive is None
+
+
+@pytest.mark.asyncio
+async def test_network_coalescing_preserves_retry_schedule_and_private_error_boundary(monkeypatch, caplog):
+    from ccxt.base.errors import NetworkError
+    events, delays = [], []
+    monkeypatch.setattr('live.candle_ws_health.emit_event', lambda bot, event: events.append(event))
+    async def watch(*args):
+        raise NetworkError('private exchange request')
+    bot = SimpleNamespace(ccp=SimpleNamespace(watch_ohlcv=watch),
+        cm=SimpleNamespace(clear_live_ws_ohlcv_state=lambda symbol: None),
+        get_exchange_time=lambda: 1_000_000, stop_signal_received=False)
+    async def sleep(delay, **kwargs):
+        delays.append(delay)
+        if len(delays) == 5:
+            bot.stop_signal_received = True
+    bot._sleep_unless_shutdown = sleep
+    with caplog.at_level(logging.INFO):
+        await candle_ws.watch_forager_ws_symbol(bot, 'BTC/USDT:USDT')
+    assert delays == [1., 2., 4., 8., 300.]
+    assert sum(r.levelno == logging.WARNING for r in caplog.records) == 1
+    assert [e['data']['receive_status'] for e in events] == ['failed'] * 5 + ['retired']
+    assert 'private' not in caplog.text
+    assert 'watchers cleared' in caplog.text
+
+
+def test_shared_receive_details_reach_real_event_pipeline():
+    from types import SimpleNamespace
+    from ccxt.base.errors import NetworkError
+    from live.event_bus import ListEventSink, LiveEventPipeline, EventTypes
+    from live.candle_ws_health import observe_receive_status
+    durable = ListEventSink()
+    pipeline = LiveEventPipeline(structured_sinks=[durable])
+    bot = SimpleNamespace(_live_event_pipeline=pipeline)
+    try:
+        observe_receive_status(bot, 'BTC', error=NetworkError('private'))
+        observe_receive_status(bot, 'BTC', retired=True)
+        assert pipeline.flush()
+        assert len(durable.events) == 2
+        assert all(e.event_type == EventTypes.CANDLE_WEBSOCKET_STATUS for e in durable.events)
+        assert durable.events[-1].status == 'skipped'
+        assert durable.events[-1].data['receive_status'] == 'retired'
+        assert pipeline.health_snapshot()['event_sink_error_total'] == 0
+    finally:
+        pipeline.close()
+
+
+@pytest.mark.asyncio
+async def test_receive_recovery_precedes_failed_ingestion(monkeypatch, caplog):
+    from ccxt.base.errors import NetworkError
+    events, calls = [], []
+    monkeypatch.setattr('live.candle_ws_health.emit_event', lambda bot, event: events.append(event))
+    async def watch(*args):
+        calls.append('receive')
+        if len(calls) == 1:
+            raise NetworkError('private')
+        return []
+    bot = SimpleNamespace(ccp=SimpleNamespace(watch_ohlcv=watch), stop_signal_received=False,
+                          get_exchange_time=lambda: 1000000)
+    async def ingest(*args):
+        assert bot._console_candle_receive is None
+        assert events[-1]['data']['receive_status'] == 'recovered'
+        raise ValueError('invalid candle')
+    bot.cm = SimpleNamespace(ingest_live_ws_ohlcv=ingest, clear_live_ws_ohlcv_state=lambda symbol: None)
+    async def sleep(*args, **kwargs):
+        if len(calls) == 2:
+            bot.stop_signal_received = True
+    bot._sleep_unless_shutdown = sleep
+    with caplog.at_level(logging.INFO):
+        await candle_ws.watch_forager_ws_symbol(bot, 'BTC')
+    assert [event['data']['receive_status'] for event in events] == ['failed', 'recovered']
+    assert 'stage=ingest error_type=ValueError' in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('terminal', ['recovered', 'retired'])
+async def test_overflow_watcher_terminal_event_survives_console_aggregate_clear(monkeypatch, terminal):
+    from ccxt.base.errors import NetworkError
+    from live.candle_ws_health import observe_receive_status
+    events, calls = [], []
+    monkeypatch.setattr('live.candle_ws_health.emit_event', lambda bot, event: events.append(event))
+    bot = SimpleNamespace(stop_signal_received=False, get_exchange_time=lambda: 1000000)
+    for i in range(256):
+        observe_receive_status(bot, str(i), error=NetworkError('private'))
+    async def watch(*args):
+        calls.append('receive')
+        if len(calls) == 1:
+            raise NetworkError('private')
+        bot.stop_signal_received = True
+        return []
+    bot.ccp = SimpleNamespace(watch_ohlcv=watch)
+    bot.cm = SimpleNamespace(clear_live_ws_ohlcv_state=lambda symbol: None)
+    async def sleep(*args, **kwargs):
+        assert len(bot._console_candle_receive['active']) == 256
+        for i in range(256):
+            observe_receive_status(bot, str(i), recovered=True)
+        assert bot._console_candle_receive is None
+        if terminal == 'retired':
+            bot.stop_signal_received = True
+    bot._sleep_unless_shutdown = sleep
+    await candle_ws.watch_forager_ws_symbol(bot, 'OVERFLOW')
+    assert [e['data']['receive_status'] for e in events if e.get('symbol') == 'OVERFLOW'] == [
+        'failed', terminal]
+    assert bot._console_candle_receive is None
+
+
+@pytest.mark.asyncio
+async def test_old_watcher_retirement_does_not_clear_replacement_receive_failure(monkeypatch, caplog):
+    from ccxt.base.errors import NetworkError
+    import asyncio
+    events = []
+    monkeypatch.setattr('live.candle_ws_health.emit_event', lambda bot, event: events.append(event))
+    old_ready, new_ready = asyncio.Event(), asyncio.Event()
+    release_old, release_new = asyncio.Event(), asyncio.Event()
+    bot = SimpleNamespace(stop_signal_received=False, get_exchange_time=lambda: 1000000,
+        cm=SimpleNamespace(clear_live_ws_ohlcv_state=lambda symbol: None))
+    async def watch(*args):
+        raise NetworkError('private')
+    bot.ccp = SimpleNamespace(watch_ohlcv=watch)
+    old = None
+    async def sleep(*args, **kwargs):
+        if asyncio.current_task() is old:
+            old_ready.set()
+            try:
+                await release_old.wait()
+            except asyncio.CancelledError:
+                await release_old.wait()
+        else:
+            new_ready.set()
+            await release_new.wait()
+    bot._sleep_unless_shutdown = sleep
+    with caplog.at_level(logging.INFO):
+        old = asyncio.create_task(candle_ws.watch_forager_ws_symbol(bot, 'BTC'))
+        replacement = None
+        try:
+            await asyncio.wait_for(old_ready.wait(), 1.)
+            candle_ws._mark_watcher_retiring(bot, 'BTC', old)
+            old.cancel()
+            await asyncio.sleep(0)
+            replacement = asyncio.create_task(candle_ws.watch_forager_ws_symbol(bot, 'BTC'))
+            await asyncio.wait_for(new_ready.wait(), 1.)
+            failures = [e for e in events if e['status'] == 'failed']
+            old_generation, new_generation = [e['data']['watcher_generation'] for e in failures]
+            assert old_generation != new_generation
+            release_old.set()
+            await asyncio.wait_for(old, 1.)
+            assert bot._console_candle_receive['active'] == {'BTC': new_generation}
+            assert 'watchers cleared' not in caplog.text
+            assert events[-1]['data']['receive_status'] == 'retired'
+            assert events[-1]['data']['watcher_generation'] == old_generation
+        finally:
+            release_old.set()
+            if replacement is not None:
+                replacement.cancel()
+            await asyncio.gather(old, *([replacement] if replacement is not None else []),
+                                 return_exceptions=True)

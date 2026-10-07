@@ -11,7 +11,7 @@ from suite_runner import (
     SuiteScenario,
     ScenarioResult,
     ExchangeDataset,
-    aggregate_metrics,
+    reduce_metrics,
     apply_scenario,
     build_scenarios,
     collect_suite_coin_sources,
@@ -49,7 +49,7 @@ def test_build_scenarios_basic():
         "scenarios": [{"label": "A"}],
         "exchanges": ["binance"],
     }
-    scenarios, aggregate_cfg = build_scenarios(suite_cfg, base_exchanges=["binance"])
+    scenarios, reducer_cfg = build_scenarios(suite_cfg, base_exchanges=["binance"])
     assert len(scenarios) == 1
     assert scenarios[0].label == "A"
     # Scenarios now inherit exchanges from suite_cfg or base_exchanges
@@ -57,7 +57,7 @@ def test_build_scenarios_basic():
 
 
 def test_build_scenarios_normalizes_label_whitespace():
-    scenarios, _aggregate_cfg = build_scenarios(
+    scenarios, _reducer_cfg = build_scenarios(
         {"scenarios": [{"label": " stress "}]}
     )
 
@@ -78,6 +78,34 @@ def test_build_scenarios_handles_exchanges_and_coin_sources():
     scenario = scenarios[0]
     assert scenario.exchanges == ["binance", "bybit"]
     assert scenario.coin_sources == {"BTC": "binance"}
+
+
+def test_build_scenarios_flattens_nested_overrides_but_keeps_coin_overrides_atomic():
+    scenarios, _ = build_scenarios(
+        {
+            "scenarios": [
+                {
+                    "label": "nested",
+                    "overrides": {
+                        "live": {"hedge_mode": True},
+                        "bot": {
+                            "short": {"risk": {"total_wallet_exposure_limit": 0.0}}
+                        },
+                        "coin_overrides": {
+                            "ETH": {"live": {"forced_mode_long": "normal"}}
+                        },
+                    },
+                }
+            ]
+        },
+        base_exchanges=["binance"],
+    )
+
+    assert scenarios[0].overrides == {
+        "live.hedge_mode": True,
+        "bot.short.risk.total_wallet_exposure_limit": 0.0,
+        "coin_overrides": {"ETH": {"live": {"forced_mode_long": "normal"}}},
+    }
 
 
 def test_build_scenarios_preserves_exact_coins_and_coin_sources():
@@ -629,8 +657,8 @@ def test_apply_scenario_overrides_use_shared_canonical_path_resolver():
         },
         "bot": {
             "long": {
-                "hsl": {"no_restart_drawdown_threshold": 0.3},
-                "hsl_no_restart_drawdown_threshold": 0.1,
+                "hsl": {"red_threshold": 0.3},
+                "hsl_red_threshold": 0.1,
                 "risk": {"entry_cooldown_minutes": 0.0},
                 "risk_entry_cooldown_minutes": 9.0,
             },
@@ -644,7 +672,7 @@ def test_apply_scenario_overrides_use_shared_canonical_path_resolver():
         coins=["BTC"],
         ignored_coins=[],
         overrides={
-            "bot.long.hsl_no_restart_drawdown_threshold": 1.0,
+            "bot.long.hsl_red_threshold": 1.0,
             "bot.long.risk.entry_cooldown_minutes": 2.5,
         },
     )
@@ -659,9 +687,9 @@ def test_apply_scenario_overrides_use_shared_canonical_path_resolver():
         base_coin_sources={"BTC": "binance"},
     )
 
-    assert cfg["bot"]["long"]["hsl"]["no_restart_drawdown_threshold"] == pytest.approx(1.0)
-    assert cfg["bot"]["long"]["risk"]["entry_cooldown_minutes"] == pytest.approx(2.5)
-    assert "hsl_no_restart_drawdown_threshold" not in cfg["bot"]["long"]
+    assert cfg["bot"]["long"]["hsl"]["red_threshold"] == pytest.approx(1.0)
+    assert cfg["bot"]["long"]["entry_cooldown"]["base_duration_minutes"] == pytest.approx(2.5)
+    assert "hsl_red_threshold" not in cfg["bot"]["long"]
     assert "risk_entry_cooldown_minutes" not in cfg["bot"]["long"]
 
 
@@ -796,14 +824,75 @@ async def test_prepare_master_datasets_uses_scenario_windows_for_individual_exch
 
 
 @pytest.mark.asyncio
+async def test_prepare_master_datasets_preserves_combined_source_exchanges(monkeypatch):
+    async def fake_prepare_hlcvs_mss(config, exchange, *, force_refetch_gaps=False):
+        assert exchange == "combined"
+        timestamps = np.array([0, 60_000], dtype=np.int64)
+        return (
+            ["ETH"],
+            np.ones((2, 1, 4), dtype=np.float64),
+            {"ETH": {"exchange": "binance"}, "__meta__": {}},
+            "",
+            "/tmp/combined",
+            np.ones(2, dtype=np.float64),
+            timestamps,
+        )
+
+    monkeypatch.setitem(
+        sys.modules,
+        "backtest",
+        SimpleNamespace(prepare_hlcvs_mss=fake_prepare_hlcvs_mss),
+    )
+    base_config = {
+        "backtest": {
+            "start_date": "1970-01-01T00:00:00",
+            "end_date": "1970-01-01T00:02:00",
+            "exchanges": ["binance", "bybit"],
+            "coins": {},
+        },
+        "live": {
+            "approved_coins": {"long": ["ETH"], "short": ["ETH"]},
+            "ignored_coins": {"long": [], "short": []},
+        },
+    }
+    scenarios = [
+        SuiteScenario(
+            label="base",
+            start_date=None,
+            end_date=None,
+            coins=None,
+            ignored_coins=None,
+            exchanges=["binance", "bybit"],
+        )
+    ]
+
+    datasets = await prepare_master_datasets(
+        base_config,
+        ["binance", "bybit"],
+        scenarios=scenarios,
+    )
+
+    assert datasets["combined"].coin_exchange == {"ETH": "binance"}
+    assert datasets["combined"].available_exchanges == ["binance", "bybit"]
+
+
+@pytest.mark.asyncio
 async def test_prepare_master_datasets_copies_materialized_arrays_directly_to_shared_memory(
     monkeypatch,
 ):
     source_hlcvs = np.arange(24, dtype=np.float64).reshape(3, 2, 4)
     source_btc = np.array([10.0, 11.0, 12.0], dtype=np.float64)
     timestamps = np.array([0, 60_000, 120_000], dtype=np.int64)
+    prepare_kwargs = {}
 
-    async def fake_prepare_hlcvs_mss(config, exchange, *, force_refetch_gaps=False):
+    async def fake_prepare_hlcvs_mss(
+        config,
+        exchange,
+        *,
+        force_refetch_gaps=False,
+        **kwargs,
+    ):
+        prepare_kwargs.update(kwargs)
         return (
             ["BTC", "ETH"],
             source_hlcvs,
@@ -855,16 +944,18 @@ async def test_prepare_master_datasets_copies_materialized_arrays_directly_to_sh
         base_config,
         ["binance"],
         shared_array_manager=manager,
+        allow_internal_nan_gaps=True,
     )
 
     assert len(manager.sources) == 2
     assert np.shares_memory(manager.sources[0], source_hlcvs)
     assert np.shares_memory(manager.sources[1], source_btc)
+    assert prepare_kwargs == {"allow_internal_nan_gaps": True}
     np.testing.assert_array_equal(datasets["binance"].hlcvs, source_hlcvs)
     np.testing.assert_array_equal(datasets["binance"].btc_usd_prices, source_btc)
 
 
-def test_aggregate_metrics_computes_stats():
+def test_reduce_metrics_computes_stats():
     scenario_results = [
         ScenarioResult(
             scenario=SuiteScenario("a", None, None, None, None),
@@ -881,7 +972,7 @@ def test_aggregate_metrics_computes_stats():
             output_path=None,
         ),
     ]
-    summary = aggregate_metrics(scenario_results, {"default": "mean"})
+    summary = reduce_metrics(scenario_results, {"default": "mean"})
     assert summary["aggregated"]["metric"] == pytest.approx(2.0)
     assert summary["stats"]["metric"]["max"] == pytest.approx(3.0)
     assert summary["stats"]["metric"]["median"] == pytest.approx(2.0)
@@ -1039,3 +1130,106 @@ def test_run_combined_dataset_passes_payload_timestamps_to_post_process(tmp_path
     np.testing.assert_array_equal(seen["plot_context"].timestamps, timestamps)
     np.testing.assert_array_equal(seen["plot_context"].hlcvs, hlcvs)
     assert seen["plot_context"].hard_stop_plot_data == {"sample": True}
+
+
+@pytest.mark.parametrize("reducer_name", ["n_days", "fills_analysis_duration_days"])
+def test_reduce_metrics_applies_one_policy_to_duration_aliases(reducer_name):
+    results = [
+        ScenarioResult(
+            scenario=SuiteScenario(str(days), None, None, None, None),
+            per_exchange={},
+            metrics={"stats": {
+                "n_days": {"mean": days},
+                "fills_analysis_duration_days": {"mean": days},
+            }},
+            elapsed_seconds=0.0, output_path=None,
+        )
+        for days in (1.0, 3.0)
+    ]
+    summary = reduce_metrics(results, {"default": "mean", reducer_name: "max"})
+    assert summary["aggregated"]["n_days"] == 3.0
+    assert summary["aggregated"]["fills_analysis_duration_days"] == 3.0
+
+
+def test_saved_suite_config_preserves_effective_exchange_defaults(monkeypatch, tmp_path):
+    import json
+    import suite_runner as suite
+    from config_utils import get_template_config
+
+    config = get_template_config()
+    config["backtest"]["exchanges"] = ["binance"]
+    config["live"]["approved_coins"] = {"long": ["BTC"], "short": []}
+    config["live"]["ignored_coins"] = {"long": [], "short": []}
+    suite_cfg = {"scenarios": [{"label": "external"}], "exchanges": ["bybit"]}
+
+    async def noop(*args, **kwargs):
+        pass
+
+    async def datasets(*args, **kwargs):
+        return {"bybit": SimpleNamespace(exchange="bybit", coins=["BTC"])}
+
+    observed = []
+
+    async def run_scenario(scenario, *args, **kwargs):
+        observed.append(scenario.exchanges)
+        output = args[6] / scenario.label
+        output.mkdir()
+        (output / "config.json").write_text("{}")
+        return ScenarioResult(
+            scenario,
+            {},
+            {"stats": {}},
+            0.0,
+            output,
+            "2026-01-01T00:00:00.000Z",
+            "2026-01-01T00:00:01.000Z",
+        )
+
+    for name in ("load_markets", "format_approved_ignored_coins",
+                 "reject_cross_exchange_market_identifier_collisions"):
+        monkeypatch.setattr(suite, name, noop)
+    monkeypatch.setattr(suite, "validate_suite_side_coin_lists", lambda *a: None)
+    monkeypatch.setattr(suite, "_coalesce_master_coins", lambda coins, *a: coins)
+    monkeypatch.setattr(suite, "prepare_master_datasets", datasets)
+    monkeypatch.setattr(suite, "apply_scenario", lambda *a, **kw: (config, ["BTC"]))
+    monkeypatch.setattr(suite, "_compute_effective_coin_exchange", lambda *a: {"BTC": "bybit"})
+    monkeypatch.setattr(suite, "run_backtest_scenario", run_scenario)
+    monkeypatch.setattr(
+        suite,
+        "_suite_session_inputs",
+        lambda *a: (
+            [],
+            [config],
+            ["BTC"],
+            ["bybit"],
+        ),
+    )
+    monkeypatch.setattr(
+        suite, "evaluation_implementation_identity", lambda: {"test": True}
+    )
+    asyncio.run(suite.run_backtest_suite_async(
+        config, suite_cfg, disable_plotting=True, suite_output_root=tmp_path,
+    ))
+    summary = json.loads((tmp_path / "suite_summary.json").read_text())
+    assert summary["layout_version"] == 2
+    assert summary["per_scenario"]["external"]["output_path"] == "external"
+    assert summary["per_scenario"]["external"]["artifacts"] == {
+        "config.json": "external/config.json",
+    }
+    assert (
+        summary["per_scenario"]["external"]["started_at"] == "2026-01-01T00:00:00.000Z"
+    )
+    with pytest.raises(FileExistsError, match="empty"):
+        asyncio.run(
+            suite.run_backtest_suite_async(
+                config,
+                suite_cfg,
+                disable_plotting=True,
+                suite_output_root=tmp_path,
+            )
+        )
+    saved = json.loads((tmp_path / "config.json").read_text())
+    resumed, _ = build_scenarios(saved["backtest"], base_exchanges=saved["backtest"]["exchanges"])
+    assert observed == [["bybit"]]
+    assert resumed[0].exchanges == observed[0]
+    assert config["backtest"]["exchanges"] == ["binance"]

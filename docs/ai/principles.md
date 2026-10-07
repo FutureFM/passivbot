@@ -21,7 +21,9 @@ Canonical repository-wide invariants; task documents link here instead of restat
 ## Statelessness
 
 - Trading decisions must be reproducible after restart from exchange state and config.
-- Do not add decision-changing local state that cannot be rederived.
+- Do not add decision-changing local state that cannot be rederived. HSL permissions and
+  cooldown are reconstructed from retained exchange facts and current configuration; no local
+  journal preserves a prior panic decision.
 - Performance caches are allowed only when cache loss, rejection, or rebuild does not change the
   intended decision.
 - A reviewed RAM-only economy gate may reset only toward current Rust intent. It must not preserve
@@ -65,6 +67,17 @@ belong in canonical loading/formatting; runtime consumers must not reapply them.
 - Any allowed fallback must be bounded, observable, and tested.
 - Use `error_contract.md` for the precise meanings of propagate, unavailable, defer, fail closed,
   degraded, and fatal.
+
+## Console Readability
+
+Keep console logs easy on human eyes and useful to both humans and agents: show meaningful
+changes, actions and concise summaries; suppress repetitive noise. Follow `logging_policy.md`.
+
+Prioritize readability for JSON clearly intended for human reading or editing, such as generated
+configs and dashboard config exports. Prefer `json_utils.dump_json_streamlined` /
+`json_dumps_streamlined` (also exported by `utils`), `passivbot tool streamline-json`, or another
+suitable formatter while preserving serialization semantics. Keep ordinary JSON serialization
+for internal outputs and outputs intended mainly for tools or AI agents.
 
 ## Scope, Testing, And Compatibility
 

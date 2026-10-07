@@ -2,6 +2,7 @@ from exchanges.ccxt_bot import CCXTBot, format_exchange_config_response
 from live.balance_composition import normalize_okx_balance_composition
 from live.diagnostic_safety import bounded_exception_type
 from passivbot import logging
+from live import hsl_live
 import passivbot_rust as pbr
 
 import asyncio
@@ -28,12 +29,25 @@ class OKXBot(CCXTBot):
         Inspect account configuration to detect portfolio margin (PM) and position mode.
         Startup must know whether OKX is in dual-side or net mode before building orders.
         """
+        self.okx_dual_side = False
         try:
             cfg = await self.cca.private_get_account_config()
-            data = cfg.get("data", [{}])
-            data0 = data[0] if data else {}
-            pos_mode = str(data0.get("posMode", "")).lower()  # "long_short_mode" or "net_mode"
-            acct_lv = str(data0.get("acctLv", "")).lower()  # "pm" for portfolio margin accounts
+            data = cfg.get("data")
+            if (
+                not isinstance(data, list)
+                or len(data) != 1
+                or not isinstance(data[0], dict)
+            ):
+                raise ValueError(
+                    "OKX account configuration requires one explicit mode row"
+                )
+            data0 = data[0]
+            pos_mode = str(
+                data0.get("posMode", "")
+            ).lower()  # "long_short_mode" or "net_mode"
+            acct_lv = str(
+                data0.get("acctLv", "")
+            ).lower()  # "pm" for portfolio margin accounts
             if pos_mode == "net_mode":
                 self.okx_dual_side = False
                 self.hedge_mode = False
@@ -43,23 +57,57 @@ class OKXBot(CCXTBot):
                 )
             elif pos_mode == "long_short_mode":
                 self.okx_dual_side = True
-            # If unknown, keep default True and let later failures flip it off.
+                self.hedge_mode = True
+            else:
+                raise ValueError(
+                    "OKX account configuration missing explicit position mode"
+                )
             self.okx_pm_account = acct_lv == "pm"
             if self.okx_pm_account:
                 logging.info(
                     "OKX account detected as Portfolio Margin (PM); mode/leverage changes may be restricted."
                 )
         except Exception as e:
-            if (
-                isinstance(e, RuntimeError)
-                and "Passivbot requires dual-side/hedge mode" in str(e)
-            ):
+            if isinstance(
+                e, RuntimeError
+            ) and "Passivbot requires dual-side/hedge mode" in str(e):
                 raise
             raise RuntimeError(
                 "Unable to detect OKX account configuration before live order setup"
             ) from e
 
     # ═══════════════════ HOOK OVERRIDES ═══════════════════
+
+    async def _do_fetch_open_orders(self, symbol: str = None) -> list:
+        """Read every pending-order page before exposing an account snapshot."""
+        orders = {}
+        cursor = None
+        for _ in range(1000):
+            params = {"paginate": False}
+            if cursor is not None:
+                params["after"] = str(cursor)
+            page = await self.cca.fetch_open_orders(
+                symbol=symbol, limit=100, params=params
+            )
+            if not isinstance(page, list) or len(page) > 100:
+                raise ValueError("OKX returned an invalid open-order page")
+            page_ids = []
+            for order in page:
+                order_id = order.get("id") if isinstance(order, dict) else None
+                if not isinstance(order_id, str) or not order_id.isdecimal():
+                    raise ValueError("OKX open order missing a numeric pagination ID")
+                page_ids.append(int(order_id))
+                orders.setdefault(order_id, order)
+            # CCXT sorts parsed orders by timestamp, so list position does not
+            # identify the oldest order. OKX's `after` cursor uses order IDs.
+            if page_ids:
+                next_cursor = min(page_ids)
+                if cursor is not None and next_cursor >= cursor:
+                    raise RuntimeError("OKX open-order pagination did not advance")
+                cursor = next_cursor
+            if len(page) < 100:
+                return list(orders.values())
+        raise RuntimeError("OKX open-order pagination exhausted before completion")
 
     def _get_position_side_for_order(self, order: dict) -> str:
         """OKX provides posSide in info."""
@@ -148,7 +196,10 @@ class OKXBot(CCXTBot):
         balance = 0.0
         for detail in details:
             collateral_enabled = detail.get("collateralEnabled")
-            if str(collateral_enabled).lower() not in {"true", "1"} and collateral_enabled is not True:
+            if (
+                str(collateral_enabled).lower() not in {"true", "1"}
+                and collateral_enabled is not True
+            ):
                 continue
             ccy = detail["ccy"]
             if ccy == self.quote:
@@ -160,7 +211,9 @@ class OKXBot(CCXTBot):
         if balance == 0.0:
             total = fetched.get("total")
             if not isinstance(total, dict) or self.quote not in total:
-                raise KeyError(f"okx: fetch_balance response missing total[{self.quote!r}]")
+                raise KeyError(
+                    f"okx: fetch_balance response missing total[{self.quote!r}]"
+                )
             return float(total[self.quote])
         return balance
 
@@ -168,7 +221,9 @@ class OKXBot(CCXTBot):
         """Expose only bounded documented OKX account-detail diagnostics."""
         return normalize_okx_balance_composition(fetched)
 
-    async def fetch_pnls(self, start_time: int = None, end_time: int = None, limit=None):
+    async def fetch_pnls(
+        self, start_time: int = None, end_time: int = None, limit=None
+    ):
         if limit is None:
             limit = 100
         if start_time is None and end_time is None:
@@ -189,7 +244,9 @@ class OKXBot(CCXTBot):
     async def gather_fill_events(self, start_time=None, end_time=None, limit=None):
         """Return canonical fill events for OKX."""
         events = []
-        fills = await self.fetch_pnls(start_time=start_time, end_time=end_time, limit=limit)
+        fills = await self.fetch_pnls(
+            start_time=start_time, end_time=end_time, limit=limit
+        )
         for fill in fills:
             events.append(
                 {
@@ -225,6 +282,7 @@ class OKXBot(CCXTBot):
             fetched[i]["position_side"] = fetched[i]["info"]["posSide"]
         return sorted(fetched, key=lambda x: x["timestamp"])
 
+    @hsl_live.connector_write("cancel")
     async def execute_cancellation(self, order: dict) -> dict:
         """OKX: Cancel order with special handling for 51400 (already cancelled/filled)."""
         try:
@@ -370,6 +428,13 @@ class OKXBot(CCXTBot):
                 else:
                     logging.info(f"{log_symbol}: {to_print}")
 
+    async def _prepare_protective_account(self):
+        await self._detect_account_config()
+        if not self.okx_dual_side:
+            raise RuntimeError(
+                "OKX protective startup requires existing hedge position mode"
+            )
+
     async def update_exchange_config(self):
         # Detect current account mode; adjust expectations before attempting changes.
         await self._detect_account_config()
@@ -381,7 +446,8 @@ class OKXBot(CCXTBot):
         try:
             res = await self.cca.set_position_mode(True)
             logging.debug(
-                "[config] set hedge mode response: %s", format_exchange_config_response(res)
+                "[config] set hedge mode response: %s",
+                format_exchange_config_response(res),
             )
         except Exception as e:
             err_str = str(e)
@@ -420,7 +486,9 @@ class OKXBot(CCXTBot):
                         {**x, **{"symbol": s}},
                     )
                 )
-        ideal_orders_tmp = [x[1] for x in sorted(ideal_orders_tmp, key=lambda x: x[0])][:100]
+        ideal_orders_tmp = [x[1] for x in sorted(ideal_orders_tmp, key=lambda x: x[0])][
+            :100
+        ]
         ideal_orders = {symbol: [] for symbol in self.active_symbols}
         for x in ideal_orders_tmp:
             ideal_orders[x["symbol"]].append(x)

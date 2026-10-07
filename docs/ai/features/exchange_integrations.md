@@ -6,19 +6,19 @@ requires explicit user approval; prefer offline request-construction tests.
 ## Supported Live-Exchange Boundary
 
 The supported production live connectors are Binance, Bybit, Bitget, Bitunix, OKX, Gate.io,
-KuCoin, Hyperliquid, and WEEX. The fake connector is an offline deterministic test harness, not an
+KuCoin, Hyperliquid, WEEX, and Lighter. The fake connector is an offline deterministic test harness, not an
 exchange.
 
 Defx is deliberately unsupported. `src/exchanges/defx.py` and the `setup_bot()` routing branch are
 stale legacy placeholders retained only until a separate cleanup removes them. Their presence does
 not make Defx a supported connector and must not expand feature coverage, implementation matrices,
 regression requirements, or live-testing scope. The canonical live fill-event factory rejects Defx
-because required realized-PnL, unstuck, and HSL replay support is absent. Do not use the Defx adapter
+because required realized-PnL, unstuck, and HSL reconstruction support is absent. Do not use the Defx adapter
 for live operation or authenticated probes.
 
 Paradex is experimental and outside the supported production boundary. Its adapter and
 `setup_bot()` routing branch may be used as comparative implementation or rate-limit research, but
-required live fill/PnL, unstuck, and HSL replay contracts are incomplete. Do not infer production
+required live fill/PnL, unstuck, and HSL reconstruction contracts are incomplete. Do not infer production
 support, implementation coverage, regression requirements, or live-testing scope from its runtime
 routing branch or comparative documentation.
 
@@ -56,6 +56,10 @@ not generalize one exchange's code, match human-readable messages, persist coold
 make held positions wholly nontradable.
 
 ## Private Order Websocket Normalization
+
+Order rows proving fill progress (`filled > 0` or `remaining < amount`) request an authoritative
+account refresh even when their status remains open and they match a recent local creation.
+A creation acknowledgement may be a self-echo; fill progress invalidates the account-wide plan.
 
 Authoritative REST open-order reconciliation remains strict. Binance and KuCoin
 private websocket notifications for Passivbot-owned orders may omit native
@@ -171,6 +175,17 @@ Primary reference: `src/fill_events_manager.py` (`BybitFetcher._fetch_positions_
 
 ## KuCoin Futures
 
+### First-candle market-age discovery
+
+KuCoin rejects `from=1`. Request daily candles from a valid millisecond timestamp
+before futures launch (`2018-01-01`), with `to` explicitly set to the current time.
+Pinned CCXT otherwise derives `to=since + limit * duration`; with `limit=1`, that
+queries only one pre-listing day and returns no data. Retain the first returned
+candle as the age basis. Empty or failed responses remain unknown and do not
+bypass the configured minimum market age; zero cache entries are retried.
+
+Primary reference: [KuCoin futures klines](https://www.kucoin.com/docs-new/rest/futures-trading/market-data/get-klines).
+
 ### IPv4 API-key whitelist transport
 
 Problem: A dual-stack host may select IPv6 for KuCoin REST and private
@@ -180,6 +195,21 @@ whitelist authentication failure.
 
 Handling: Both KuCoin REST and WebSocket CCXT clients use IPv4-only network
 connectors. Keep the host's stable public IPv4 address in the API-key whitelist.
+
+### Private websocket token renewal
+
+Problem:
+
+1. KuCoin expires private futures websocket tokens during long-running sessions.
+2. Pinned CCXT classifies `connectId=privateFutures` as `private` when handling the expiry message,
+   so its cached futures URL keeps the rejected token and every reconnect reuses it.
+
+Handling:
+
+1. Clear the exact negotiated URL cache entry named by the websocket's `connectId` before CCXT
+   propagates the expiry error to the reconnect loop.
+2. Keep the expiry visible as a throttled websocket warning without emitting the dependency's raw
+   callback traceback. The next `watch_orders` attempt must negotiate a new futures token.
 
 ### KuCoin hedge-mode refresh
 
@@ -227,8 +257,12 @@ Handling:
    the requested range. Promote the exact omission to verified no-trade continuity only if one
    successful raw payload returns both boundaries and no row inside the gap. This contextual proof
    may repair an older persistent `fetch_failed` gap. Empty, one-sided, malformed, or partially
-   recovered responses remain unavailable, preserve persistent gap status, and restart the
-   persistent retry cooldown rather than issuing another contextual request on every candle read.
+   recovered responses remain unavailable, preserve persistent gap status, and start a five-minute
+   contextual-proof cooldown rather than issuing another request on every candle read. Adjacent
+   records retain independent retry clocks; all unverified fragments of the proof window must be
+   eligible and both real bounds must fit one request page. Wider gaps retain ordinary repair
+   instead of repeated short-cooldown proof attempts. Ordinary missing-range retry timing remains
+   unchanged.
 
 ## Bitget Futures
 
@@ -447,6 +481,8 @@ Handling:
    request spacing below the venue's documented UID/IP rolling limit. Treat the observed
    `code=1, msg=Network Error` envelope like documented network error `10001`, and retry native
    market discovery with bounded backoff so a transient cold-start response is not permanent.
+   Attach the bounded venue code to the mapped exception for structured write diagnostics; do not
+   propagate response bodies, configured headers, or credentials into the public diagnostic path.
 4. Authenticate the private WebSocket with its seconds-based signature, subscribe to `order`, and
    send Bitunix's application-level JSON ping while idle; transport-level WebSocket heartbeats do
    not replace the venue keepalive. Enrich each order notification from REST detail before
@@ -459,8 +495,9 @@ Handling:
 5. Apply custom endpoint domain rewrites and `rest.url_overrides.api` to the native REST base, and
    merge `rest.extra_headers` into every request. Reject authentication header names
    case-insensitively in configured headers so proxy or user headers cannot collide with generated
-   signatures. Honor `disable_ws` for both private orders and public tickers: use REST order
-   polling and request only explicit, bounded symbol sets through REST depth.
+   signatures. Honor `disable_ws` for private orders and public market streams: use REST order
+   polling, request only explicit bounded symbol sets through REST depth, and leave canonical
+   candle refresh and repair to REST.
 6. Keep `bitunix: null` explicit in `broker_codes.hjson`; there is no Passivbot broker payload for
    this connector.
 
@@ -488,7 +525,11 @@ Handling:
    price for every limit order and every open order. Only terminal market-order detail may omit the
    request price.
 5. Bitunix has emitted `NEW_` on live order detail although its schema documents `NEW`. Normalize
-   only trailing underscore padding before applying the closed order-status allowlist.
+   only trailing underscore padding before applying the closed order-status allowlist. Pending
+   endpoint membership is itself authoritative evidence that an order remains pending, so retain
+   an otherwise unknown bounded code-like transition status as open until a later complete
+   pending snapshot removes it, with a rate-limited structured warning. Missing, free-form, and
+   oversized statuses remain invalid, and order-detail normalization keeps the strict allowlist.
 6. Page pending orders by `skip` to the required, stable reported total under one fixed `endTime`
    snapshot. Reject missing, changing, truncated, or duplicate pagination results before treating
    the account-critical open-order set as authoritative.
@@ -497,10 +538,11 @@ Handling:
    `realizedPNL` and the fee sign so maker rebates remain positive balance impacts. Enrich empty
    fill `clientId` values through order detail, but retain the exchange-truth fill with unknown
    attribution when terminal order detail has expired. This is the canonical fill source for
-   realized PnL, unstuck accounting, and HSL replay.
-8. Reconstruct realized wallet balance as
-   `available + frozen + margin - crossUnrealizedPNL - isolationUnrealizedPNL`; do not feed
-   mark-to-market equity into Rust sizing.
+   realized PnL, unstuck accounting, and HSL reconstruction.
+8. Reconstruct realized wallet balance as `available + frozen + margin`. These are the disjoint
+   available, order-locked, and position-margin quantities. Keep
+   `crossUnrealizedPNL + isolationUnrealizedPNL` separate as mark-to-market state so price movement
+   does not change Rust's realized sizing balance.
 
 Primary references: [place order](https://www.bitunix.com/api-docs/futures/trade/place_order.html),
 [pending positions](https://www.bitunix.com/api-docs/futures/position/get_pending_positions.html),
@@ -522,6 +564,12 @@ are explicitly disabled, live market snapshots select this targeted REST path di
 opening or waiting for a public ticker socket; unbounded bulk requests and requests above the
 eight-symbol limit fail closed.
 
+Live snapshots default to targeted ticker reads even with WebSockets enabled. Only requested
+symbols participate in the bounded readiness wait, so an unrelated silent market cannot delay
+protection of a held position. This still uses the shared websocket cache and retains its freshness
+checks and capped depth fallback. An explicit `market_snapshot_ticker_strategy=bulk` remains an
+operator override.
+
 Bitunix klines return at most 200 rows. The live field names are inverted relative to their units:
 `quoteVol` is base quantity and `baseVol` is quote notional; normalize `quoteVol` as CCXT base
 volume so Passivbot's generic quote-volume calculation remains dimensionally correct. Missing,
@@ -532,9 +580,27 @@ and deduplicate. This pagination supports live warmup, restart reconstruction, a
 indicators only. Bulk historical Bitunix data for backtesting or optimization is not a supported
 source.
 
+When WebSockets are enabled, multiplex the active forager candidates on the official
+`market_kline_1min` channel. Deterministically shard the sorted symbol set across public sockets,
+with no more than the venue's 300 subscriptions on each connection.
+The push timestamp is receipt/update time, so floor it to the one-minute bucket; normalize `b` as
+base volume and validate the complete OHLC row. Pass the changing open bucket through the generic
+successor-candle finalization boundary. Drop a transient internally inconsistent update instead of
+clamping exchange values or failing unrelated multiplexed symbols; a bounded consecutive run wakes
+the affected watcher into REST fallback and suspends new rows for that symbol until the watcher
+consumes the fallback signal. Startup basis, reconnect gaps, persistent malformed data, prolonged
+silence, and periodic integrity checks remain REST-owned; a transport failure wakes every affected
+watcher so provenance is cleared before bounded reconnect and REST fallback. Track application-data
+liveness per symbol so unrelated Kline traffic and control frames cannot conceal a stalled
+subscription, while also enforcing connection silence independently of the short receive polling
+used for subscription reconciliation. Validate subscription acknowledgements and wake only the
+rejected symbols into REST fallback when the response identifies them; an unscoped rejection
+conservatively wakes the pending subscription batch.
+
 Primary references: [ticker WebSocket](https://www.bitunix.com/api-docs/futures/websocket/public/Tickers%20Channel.html),
 [REST depth](https://www.bitunix.com/api-docs/futures/market/get_depth.html), and
-[kline API](https://www.bitunix.com/api-docs/futures/market/get_kline.html).
+[Kline WebSocket](https://www.bitunix.com/api-docs/futures/websocket/public/kline%20channel.html),
+and [kline API](https://www.bitunix.com/api-docs/futures/market/get_kline.html).
 
 ## WEEX Futures
 
@@ -648,9 +714,9 @@ Handling in Passivbot:
    finalized tail covers the remaining range.
 2. Exclude the forming candle and require exact finalized-candle coverage before
    publishing close, volume, quote-volume, or volatility EMAs.
-3. Require exact 1m coverage before rebuilding trailing extrema or extending an
-   HSL replay cache. Missing coverage marks trailing state unavailable or makes
-   HSL fall back to its authoritative full replay path.
+3. Require exact 1m coverage before rebuilding trailing extrema. HSL restart reconstruction uses
+   the documented 1m/5m/15m/1h resolution ladder for the older leading prefix and remains
+   authoritative for fill timestamps, realized PnL, fees, and episode boundaries.
 4. Keep bulk historical WEEX backtest downloading out of scope; this bounded
    paging exists for live warmup, restart reconstruction, and runtime indicators.
 
@@ -674,6 +740,65 @@ Handling:
    it is not a supported WEEX data source in this release.
 
 Primary reference: [WEEX V3 trade-detail API](https://www.weex.com/api-doc/contract/Transaction_API/GetTradeDetails).
+
+## Lighter USDC perpetuals
+
+Use the dedicated CCXT adapter and existing L2 API key, with the official signer revision
+specified in [the setup guide](../../exchanges/lighter.md). Never pass that key as CCXT's L1
+`privateKey`: the default L1 setup rotates API keys and may approve builder fees. Force
+`builderFee=false` and provide the official zero-valued integrator signing fields.
+
+Lighter is one-way. Normalize authoritative buy/sell plus explicit `reduce_only` into position
+side; every close must be reduce-only. Encode Passivbot client IDs into the exchange's 48-bit
+integer range with a namespace and reversible order-type marker. Do not infer ownership from
+side, price, or quantity. Quantities are base units, not `quote_multiplier` contracts.
+
+Serialize signed writes and propagate failures. A `sendTx` receipt is pending transaction evidence,
+not an active-order acknowledgement. Confirm the exact client ID through active/inactive orders;
+confirm cancellation by authoritative active-order removal. Never blindly resubmit an uncertain
+write. Fetch all active perpetual orders in one request, rather than only configured markets.
+Validate ownership in active, closed, and streamed order responses, and reject duplicate position markets
+instead of allowing a later row to overwrite exposure or invent hedged state.
+Stream ownership checks belong in per-row normalization so malformed updates request an account
+refresh while valid rows in the same batch remain usable, without consuming the reconnect budget.
+
+Cap candle pages at 500 and bound the end of each request to prevent the exchange from silently
+tail-anchoring an over-wide warmup window. Public data clients and historical preparation must use
+the same adapter. Discover market age by walking bounded daily pages backward, not by requesting
+one pre-listing day from the epoch. Historical sizing uses base units and one-way positions.
+Verify the pinned signer hash before native loading.
+
+Use actual order-book quotes because ticker responses lack bid/ask. Keep cross/isolated margin
+and leverage together in their per-market configuration transaction. Balance is realized USDC
+collateral and must validate the exact requested account, not CCXT's missing-field zero defaults.
+The synchronous balance CLI and asynchronous trading adapter share this validation.
+
+Cursor-paginate all perpetual trades and reject missing pages, stalled cursors, or conflicting
+identities. Validate descending timestamps within and across pages while allowing identical
+overlap and equal-timestamp fills. A full page without a continuation cursor cannot prove complete
+history unless the validated descending page has already crossed the requested start. Retain raw
+pre-fill position evidence for restart reconstruction, and split one-way
+position flips into close/open components with distinct event and source identities so cache
+deduplication retains both legs. Reductions require authoritative account-side PnL,
+except omitted zero values independently proven by the exchange's before-state. Preserve missing
+fee evidence for the canonical best-effort fee policy rather than fabricating zero fees.
+A nonzero pre-fill position requires a strictly positive entry quote; a flat position requires zero.
+
+## Unavailable Configured Live Markets
+
+Live coin overrides are resolved against the current exchange market snapshot before downstream
+mode or sizing lookups. Skip an unavailable market (including an exact identifier classified as
+`UnknownMarketIdentifier`) with a bounded notice on change, retaining the original config so the
+next market refresh can reconsider it. Do not synthesize an active market or change the shared
+resolver's historical/backtest behavior. Ambiguous identifiers, conflicting overrides, and other
+resolution failures still propagate; a failed refresh must not publish a partial override map.
+
+An inactive market is not an absent market: retain its overrides and existing protective-mode
+handling. Never drop exchange positions or open orders because their coin is unavailable in config;
+missing market metadata for such state remains an explicit failure. Approved-list filtering also
+applies when the eligible market set is empty.
+Connector-specific live-state hooks must run the shared base validation before any connector
+early return, including Hyperliquid unified-account support.
 
 ## General Guidance
 

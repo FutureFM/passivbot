@@ -2,7 +2,11 @@
 
 ## Contract
 
-1. Prefer existing local data before remote calls.
+1. Prefer existing local data before remote calls. Backtest/optimization `backtest.offline`
+   forbids every remote preparation path, including metadata and listing refreshes. Accept
+   valid stale metadata, preserve confirmed exchange-side coverage boundaries, and fail on
+   missing required local inputs. The task-local policy must never enable offline behavior
+   in live callers. Verified prepared datasets retain input provenance.
 2. For backtest preparation, use v2 OHLCV chunks first, legacy raw shards second, and targeted remote fetches last.
    For missing Binance futures 1m data in the current v2 path, remote source priority is Binance
    Vision monthly archives, Binance Vision daily archives, then CCXT. More than seven days of
@@ -34,6 +38,13 @@
    symbol/position-side availability, trailing deferral, readiness results, or trading behavior.
 
 ## Non-Obvious Details
+
+Ordinary native higher-timeframe reads reuse verified persisted rows and fetch only missing spans,
+with one source bucket of overlap on each side. Overlapping requests are coalesced; the overlap
+retains within-response evidence for KuCoin's no-tick gaps. Pages persisted before a deadline or
+cancellation remain useful to the next acquisition, including after manager restart. Forced
+`max_age_ms=0` reads still refetch the full requested range. Missing buckets remain unavailable;
+this acquisition optimization does not relax full-coverage EMA readiness or fabricate candles.
 
 1. Runtime synthetic candles are not always persisted to disk shards.
 2. Real candles replacing synthetic candles must trigger EMA cache invalidation.
@@ -99,14 +110,14 @@
    candles: they may use non-persistent zero-volume continuity rows so sparse no-trade intervals
    do not permanently block strategy inputs. The timestamps remain unresolved and retryable;
    delayed authoritative rows replace the provisional values and invalidate affected EMA caches.
-   This exception is selected explicitly by the consumer: cache-only candidate close EMAs and
-   completed-candle forager ranking metrics remain strict, use policy-separated cache entries, and
-   cannot reuse a provisional active-strategy result. Synthetic replacement tracking follows the
-   manager's live/replay clock so delayed authoritative rows invalidate provisional replay EMAs
-   deterministically.
-   The live orchestrator likewise requests forager quote-volume and log-range through the strict
-   policy even for active symbols. A coincident strategy log-range span may use provisional
-   continuity without leaking that value into the separate `forager_m1` ranking bundle.
+   This exception is selected explicitly by the consumer: completed-candle forager ranking metrics
+   for current, remote-enabled candidates may bridge bounded internal gaps, while cache-only
+   candidate reads remain strict. This is approximate ranking continuity, not evidence that the
+   missing rows were fetched. Synthetic replacement tracking follows the manager's live/replay
+   clock so delayed authoritative rows invalidate provisional replay EMAs deterministically.
+   Existing known-gap and refresh diagnostics expose repair state. Live orchestration derives
+   ranking-input consumption from canonical gap state and emits activation/recovery transitions
+   per symbol and metric without a second per-span provenance state machine or use counter.
    Open-ended tails use the separate bounded projection policy below.
    Refresh budgets count
    symbol/timeframe fetches, health scans are bounded and rotated across cycles, interleave each
@@ -144,8 +155,12 @@
    processing time is not post-boundary transport provenance. The current in-progress minute is
    rejected, an existing canonical basis is required, and WebSocket silence and reconnect gaps remain
    missing. A later changed row for the same timestamp overwrites the candle and invalidates affected
-   EMA state. WebSocket shard persistence must be read-verified before the row is exposed to cache
-   and EMA readers, including where an immutable legacy shard shadows primary storage. REST remains
+   EMA state. WebSocket canonical reads, merge-before-write reads, and persistence verification
+   propagate shard read failures, including failures masked by another legacy or primary source.
+   Missing shards are distinct from unreadable history. Strict canonical reads refresh source
+   discovery; strict merges read the actual write target under the fetch lock rather than trusting
+   a cached directory listing. WebSocket shard persistence must be read-verified before the row is
+   exposed to cache and EMA readers, including where an immutable legacy shard shadows primary storage. REST remains
    the complete fallback for startup basis, historical and internal gaps,
    prolonged silence, reconnect recovery, and a configured periodic integrity audit. Audits force a
    bounded REST overlap even while the persisted WebSocket tail is current; a successful REST
@@ -185,7 +200,9 @@
    nevertheless symbol-scoped: once every normal side is proven dynamically managed, any missing
    required strategy EMA degrades the whole flat symbol rather than fabricating a partial bundle.
    Missing forager ranking features remain side-scoped because their affected side is authoritative
-   and carried separately from strategy EMA maps. Dynamic-management eligibility is retained in
+   and carried separately from strategy EMA maps. They remain conditional diagnostics, rather than
+   symbol-wide EMA-unavailable state, until Rust reports that ranking was required for that side.
+   Dynamic-management eligibility is retained in
    memory independently of side-scoped cancellation permission when Rust's symbol-level
    nontradable result changes both sides to the configured manual stop mode. This lets the next
    identical missing-ranking cycle remain degraded without authorizing cancellation of an
@@ -210,12 +227,11 @@
    bulk backtest-data download.
 10. Native higher-timeframe EMA windows require full requested coverage on every exchange. WEEX
     additionally requires exact aligned coverage for 1m EMA windows because its recent endpoint
-    silently tail-anchors responses. Exchange-independent HSL replay-cache extension consumers
-    require exact aligned coverage or authoritative replay. HSL restart and live trailing restart
-    reconstruction may instead fetch 1m candles first, then cover only the older leading prefix
-    with 5m, 15m, and 1h candles. The finest available source wins, source counts remain visible,
-    and only coarse buckets ending at or before the first available 1m candle are eligible, so
-    later price action cannot leak backward across the precision boundary.
+    silently tail-anchors responses. HSL restart and live trailing restart reconstruction may fetch
+    1m candles first, then cover only the older leading prefix with 5m, 15m, and 1h candles. The
+    finest available source wins, source counts remain visible, and only coarse buckets ending at
+    or before the first available 1m candle are eligible, so later price action cannot leak backward
+    across the precision boundary.
 
     Trailing still requires a nonempty exact 1m suffix and its existing dense post-fill coverage
     and bounded open-tail checks. The first post-fill minute remains the exact reset boundary;
@@ -243,8 +259,10 @@
     Missing rows remain unavailable to ordinary candle consumers until an authoritative row
     arrives. Live strategy EMA reads may provisionally bridge a later-bracketed internal gap with
     non-persistent flat zero-volume rows only when the gap is no wider than
-    `live.max_active_candle_tail_gap_minutes`; cache-only forager ranking carry-forward remains
-    unavailable across an unresolved internal gap. Complete rows in the supplied EMA window remain
+    `live.max_active_candle_tail_gap_minutes`; current remote-enabled forager ranking reads use the
+    same bounded internal-gap rule, while cache-only forager ranking carry-forward remains
+    unavailable across an unresolved internal gap.
+    Complete rows in the supplied EMA window remain
     authoritative even if stale known-gap metadata still names their timestamps. Recording or
     extending a 1m gap invalidates cached 1m EMA and open-tail projection values. An overlap refresh
     which retries a due gap
@@ -299,7 +317,16 @@
     proof does not wait for the ordinary retry count to become persistent. Only when one successful
     raw payload returns both boundaries while omitting the intervening timestamps may that exact
     range be promoted to verified `no_trades` continuity. Empty, one-sided, terminal, or rejected
-    payloads do not prove the gap and start a separate seven-day contextual-proof cooldown. Ordinary
+    payloads do not prove the gap and start a separate five-minute contextual-proof cooldown. A
+    contiguous missing span may be covered by multiple adjacent retry records; verification requires
+    complete metadata coverage and every unverified fragment's contextual retry to be due. Verified
+    no-trade fragments may share the proof window, but terminal and uncovered fragments cannot.
+    Ordinary historical repair recognizes the union of deferred records without merging their
+    independent retry clocks or refetching the surrounding cached history. Coverage uses one sorted
+    metadata snapshot per check. Live present and historical scans index overlapping
+    records without merging their retry clocks, and rebuild the read index when canonical
+    metadata changes locally or through a shared-cache writer. Contextual proof is scheduled only when both real bounds and the
+    overlap fit one request page; wider gaps remain unavailable under ordinary retry policy. Ordinary
     missing-range retries retain their existing independent schedule.
 15. Urgent active-candle refresh records and reports incomplete symbol coverage but does not itself
     gate the whole planner cycle. Canonical EMA consumers determine symbol/order-class readiness;
@@ -357,3 +384,55 @@ Cache paths use `to_standard_exchange_name()` rather than raw CCXT identifiers s
 - `src/hlcv_preparation.py`
 - `src/tools/verify_hlcvs_data.py`
 - `exchange_integrations.md`
+
+## Source-resolution reads for HSL
+
+`get_candles(standardize=False)` retains normal source acquisition and caching but
+returns sparse source rows without the 1m gap-standardization or outside-range
+price seed. The 1m returned array is detached from the mutable cache. Native coarse
+cache reads remain native even with no exchange object; they must not relabel 1m
+rows as 5m/15m/1h. Existing callers retain standardization by default.
+
+The staged `live.hsl_candles.CandleSourceReader.acquire` reader requests supported
+1m/5m/15m/1h sources over the full estimator window. A real 1m close at the inclusive
+left edge belongs to the window although its source bucket opened one minute earlier.
+Rust rejects earlier closes and coarse buckets straddling the boundary, selects the
+finest available source, and applies estimator-local gap carrying. Manager-persisted
+verified no-trade observations remain usable under the existing cache contract.
+
+Each source read has a caller-supplied deadline which does not await resistant
+cancellation. Expected exchange/transport/read failures retain type-only diagnostics
+and attempt a bounded cache-only read; independent resolutions survive. The caller
+reuses one `CandleSourceReader` per manager across scopes and cycles. It retains
+unfinished reads, refuses another read of the same symbol/timeframe/source kind,
+and caps total pending reads (eight by default, configurable on construction).
+A timed-out coroutine's return value is never consumed or allowed to extend its
+read deadline. Cache fallback is a separate fresh observation: it may include
+canonical cache updates completed meanwhile, including an update from the timed-out
+fetch. Rows are copied and stamped at that actual cache capture time. There is no
+shared atomic cutoff across resolutions; Rust rejects sources unavailable at the
+chosen evaluation time, and the eventual runtime caller owns final snapshot
+revalidation. Freezing a pre-fetch cache is not required. Pending-read count is
+diagnostic; it never supplies a trading decision.
+
+Invalid producer shapes, programming errors and cancellation propagate. Acquisition
+wrappers are cancelled and awaited; underlying cancellation-resistant reads remain
+tracked within the fixed capacity until completion. Late exceptions are consumed;
+unexpected late programming failures are raised on the next acquisition instead of
+silently hidden. No source projection is written into factual caches. The caller owns
+background scheduling and coherent current-state capture; this staged reader alone
+does not activate hsl trading.
+
+HSL source batches may retain a native copy of their immutable scalar candle
+rows for repeated evaluations. Replacing a source batch replaces that native copy.
+The copy contains no projected window or trading permission: every projection
+reapplies its exact lookback bounds and current exchange/UTC observation offset,
+and every risk evaluation still consumes current account and mark facts.
+
+### Live EMA preparation pacing
+
+Live EMA preparation keeps serial symbol loading when candle fetch pacing is positive and parallel
+loading when it is zero. Position symbols remain first in the ordered list. It does not add a sleep
+after preparing each symbol, but yields to other tasks without delay. The candle manager enforces the configured process-local spacing at
+actual CCXT OHLCV requests, so cache-only preparation incurs no artificial per-symbol pause.
+See [EMA preparation timings](live_events.md#ema-preparation-timings) for structured attribution.

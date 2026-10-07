@@ -1,11 +1,18 @@
 # Running the bot live
 
+For Lighter, follow the [exchange setup guide](exchanges/lighter.md) to install the compatible
+signer and configure an existing L2 API key before starting the bot.
+
 ## Logging
 
 `passivbot live` now writes its console log stream to a timestamped file under `logs/` by default.
 It also refreshes `logs/{user}.log` as a stable alias to the current run's logfile, which is useful
 for monitor tooling that wants a fixed path per bot. This behavior is controlled from
 `config.logging`:
+
+On Windows without symlink privileges, the stable path is a small text pointer containing the
+absolute timestamped-log path. Passivbot's monitor tooling resolves that pointer automatically and
+continues following it when a later run refreshes the stable path.
 
 - `logging.persist_to_file = true` keeps on-disk live logs enabled
 - `logging.dir` chooses the target directory for both the timestamped archive and the stable alias

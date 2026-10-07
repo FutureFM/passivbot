@@ -68,8 +68,20 @@ response and does not alter scalar balance extraction or staged refresh calls.
 
 Balance publication occurs on the existing aggregate raw/snapped transition or
 on a changed full normalized composition signature, including a change in an
-omitted row. Console admission remains based solely on snapped-balance
-materiality. Visible balance lines may append a sanitized sample of at most two
+omitted row. Deferred HSL account reports publish one initial balance snapshot, then raw/snapped or
+composition transitions, using presentation-only anchors and passive cached equity (unknown
+when current inputs are absent). Publication performs no fetches or execution scheduling. Presentation anchors advance only
+after successful event enqueue or console fallback, so transient observer failures can retry.
+Balance-log equity requires complete held-position coverage and confirmed account state. It
+may reuse quotes already obtained for position logging within its 60-second diagnostic allowance,
+including completed-candle fallback; it performs no additional fetch. Trading and risk retain their
+own stricter freshness checks. `equity_estimated`, `equity_valuation_source` (market_quote,
+completed_candle, mixed, or flat), and `equity_observation_age_ms` describe the valuation. Age is
+since observation, not the underlying candle timestamp. Older or candle-derived estimates are
+labelled on the console. Missing, invalid, stale, or pending inputs leave equity unavailable with
+`equity_unavailable_reason`; partial PnL is never published as total equity.
+
+Console admission thereafter remains based solely on snapped-balance materiality. Visible balance lines may append a sanitized sample of at most two
 retained assets; composition-only changes remain structured/text durable but
 stay off the console.
 
@@ -357,7 +369,6 @@ Stable per-record reason-count values are:
 - `conversion_zero_or_duplicate`
 - `debug_mode`
 - `exact_reconciliation_match`
-- `hsl_replay_pending`
 - `account_cancel_first_barrier`
 - `limit_order_create_market_distance`
 - `low_balance`
@@ -434,28 +445,68 @@ published only after identity, size, refresh-generation, and price predicates cl
 The existing warning remains the console/text projection, so the structured event itself
 does not produce a second console line.
 
-## HSL Replay Timing
+## HSL Observations
 
-For coin-mode `hsl.replay.completed`, `full_elapsed_s` is total replay time;
-`protective_elapsed_s` and `startup_blocking_elapsed_s` measure held-pair protective readiness;
-`replay_loop_elapsed_s` covers the replay loop itself.
+HSL emits `hsl.status` with `engine=hsl` and one bounded aggregate per
+qualitative scope/action/availability/estimate or raw-RED/EMA-pending change, including stale/current observation recovery. This is passive observation, never a gate
+or retained trading permission. Numeric metrics refresh after each protective execution wave in the
+monitor snapshot even when no new status event is emitted. Sink/projection failure cannot inhibit
+risk evaluation or exchange execution.
 
-Cache events use `hsl.replay.cache` with `cache_status=hit|miss|rejected`. Cache misses and
-rejections are non-authoritative performance outcomes and fall back to exchange-derived replay.
-Cache write/load rejection reasons and coin replay failures retain bounded exception types only,
-never exception text, tracebacks, or unsafe exception class names.
-HSL historical candle-fetch failures and passive account-series or replay-matrix cache observers
-follow the same boundary. Failed per-symbol progress events retain their existing stage, status,
-reason, symbol, timeframe, and timing fields plus a bounded exception type; the corresponding
-text diagnostics retain no exception text or unsafe exception class names. Redaction does
-not change candle fallback or degradation, retries, replay continuation, cache clearing, pair-only
-cache drops, timeline/compact replay, or trading state.
-Pair progress exposes `applied_rows`/`total_applied_rows` and scan-cost fields
-`scanned_rows`/`total_scanned_rows`/`scanned_rows_per_second`/`pair_elapsed_s`.
-`is_held_pair`, `is_cooldown_pair`, and `pair_idx` expose deterministic
-held/cooldown/remaining ordering without controlling it. `stage=held_protective_ready` records
-bounded ready/pending pairs after the held batch; remaining pairs continue until the full-replay
-terminal event.
+Connector admission evaluates current risk without diagnostic projection or synchronous event sinks.
+Decision captures are separate from reporting. A protective wave reports after its order work,
+including when no exit work remains, so synchronous HSL sinks cannot age its inputs before a write.
+Diagnostic expiry uses the actual held-position mark timestamps consumed by evaluated scopes;
+quotes cached for disabled scopes cannot expire another scope's display. The bounded legacy
+aggregate preserves last RED attention, while a stale or failed GREEN observation is labelled
+stale or unavailable instead of advertising current GREEN. Per-scope rows retain the last observed
+native decision alongside explicit freshness.
+
+The hsl monitor `hsl` section has `schema_version=1`, `signal_mode`, `observation_status`,
+`captured_at_ms`, `age_ms`, current account availability, complete scope counts and up to 128 scoped
+rows. RED scopes come first, then unavailable, raw-RED/EMA-pending and estimated scopes. `omitted_scopes` discloses
+truncation. Status events carry at most three rows; console summaries carry counts. A top-level aggregate tier
+keeps RED visible to existing risk reports and startup previews without inventing an aggregate
+drawdown score for independent scopes. Rows identify
+symbol/position side where applicable, native action, GREEN/RED or diagnostic inactive status,
+raw/EMA/selected drawdown, configured threshold, RED/flat evidence times and approximation reasons.
+There is one portfolio scope in unified mode; side and coin modes retain their native topology.
+Unavailable input is never displayed as GREEN. Removed legacy tiers do not reappear in hsl
+payloads.
+
+The optional `candle_sources` diagnostic describes failures in the latest already-acquired HSL
+source batches, independently of decision freshness. It contains the complete `failure_count`,
+up to 16 deterministic `failures` rows (symbol, timeframe, fetch/cache stage and bounded exception
+type), and `omitted_failures`. Failed cache fallbacks precede fetch failures before sampling, so
+terminal source loss remains distinguishable from a fetch failure with successful cache recovery.
+Exception text and raw exchange payloads are never included. Source
+failure changes and recovery emit a status transition, including changes in omitted rows; repeated
+unchanged failures do not. The console shows one compact source cause when no current scope
+unavailability reason takes priority, including in the legacy/sink-error console fallback. This
+view neither fetches inputs nor changes risk reasons,
+readiness, retry policy or trading authority.
+
+An optional bounded `unavailable_scope` retains the first required-input cause before scope
+sampling, even when RED rows fill the event or monitor sample. Both consoles preserve that cause
+ahead of candle failures. Structured console records reserve space for counts and the primary
+cause, then include account, stale, scope and approximation context only while the complete
+record fits 240 characters; omitted console context remains in the structured observation.
+
+Smoke reports and dashboard event summaries consume these scoped status rows directly,
+including current raw-RED/EMA-pending loss and halted terminal timestamps. Complete
+`action_counts` and `raw_pending_scope_count` accompany sampled rows; omitted scope
+counts remain explicit, so samples do not imply complete per-symbol coverage. Expired
+observations are retained as historical evidence but do not advertise active cooldown,
+current proximity or pending RED. Historical event tapes may still be read in their old
+schema; the current controller does not emit the retired event lifecycle.
+
+An observation becomes visibly stale when its captured input TTL expires (including the exact
+retained position timestamp used by evaluation), account confirmation is
+pending, or its account generation changes. The last decision remains labeled as an observation;
+monitor reads do not initialize an HSL owner, perform I/O, or reevaluate risk. Diagnostic state is
+replaced after each protective wave and is not persisted as restart authority. A first projection
+failure is explicitly diagnostic-unavailable, and unavailable-scope fallback logs retain warning
+severity when event emission fails or the configured console sink reports a write failure.
 
 ## Eligibility And Market Compatibility
 
@@ -644,3 +695,56 @@ converting it to zero. Totals may be summed across compatible windows; maxima re
 - `src/live/event_producers.py`
 - `tests/test_live_event_registry_docs.py`
 - event-family tests under `tests/`
+
+### Risk input readiness
+
+`risk.input.status` reports live balance-input readiness: `deferred` blocks ordinary planning,
+`succeeded` reports recovery, and `failed` reports terminal exhaustion of the local attempt budget.
+The producer in `live/risk_input_recovery.py` emits code-owned reason/action strings and bounded
+numeric diagnostics: current raw/sizing balances, first invalid replay timestamp/balance, invalid
+row count, replay start/end, `retry_count` (failed attempts including the initial failure),
+`max_attempts`, and `retry_delay_seconds`. Non-finite numbers become null. Each counted failure
+emits a warning, except the final failure which emits an error with `action=stop_without_restart`
+and zero delay. The first and final failures also attach a bounded `traceback` frame chain and
+log its frame-only text representation. Raw payloads, exception text, and locals are excluded.
+Failed event emission falls back to standard logging. The pipeline also logs these recovery
+records directly if its configured console sink raises, since an accepted event alone does not
+prove console delivery. Healthy console delivery produces one attempt record.
+Readiness polls inside the retry deadline neither increment the count nor repeat the warning.
+Recovery is immediate after the owning operation succeeds. See `equity_hard_stop_loss.md` for
+retry, terminal-stop, and protection policy.
+
+## EMA Preparation Timings
+
+`ema.bundle.completed` includes an optional `timings` object, without changing its DEBUG,
+structured/monitor-only routing. `elapsed_ms` measures bundle wall time since the start event;
+`symbol_elapsed_ms` sums symbol preparation durations, and `symbol_count` counts attempted symbols.
+`slowest_symbols` retains at most eight rows in descending elapsed time (symbol breaks ties), with
+`symbols_omitted` reporting the remainder. `stage_totals` includes all attempted symbols, not just
+that sample. Older producers omit `timings`; consumers must not interpret its absence as zero.
+
+Rows and totals use `<stage>_ms` and `<stage>_calls` for candle loading (`candles`), disk loading
+(`disk_load`), fetch-lock acquisition (`fetch_lock_wait`, excluding held work and release), projected
+open-tail metrics (`projection`), EMA arithmetic (`ema_compute`), and remote page-fetch
+operations including internal retries (`remote_fetch`). `remote_spacing_sleep` also records `_requested_ms`, separately from
+observed elapsed sleep. Stages absent from a completed symbol were not attempted; failed attempts
+contribute elapsed time and counts if the bundle subsequently completes. A failed/cancelled bundle
+does not emit a completion event.
+
+These are inclusive, potentially nested measurements, not an additive partition. Concurrent symbol
+work can exceed bundle wall time; candle loading includes nested disk, lock, and remote work, and
+remote fetch time includes spacing and other retry/rate-limit waits inside that call. Timers do not
+profile every operation or explain unmeasured time. Timing state is scoped to the current bundle's
+symbol tasks, bounded independently of span/candle counts, and never controls scheduling, readiness,
+EMA values, or order construction.
+
+
+### Readiness and owner timing presentation
+
+Console health includes fill age/pending confirmation, active held trailing input wait count/age and a bounded scope sample, last completed-pass/write age, and HSL ordinary preparation age when pending. Unknown ages remain unknown. The last write timestamp is retained independently of pruned execution retry caches. Wait tracking retains up to 256 stable scopes; the current held wait count includes untracked scopes, which are explicitly labeled, and their ages are not invented. Trailing recovery phase totals attribute time to the last observed blocker until the next poll (`fill_confirmation`, `candle_input`, `other_input`); they include polling, candle finalization and retrieval, and are not exclusive network/CPU profiles. Configured pacing and idle loop waits are not readiness waits.
+
+`cycle.completed` identifies `execution_owner`. For `hsl`, it completes one finite protective pass, not its overlapping background ordinary preparation. `timings_ms` reports authoritative refresh, protection and ordinary submission performed in that pass. Optional `ordinary_prepare_elapsed_ms` measures preparation start through retrieval of its completed task (including polling delay); `ordinary_pending_age_ms` describes an unfinished task separately. Early-return, shutdown-shortened and I/O-failed passes do not emit successful completions; completion describes the finite owner pass, not proof that every trading input or background task is ready. Only finite nonnegative numeric `timings_ms.authoritative` values bypass sensitive-key redaction.
+
+`candle.websocket_status` retains individual CCXT receive failures and observed recovery/retirement. Console coalescing is confined to receive-stage network errors; ingestion/programming failures retain their scoped warnings. Receive recovery is recorded before downstream ingestion. Durable terminal observations survive console overflow; watcher generation ownership prevents an old retirement from clearing a replacement receive failure. Recovery covers observed failed subscriptions, not venue connectivity or REST readiness, and overflow is labeled partial. No reconnect, fallback or trading policy depends on presentation state. Candle `scope=warmup_cache` summaries describe cache windows; held close coverage and trailing input waits describe current trading impact.
+
+Console prefixes include bounded exchange/user identity; full user identity is also in durable events and health summaries. Timestamped command archives include a unique run suffix; stable per-user log aliases remain unchanged. Routine KuCoin re-fetches are DEBUG, while slow fetches and newly persisted fills retain their existing operator visibility.

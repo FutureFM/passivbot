@@ -72,6 +72,74 @@ def test_combined_market_settings_propagates_ambiguous_source_identifier():
             default_warm=0,
         )
 
+
+def test_combined_market_settings_rejects_cross_denomination_override(caplog):
+    class StubManager:
+        def __init__(self, symbol, exchange):
+            self.symbol = symbol
+            self.exchange = exchange
+
+        def has_coin(self, _coin):
+            return True
+
+        def get_symbol(self, _coin):
+            return self.symbol
+
+        def get_market_specific_settings(self, _coin):
+            return {"exchange": self.exchange, "c_mult": 1.0}
+
+    result = hp._resolve_combined_market_settings(
+        coin="SHIB",
+        best_exchange="binance",
+        market_settings_sources={"SHIB": "bybit"},
+        om_dict={
+            "binance": StubManager("1000SHIB/USDT:USDT", "binance"),
+            "bybit": StubManager("SHIB/USDT:USDT", "bybit"),
+        },
+        per_coin_warmups={},
+        default_warm=0,
+    )
+
+    assert result["exchange"] == "binance"
+    assert "market denomination differs from OHLCV source" in caplog.text
+
+
+def test_combined_market_settings_uses_metadata_proven_denomination():
+    class StubManager:
+        def __init__(self, symbol, exchange, base_name=None):
+            self.symbol = symbol
+            self.exchange = exchange
+            self.base_name = base_name
+
+        def has_coin(self, _coin):
+            return True
+
+        def get_symbol(self, _coin):
+            return self.symbol
+
+        def get_market_specific_settings(self, _coin):
+            result = {"exchange": self.exchange, "c_mult": 1.0}
+            if self.base_name is not None:
+                result["baseName"] = self.base_name
+            return result
+
+    result = hp._resolve_combined_market_settings(
+        coin="SHIB",
+        best_exchange="bitget",
+        market_settings_sources={"SHIB": "bybit"},
+        om_dict={
+            "bitget": StubManager(
+                "SHIB1000/USDT:USDT", "bitget", base_name="SHIB"
+            ),
+            "bybit": StubManager("SHIB1000/USDT:USDT", "bybit"),
+        },
+        per_coin_warmups={},
+        default_warm=0,
+    )
+
+    assert result["exchange"] == "bybit"
+    assert result["ohlcv_source"] == "bitget"
+
 # ============================================================================
 # Fixtures
 # ============================================================================
@@ -3097,7 +3165,7 @@ async def test_combined_force_refetch_uses_v2_resolver_for_large_internal_gap(
 
 
 @pytest.mark.asyncio
-async def test_combined_force_refetch_btc_prices_use_v2_resolver(monkeypatch, tmp_path):
+async def test_combined_force_refetch_btc_prices_rejects_truncated_v2_range(monkeypatch, tmp_path):
     start_ts = month_start_ts(2026, 4)
     end_ts = start_ts + 10 * 60_000
     symbol = "BTC/USDT:USDT"
@@ -3160,12 +3228,10 @@ async def test_combined_force_refetch_btc_prices_use_v2_resolver(monkeypatch, tm
         legacy_root=None,
     )
 
-    assert source_exchange == "binanceusdm"
-    np.testing.assert_array_equal(
-        btc_df["timestamp"].to_numpy(dtype=np.int64, copy=False),
-        np.array([start_ts], dtype=np.int64),
-    )
-    np.testing.assert_allclose(btc_df["close"].to_numpy(dtype=np.float64), [50000.0])
+    # The resolver truncates at the unsupported internal gap. A partial BTC
+    # range cannot serve as the benchmark for the complete requested timeline.
+    assert source_exchange is None
+    assert btc_df.empty
 
 
 @pytest.mark.asyncio

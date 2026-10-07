@@ -866,6 +866,8 @@ async def test_orchestrator_ema_bundle_uses_cache_only_for_secondary_forager_sym
             return 0.0
 
         def bp(self, pside, key, symbol):
+            if key == "entry_cooldown_weights_minutes":
+                return {"exposure_ratio": 0.0, "adverse_directionality": 0.0}
             if key == "ema_span_0":
                 return 10.0
             if key == "ema_span_1":
@@ -873,6 +875,8 @@ async def test_orchestrator_ema_bundle_uses_cache_only_for_secondary_forager_sym
             if key == "entry_volatility_ema_span_hours":
                 return 2.0
             return 0.0
+
+        is_pside_enabled = pb_mod.Passivbot.is_pside_enabled
 
         def bot_value(self, pside, key):
             if key == "forager_volume_ema_span_1m":
@@ -989,6 +993,8 @@ async def test_orchestrator_ema_bundle_fetches_flat_default_normal_planning_symb
             return 0.0
 
         def bp(self, pside, key, symbol):
+            if key == "entry_cooldown_weights_minutes":
+                return {"exposure_ratio": 0.0, "adverse_directionality": 0.0}
             if key == "ema_span_0":
                 return 10.0
             if key == "ema_span_1":
@@ -996,6 +1002,8 @@ async def test_orchestrator_ema_bundle_fetches_flat_default_normal_planning_symb
             if key == "entry_volatility_ema_span_hours":
                 return 2.0
             return 0.0
+
+        is_pside_enabled = pb_mod.Passivbot.is_pside_enabled
 
         def bot_value(self, pside, key):
             if key == "forager_volume_ema_span_1m":
@@ -1027,7 +1035,7 @@ async def test_orchestrator_ema_bundle_fetches_flat_default_normal_planning_symb
 
 
 @pytest.mark.asyncio
-async def test_orchestrator_ema_bundle_marks_missing_required_forager_ema_unavailable(
+async def test_orchestrator_ema_bundle_tracks_missing_required_forager_ema_by_side(
     monkeypatch,
 ):
     import passivbot as pb_mod
@@ -1087,11 +1095,11 @@ async def test_orchestrator_ema_bundle_marks_missing_required_forager_ema_unavai
 
         def _strategy_params_to_rust_dict(self, pside, symbol):
             return {
-                "ema_span_0": 10.0,
-                "ema_span_1": 20.0,
                 "volatility_ema_span_1m": 5.0,
                 "volatility_ema_span_1h": 0.0,
                 "entry": {
+                    "ema_span_0": 10.0,
+                    "ema_span_1": 20.0,
                     "threshold_volatility_1m_weight": 0.0,
                     "retracement_volatility_1m_weight": 0.0,
                 },
@@ -1100,6 +1108,15 @@ async def test_orchestrator_ema_bundle_marks_missing_required_forager_ema_unavai
                     "retracement_volatility_1m_weight": 0.0,
                 },
             }
+
+        def bp(self, pside, key, symbol):
+            if key == "entry_cooldown_weights_minutes":
+                return {"exposure_ratio": 0.0, "adverse_directionality": 0.0}
+            if key == "unstuck_enabled":
+                return False
+            raise KeyError(key)
+
+        is_pside_enabled = pb_mod.Passivbot.is_pside_enabled
 
         def bot_value(self, pside, key):
             if key == "forager_volume_ema_span_1m":
@@ -1143,7 +1160,11 @@ async def test_orchestrator_ema_bundle_marks_missing_required_forager_ema_unavai
 
     assert m1_close_emas[symbol]
     assert m1_volume_emas[symbol] == {}
-    assert bot._orchestrator_ema_unavailable_symbols == {symbol}
+    assert bot._orchestrator_ema_unavailable_symbols == set()
+    assert bot._forager_rank_feature_unavailable_by_side == {
+        "long": {symbol},
+        "short": set(),
+    }
 
 
 @pytest.mark.asyncio
@@ -1219,11 +1240,11 @@ async def test_orchestrator_ema_bundle_marks_flat_forager_candidate_required_m1_
 
         def _strategy_params_to_rust_dict(self, pside, symbol):
             return {
-                "ema_span_0": 10.0,
-                "ema_span_1": 20.0,
                 "volatility_ema_span_1m": 5.0,
                 "volatility_ema_span_1h": 0.0,
                 "entry": {
+                    "ema_span_0": 10.0,
+                    "ema_span_1": 20.0,
                     "threshold_volatility_1m_weight": 1.0,
                     "retracement_volatility_1m_weight": 0.0,
                     "threshold_volatility_1h_weight": 0.0,
@@ -1236,6 +1257,15 @@ async def test_orchestrator_ema_bundle_marks_flat_forager_candidate_required_m1_
                     "retracement_volatility_1h_weight": 0.0,
                 },
             }
+
+        def bp(self, pside, key, symbol):
+            if key == "entry_cooldown_weights_minutes":
+                return {"exposure_ratio": 0.0, "adverse_directionality": 0.0}
+            if key == "unstuck_enabled":
+                return False
+            raise KeyError(key)
+
+        is_pside_enabled = pb_mod.Passivbot.is_pside_enabled
 
         def bot_value(self, pside, key):
             if key in {"forager_volume_ema_span_1m", "forager_volatility_ema_span_1m"}:
@@ -1417,11 +1447,11 @@ async def test_orchestrator_ema_bundle_projection_context_summary_is_debug(
 
         def _strategy_params_to_rust_dict(self, pside, symbol):
             return {
-                "ema_span_0": 10.0,
-                "ema_span_1": 20.0,
                 "volatility_ema_span_1m": 5.0,
                 "volatility_ema_span_1h": 0.0,
                 "entry": {
+                    "ema_span_0": 10.0,
+                    "ema_span_1": 20.0,
                     "threshold_volatility_1m_weight": 1.0,
                     "retracement_volatility_1m_weight": 0.0,
                     "threshold_volatility_1h_weight": 0.0,
@@ -1434,6 +1464,15 @@ async def test_orchestrator_ema_bundle_projection_context_summary_is_debug(
                     "retracement_volatility_1h_weight": 0.0,
                 },
             }
+
+        def bp(self, pside, key, symbol):
+            if key == "entry_cooldown_weights_minutes":
+                return {"exposure_ratio": 0.0, "adverse_directionality": 0.0}
+            if key == "unstuck_enabled":
+                return False
+            raise KeyError(key)
+
+        is_pside_enabled = pb_mod.Passivbot.is_pside_enabled
 
         def bot_value(self, pside, key):
             if key == "forager_volume_ema_span_1m":
@@ -1512,7 +1551,11 @@ async def test_orchestrator_ema_bundle_projection_context_summary_is_debug(
             == 60_000
         )
     assert bot._orchestrator_ema_projection_symbols == set(symbols)
-    assert bot._orchestrator_ema_unavailable_symbols == set(symbols)
+    assert bot._orchestrator_ema_unavailable_symbols == set()
+    assert bot._forager_rank_feature_unavailable_by_side == {
+        "long": set(symbols),
+        "short": set(),
+    }
     assert not any(
         "late open-tail EMA projection context" in record.message
         and record.levelno >= logging.INFO
@@ -1595,6 +1638,8 @@ async def test_orchestrator_ema_bundle_skips_cache_only_never_fetched_secondarie
             return 0.0
 
         def bp(self, pside, key, symbol):
+            if key == "entry_cooldown_weights_minutes":
+                return {"exposure_ratio": 0.0, "adverse_directionality": 0.0}
             if key == "ema_span_0":
                 return 10.0
             if key == "ema_span_1":
@@ -1602,6 +1647,8 @@ async def test_orchestrator_ema_bundle_skips_cache_only_never_fetched_secondarie
             if key == "entry_volatility_ema_span_hours":
                 return 2.0
             return 0.0
+
+        is_pside_enabled = pb_mod.Passivbot.is_pside_enabled
 
         def bot_value(self, pside, key):
             if key == "forager_volume_ema_span_1m":
@@ -1775,6 +1822,8 @@ async def test_orchestrator_ema_bundle_carries_cached_forager_qv_log_range(
             return 0.0
 
         def bp(self, pside, key, symbol):
+            if key == "entry_cooldown_weights_minutes":
+                return {"exposure_ratio": 0.0, "adverse_directionality": 0.0}
             if key == "ema_span_0":
                 return 10.0
             if key == "ema_span_1":
@@ -1782,6 +1831,8 @@ async def test_orchestrator_ema_bundle_carries_cached_forager_qv_log_range(
             if key == "entry_volatility_ema_span_hours":
                 return 2.0
             return 0.0
+
+        is_pside_enabled = pb_mod.Passivbot.is_pside_enabled
 
         def bot_value(self, pside, key):
             if key == "forager_volume_ema_span_1m":
@@ -1887,6 +1938,8 @@ async def test_orchestrator_ema_bundle_uses_cache_only_for_secondaries_without_o
             return 0.0
 
         def bp(self, pside, key, symbol):
+            if key == "entry_cooldown_weights_minutes":
+                return {"exposure_ratio": 0.0, "adverse_directionality": 0.0}
             if key == "ema_span_0":
                 return 10.0
             if key == "ema_span_1":
@@ -1894,6 +1947,8 @@ async def test_orchestrator_ema_bundle_uses_cache_only_for_secondaries_without_o
             if key == "entry_volatility_ema_span_hours":
                 return 2.0
             return 0.0
+
+        is_pside_enabled = pb_mod.Passivbot.is_pside_enabled
 
         def bot_value(self, pside, key):
             if key == "forager_volume_ema_span_1m":
@@ -2000,6 +2055,8 @@ async def test_orchestrator_ema_bundle_disables_remote_fetch_for_cache_only_seco
             return 0.0
 
         def bp(self, pside, key, symbol):
+            if key == "entry_cooldown_weights_minutes":
+                return {"exposure_ratio": 0.0, "adverse_directionality": 0.0}
             if key == "ema_span_0":
                 return 10.0
             if key == "ema_span_1":
@@ -2007,6 +2064,8 @@ async def test_orchestrator_ema_bundle_disables_remote_fetch_for_cache_only_seco
             if key == "entry_volatility_ema_span_hours":
                 return 2.0
             return 0.0
+
+        is_pside_enabled = pb_mod.Passivbot.is_pside_enabled
 
         def bot_value(self, pside, key):
             if key == "forager_volume_ema_span_1m":
@@ -2045,7 +2104,7 @@ async def test_orchestrator_ema_bundle_disables_remote_fetch_for_cache_only_seco
 
 
 @pytest.mark.asyncio
-async def test_orchestrator_ema_bundle_marks_incomplete_cache_only_symbol_unavailable(
+async def test_orchestrator_ema_bundle_scopes_incomplete_cache_only_ranking_by_side(
     monkeypatch,
 ):
     import passivbot as pb_mod
@@ -2104,6 +2163,8 @@ async def test_orchestrator_ema_bundle_marks_incomplete_cache_only_symbol_unavai
             return 0.0
 
         def bp(self, pside, key, symbol):
+            if key == "entry_cooldown_weights_minutes":
+                return {"exposure_ratio": 0.0, "adverse_directionality": 0.0}
             if key == "ema_span_0":
                 return 10.0
             if key == "ema_span_1":
@@ -2111,6 +2172,8 @@ async def test_orchestrator_ema_bundle_marks_incomplete_cache_only_symbol_unavai
             if key == "entry_volatility_ema_span_hours":
                 return 2.0
             return 0.0
+
+        is_pside_enabled = pb_mod.Passivbot.is_pside_enabled
 
         def bot_value(self, pside, key):
             if key == "forager_volume_ema_span_1m":
@@ -2152,9 +2215,10 @@ async def test_orchestrator_ema_bundle_marks_incomplete_cache_only_symbol_unavai
     assert isinstance(h1_log_range_emas["CACHE/USDT:USDT"], dict)
     assert "CACHE/USDT:USDT" not in volumes_long
     assert isinstance(log_ranges_long["CACHE/USDT:USDT"], float)
-    assert bot._orchestrator_ema_unavailable_symbols == {
-        "CACHE/USDT:USDT",
-        "FETCH/USDT:USDT",
+    assert bot._orchestrator_ema_unavailable_symbols == {"FETCH/USDT:USDT"}
+    assert bot._forager_rank_feature_unavailable_by_side == {
+        "long": {"CACHE/USDT:USDT", "FETCH/USDT:USDT"},
+        "short": set(),
     }
 
 

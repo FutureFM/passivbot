@@ -1,6 +1,7 @@
 """Optimizer helpers for running suites of backtests per candidate."""
 
 from __future__ import annotations
+from simulation_data import simulation_data_scope
 
 import asyncio
 import logging
@@ -11,7 +12,7 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 
-from config import load_prepared_config
+from config.load import load_input_config, prepare_config
 from config.access import require_config_value, require_live_value
 from config.overrides import parse_overrides
 from config_utils import format_config
@@ -19,6 +20,7 @@ from optimization.warmup import (
     compute_optimizer_backtest_warmup_minutes,
     compute_optimizer_per_coin_warmup_minutes,
     stamp_warmup_metadata,
+    validate_optimizer_dataset_intervals,
 )
 from historical_selection import (
     prepare_suite as prepare_organillo_suite,
@@ -28,7 +30,6 @@ from shared_arrays import attach_shared_array
 from suite_runner import (
     SuiteScenario,
     extract_suite_config,
-    aggregate_metrics,
     apply_scenario,
     build_scenarios,
     collect_suite_coin_sources,
@@ -73,16 +74,18 @@ class ScenarioEvalContext:
     coin_slice_indices: Optional[Dict[str, List[int]]] = None  # per-exchange coin indices
 
 
+@simulation_data_scope
 async def prepare_suite_contexts(
     config: Dict[str, Any],
     suite_cfg: Dict[str, Any],
     *,
     shared_array_manager,
+    allow_internal_nan_gaps: bool = False,
 ) -> tuple[List[ScenarioEvalContext], Dict[str, Any]]:
     """Prepare datasets and configs for every optimizer suite scenario."""
 
     base_exchanges = require_config_value(config, "backtest.exchanges")
-    scenarios, aggregate_cfg = build_scenarios(suite_cfg, base_exchanges=base_exchanges)
+    scenarios, reducer_cfg = build_scenarios(suite_cfg, base_exchanges=base_exchanges)
     config, scenarios = prepare_organillo_suite(config, scenarios)
 
     # Determine which individual exchange datasets are needed for single-exchange scenarios
@@ -171,6 +174,7 @@ async def prepare_suite_contexts(
         needed_individual_exchanges=needed_individual,
         candle_interval_minutes=candle_interval,
         scenarios=scenarios,
+        allow_internal_nan_gaps=allow_internal_nan_gaps,
     )
     available_coins = set()
     for dataset in datasets.values():
@@ -179,10 +183,24 @@ async def prepare_suite_contexts(
         raise ValueError("No coins available after preparing master datasets.")
 
     has_combined = "combined" in datasets
-    # Available exchanges exclude "combined" pseudo-exchange
+    # A combined dataset may cover exchanges for which no individual dataset
+    # was prepared. Include its full source identity when deciding whether an
+    # explicit scenario restriction truly selects the whole exchange pool.
+    # Otherwise a bybit-only scenario can be misclassified as "all exchanges"
+    # merely because bybit is the only separately materialized dataset, and it
+    # may then consume combined candles selected from another exchange.
     dataset_available_exchanges = sorted(
-        set(ds.exchange for ds in datasets.values() if ds.exchange != "combined")
-    ) or (datasets["combined"].available_exchanges if has_combined else [])
+        {
+            exchange
+            for dataset in datasets.values()
+            for exchange in (
+                dataset.available_exchanges
+                if dataset.exchange == "combined"
+                else [dataset.exchange]
+            )
+            if exchange != "combined"
+        }
+    )
 
     contexts: List[ScenarioEvalContext] = []
 
@@ -201,7 +219,9 @@ async def prepare_suite_contexts(
             coin: deepcopy(dataset.mss.get(coin, {})) for coin in selected_coins
         }
         # Adjust per-coin indices relative to the time slice to avoid full hlcvs copies.
-        warmup_map = compute_optimizer_per_coin_warmup_minutes(scenario_config)
+        warmup_map = compute_optimizer_per_coin_warmup_minutes(
+            scenario_config, for_trade_activation=True
+        )
         for coin, meta in mss_slice.items():
             first_idx = int(meta.get("first_valid_index", 0))
             last_idx = int(meta.get("last_valid_index", total_steps_1m - 1))
@@ -271,6 +291,19 @@ async def prepare_suite_contexts(
             raise ValueError(f"Suite scenario {scenario.label} could not be prepared: {exc}") from exc
         scenario_config = format_config(scenario_config_raw, verbose=False)
         scenario_config = parse_overrides(scenario_config, verbose=False)
+        # Freeze the resolved patch in both candidate evaluation and resume evidence.
+        # Reapplying raw file references would discard preparation's resolved values.
+        scenario_overrides = deepcopy(scenario.overrides) if scenario.overrides else {}
+        coin_keys = [
+            key for key in scenario_overrides
+            if key == "coin_overrides" or key.startswith("coin_overrides.")
+        ]
+        if coin_keys:
+            for key in coin_keys:
+                scenario_overrides.pop(key)
+            scenario_overrides["coin_overrides"] = deepcopy(
+                scenario_config.get("coin_overrides", {})
+            )
         scenario_config.setdefault("backtest", {})
         scenario_config["backtest"]["coins"] = {}
 
@@ -328,6 +361,7 @@ async def prepare_suite_contexts(
                     f"Suite scenario {scenario.label} has no coins after applying exchange filters."
                 )
             scenario_config["backtest"]["coins"][dataset.exchange] = list(selected_coins)
+            validate_optimizer_dataset_intervals(scenario_config, dataset.mss, dataset.exchange)
             if dataset.hlcvs_spec is not None:
                 start_idx, end_idx, coin_indices = _compute_slice_indices(
                     dataset,
@@ -361,7 +395,7 @@ async def prepare_suite_contexts(
                         shared_btc_np={},
                         attachments={"hlcvs": {}, "btc": {}},
                         coin_indices={dataset.exchange: coin_indices},
-                        overrides=deepcopy(scenario.overrides) if scenario.overrides else {},
+                        overrides=deepcopy(scenario_overrides),
                         master_hlcvs_specs={dataset.exchange: dataset.hlcvs_spec},
                         master_btc_specs={dataset.exchange: dataset.btc_spec},
                         time_slice={dataset.exchange: (start_idx, end_idx)},
@@ -404,7 +438,7 @@ async def prepare_suite_contexts(
                         shared_btc_np={},
                         attachments={"hlcvs": {}, "btc": {}},
                         coin_indices={dataset.exchange: None},  # Already sliced
-                        overrides=deepcopy(scenario.overrides) if scenario.overrides else {},
+                        overrides=deepcopy(scenario_overrides),
                         master_hlcvs_specs=None,
                         master_btc_specs=None,
                         time_slice=None,
@@ -433,6 +467,7 @@ async def prepare_suite_contexts(
                 continue
             exchanges_for_scenario.append(exchange_key)
             scenario_config["backtest"]["coins"][exchange_key] = list(coins_for_exchange)
+            validate_optimizer_dataset_intervals(scenario_config, dataset.mss, exchange_key)
             if dataset.hlcvs_spec is not None:
                 start_idx, end_idx, coin_indices = _compute_slice_indices(
                     dataset,
@@ -523,7 +558,7 @@ async def prepare_suite_contexts(
                 shared_hlcvs_np={},
                 shared_btc_np={},
                 attachments={"hlcvs": {}, "btc": {}},
-                overrides=deepcopy(scenario.overrides) if scenario.overrides else {},
+                overrides=deepcopy(scenario_overrides),
                 master_hlcvs_specs=master_hlcvs_specs or None,
                 master_btc_specs=master_btc_specs or None,
                 time_slice=time_slice or None,
@@ -547,15 +582,20 @@ async def prepare_suite_contexts(
     if not contexts:
         raise ValueError("Suite configuration produced no runnable scenarios after filtering.")
 
-    return contexts, aggregate_cfg
+    return contexts, reducer_cfg
 
 
 def ensure_suite_config(config_path: Path, suite_path: Optional[Path]) -> Dict[str, Any]:
-    config = load_prepared_config(str(config_path), verbose=False)
-    config = parse_overrides(config, verbose=False)
+    source, base_path, raw = load_input_config(str(config_path))
     suite_override = None
     if suite_path:
-        suite_override = load_suite_override_config(suite_path)
+        suite_override = load_suite_override_config(
+            suite_path, source_config=source, base_config_path=base_path
+        )
+    config = prepare_config(
+        source, base_config_path=base_path, raw_snapshot=raw, verbose=False
+    )
+    config = parse_overrides(config, verbose=False)
     return extract_suite_config(config, suite_override)
 
 

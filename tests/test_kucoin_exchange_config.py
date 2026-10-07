@@ -5,6 +5,7 @@ import socket
 import types
 
 import pytest
+import ccxt.pro as ccxt_pro
 
 from exchanges.kucoin import (
     AsyncKucoinBrokerFutures,
@@ -39,6 +40,62 @@ class DummyCCA:
     async def set_leverage(self, **params):
         self.leverage_calls.append(params)
         return {"symbol": params["symbol"], "leverage": params["leverage"]}
+
+
+def test_kucoin_futures_expired_ws_token_invalidates_exact_negotiated_url(monkeypatch):
+    client = ProKucoinBrokerFutures({})
+    private_url = object()
+    private_futures_url = object()
+    client.options["urls"] = {
+        "private": private_url,
+        "privateFutures": private_futures_url,
+    }
+    delegated = []
+
+    def handle_error_message(_self, ws_client, message):
+        delegated.append((ws_client, message))
+        return False
+
+    monkeypatch.setattr(
+        ccxt_pro.kucoinfutures,
+        "handle_error_message",
+        handle_error_message,
+    )
+    ws_client = types.SimpleNamespace(
+        url="wss://push-private.kucoin.example/endpoint?token=redacted&connectId=privateFutures"
+    )
+    message = {"type": "error", "data": "token is expired"}
+
+    assert client.handle_error_message(ws_client, message) is False
+
+    assert client.options["urls"]["privateFutures"] is None
+    assert client.options["urls"]["private"] is private_url
+    assert delegated == [(ws_client, message)]
+
+
+def test_kucoin_ws_non_expiry_error_preserves_negotiated_url(monkeypatch):
+    client = ProKucoinBrokerFutures({})
+    private_futures_url = object()
+    client.options["urls"] = {"privateFutures": private_futures_url}
+
+    monkeypatch.setattr(
+        ccxt_pro.kucoinfutures,
+        "handle_error_message",
+        lambda _self, _ws_client, _message: False,
+    )
+    ws_client = types.SimpleNamespace(
+        url="wss://push-private.kucoin.example/endpoint?token=redacted&connectId=privateFutures"
+    )
+
+    assert (
+        client.handle_error_message(
+            ws_client,
+            {"type": "error", "data": "type is not supported"},
+        )
+        is False
+    )
+
+    assert client.options["urls"]["privateFutures"] is private_futures_url
 
 
 @pytest.mark.asyncio
@@ -123,6 +180,42 @@ def test_create_ccxt_sessions_requires_complete_futures_broker_config():
 
     with pytest.raises(ValueError, match="broker-name"):
         bot.create_ccxt_sessions()
+
+
+@pytest.mark.parametrize("timeout", [None, 65_000])
+@pytest.mark.parametrize("native_keys", [False, True])
+def test_kucoin_session_setup_preserves_common_timeout_and_broker_headers(timeout, native_keys):
+    bot = KucoinBot.__new__(KucoinBot)
+    bot.exchange = "kucoin"
+    bot.user_info = (
+        {"apiKey": "api_key", "secret": "api_secret", "password": "api_passphrase"}
+        if native_keys else
+        {"key": "api_key", "secret": "api_secret", "passphrase": "api_passphrase"}
+    )
+    if timeout is not None:
+        bot.user_info["timeout"] = timeout
+    bot.broker_code = {"futures": {
+        "partner": "passivbotFutures", "broker-key": "broker_secret",
+        "broker-name": "passivbotFutures",
+    }}
+    bot.ws_enabled = True
+    bot._build_ccxt_options = lambda: {}
+    bot._apply_endpoint_override = lambda client: None
+
+    bot.create_ccxt_sessions()
+
+    for client in (bot.cca, bot.ccp):
+        assert client.timeout == (30_000 if timeout is None else timeout)
+        assert client.enableRateLimit is True
+        assert (client.apiKey, client.secret, client.password) == (
+            "api_key", "api_secret", "api_passphrase"
+        )
+        assert client.options["defaultType"] == "swap"
+        headers = client.sign("orders", "futuresPrivate", "GET", {})["headers"]
+        assert headers["KC-API-PARTNER"] == "passivbotFutures"
+        assert headers["KC-API-PARTNER-VERIFY"] == "true"
+        assert headers["KC-API-PARTNER-SIGN"]
+        assert headers["KC-BROKER-NAME"] == "passivbotFutures"
 
 
 def test_kucoin_ticker_normalizer_labels_last_price_fallback(caplog):

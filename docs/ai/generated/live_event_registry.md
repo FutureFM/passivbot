@@ -19,6 +19,7 @@ The code-owned registries live in `src/live/event_bus.py`. Payload and emission 
 - `cache.warmup_decision`
 - `candle.coverage_checked`
 - `candle.tail_projected`
+- `candle.websocket_status`
 - `config.market_compatibility`
 - `cycle.completed`
 - `cycle.degraded`
@@ -64,11 +65,6 @@ The code-owned registries live in `src/live/event_bus.py`. Payload and emission 
 - `hsl.raw_red_pending`
 - `hsl.red_finalized_without_order`
 - `hsl.red_triggered`
-- `hsl.replay.cache`
-- `hsl.replay.completed`
-- `hsl.replay.failed`
-- `hsl.replay.progress`
-- `hsl.replay.started`
 - `hsl.status`
 - `hsl.transition`
 - `market.snapshot_diagnostic_skipped`
@@ -87,6 +83,7 @@ The code-owned registries live in `src/live/event_bus.py`. Payload and emission 
 - `remote_call.throttled`
 - `resource.memory_snapshot`
 - `risk.entry_cooldown_delta_anchored`
+- `risk.input.status`
 - `risk.mode_changed`
 - `risk.realized_loss_gate_blocked`
 - `runtime.started`
@@ -171,6 +168,7 @@ The code-owned registries live in `src/live/event_bus.py`. Payload and emission 
 - `config_stock_perp_unavailable_market`
 - `config_stock_perp_wrong_exchange`
 - `connector_call_started`
+- `current_balance_unavailable`
 - `ema_fallback_used`
 - `entry_cooldown_position_delta`
 - `exchange_acknowledged`
@@ -196,12 +194,7 @@ The code-owned registries live in `src/live/event_bus.py`. Payload and emission 
 - `hsl_price_history_symbol_fetch_started`
 - `hsl_raw_red_pending_ema_confirmation`
 - `hsl_red_finalized_without_exchange_order`
-- `hsl_replay_cache_hit`
-- `hsl_replay_cache_miss`
-- `hsl_replay_cache_rejected`
-- `hsl_replay_cache_write_failed`
-- `hsl_replay_cache_written`
-- `hsl_replay_pending`
+- `hsl_signal_unavailable`
 - `hsl_timeline_replay_completed`
 - `hsl_timeline_replay_started`
 - `length_mismatch`

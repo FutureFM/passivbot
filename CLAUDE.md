@@ -63,20 +63,26 @@ running Python tests that exercise them.
 
 ## Fork features on top of v8.1.0
 
-This branch line (fork of `enarjord/passivbot`) adds features after the `v8.1.0` release. Each has a
-contract doc — read it before changing the feature:
+This branch line (fork of `enarjord/passivbot`, synced with upstream `master` / schema v8.6.0) adds
+the features below. Each has a contract doc — read it before changing the feature. Divergence,
+time stops and historical selection are CPU-only: the GPU optimizer rejects them, and its
+`ema_anchor` screening warns that it does not model the exposure cap (exact CPU validation does).
 
 | Feature | Config | Contract / user doc | Main code |
 |---|---|---|---|
 | Historical coin selection ("Organillo"): daily 0/1 CSV(.gz) "carton" restricts the backtest/optimizer universe; unselected coins get `GracefulStop`; causal admission (future selections never affect current decisions); content-hashed for resume | `backtest.organillo_mode`, `organillo_carton_path` (`organillo_carton_hash` is derived — leave unset) | `docs/ai/features/historical_selection.md`, `docs/organillo.md` | `src/historical_selection.py`, Rust `backtest.rs` |
 | Cross-asset divergence protection: z-score of 5/15/60/240m ROC vs population; outliers shrink WEL and lengthen held-position entry cooldown | `bot.<side>.risk.divergence_*` | `docs/ai/features/divergence_protection.md` | Rust `divergence.rs`, `orchestrator.rs`; `src/divergence_inputs.py` (live ROC) |
-| Per-fill entry cooldown scaling: `base * factor^(fills-1)`, capped ≤1440 min; live reconstructs fill count from exchange fills, unproven history defers entries | `risk.entry_cooldown_factor_per_fill`, `risk.entry_cooldown_max_minutes` | `docs/ai/features/strategy_runtime.md` | Rust `effective_entry_cooldown_minutes` in `orchestrator.rs` |
+| Divergence × upstream adaptive cooldown: held positions multiply `bot.<side>.entry_cooldown` duration by the divergence delay, capped by `max_duration_minutes` (or 1440) | `entry_cooldown.*`, `risk.divergence_delay_multiplier` | `docs/ai/features/strategy_runtime.md` | Rust `divergence_scaled_cooldown` in `orchestrator.rs`; `Passivbot._entry_cooldown_horizon` |
+| `ema_anchor` per-position exposure cap (entries cropped at WEL × (1+excess allowance)) | always on | CHANGELOG | `passivbot-rust/src/strategies/ema_anchor.rs` |
 | Time-based stops: reduce-only market closes (`close_time_stop_<side>`) after N days; clock and partial-close target are reconstructed from fills + client order IDs (target encoded in the ID), no local timer | `risk.time_stop_*` | `docs/ai/features/time_stop.md`, `docs/time_stop.md` | Rust `calc_time_stop_close` in `orchestrator.rs`; `src/time_stop.py` (`reconstruct_episodes`, ID encode/decode), `src/passivbot.py`, `src/live/reconciler.py` |
 | `pnl_by_coin.png` backtest chart | — | `docs/backtesting.md` | `src/plotting.py` |
 
-Shared mechanics worth knowing: `time_stop.reconstruct_episodes` replays the fill stream once and
-feeds both the cooldown fill count and time-stop state; missing/ambiguous evidence yields `None`,
-which Rust treats as "defer entries/temporal closes for that pair" while ordinary closes continue.
-Tests: `tests/test_historical_selection.py`, `test_divergence_inputs.py`,
-`test_entry_cooldown_fill_factor.py`, `test_time_stop.py`, `test_orchestrator_json_api.py`,
-`test_pnl_by_coin_plot.py`.
+Shared mechanics worth knowing: `time_stop.reconstruct_episodes` replays the fill stream to rebuild
+the time-stop clock and target; missing/ambiguous evidence yields `None`, which Rust treats as
+"defer entries/temporal closes for that pair" while ordinary closes continue. Optional divergence
+optimizer bounds must survive both config loading (`config/hydrate.py`) and cleanup/export
+(`preserve_optional_adaptive_bounds` in `config/optimize_bounds.py`). Integer-valued bot params
+coming from the optimizer arrive as floats (see `divergence_min_timeframes` in `python.rs`).
+Tests: `tests/test_historical_selection.py`, `test_divergence_inputs.py`, `test_time_stop.py`,
+`test_orchestrator_json_api.py`, `test_pnl_by_coin_plot.py`,
+`tests/optimization/test_gpu_cpu_only_features.py`.

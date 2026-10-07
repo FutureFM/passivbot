@@ -13,6 +13,7 @@ from pathlib import Path
 
 from cli_utils import help_requested
 from passivbot_version import __version__
+from passivbot_exceptions import GPUScreeningMigrationError
 
 
 @dataclass(frozen=True)
@@ -61,6 +62,10 @@ TOOL_COMMANDS: dict[str, CommandSpec] = {
         "tools.compare_backtests",
         "compare completed backtest artifacts (requires full install)",
         requires_full=True,
+    ),
+    "compose-coin-overrides": CommandSpec(
+        "tools.compose_coin_overrides",
+        "compose single-coin configs with minimal inline overrides",
     ),
     "fetch-balance": CommandSpec("tools.fetch_balance", "fetch exchange balances"),
     "hyperliquid-balance-probe": CommandSpec(
@@ -136,9 +141,9 @@ TOOL_COMMANDS: dict[str, CommandSpec] = {
         "tools.hsl_startup_preview",
         "read-only offline HSL startup preview",
     ),
-    "hsl-replay-benchmark": CommandSpec(
-        "tools.hsl_replay_benchmark",
-        "benchmark the offline coin-HSL replay hot path",
+    "gpu-proxy-benchmark": CommandSpec(
+        "tools.gpu_proxy_benchmark",
+        "benchmark deterministic Apple MPS proxy workloads",
     ),
     "live-smoke-report": CommandSpec(
         "tools.live_smoke_report",
@@ -187,6 +192,9 @@ TOOL_COMMANDS: dict[str, CommandSpec] = {
         "migrate historical data layout (requires full install)",
         requires_full=True,
     ),
+    "migrate-hsl": CommandSpec(
+        "tools.migrate_hsl_config", "write a validated HSL config without deploying it"
+    ),
     "migrate-config-v7": CommandSpec(
         "tools.migrate_config_v7",
         "migrate a v7 trailing-grid config to v8 trailing_grid_v7",
@@ -226,6 +234,11 @@ TOOL_COMMANDS: dict[str, CommandSpec] = {
         "select a single candidate from a Pareto front (requires full install)",
         requires_full=True,
     ),
+    "pareto-plot": CommandSpec(
+        "tools.pareto_plot",
+        "explore Pareto metrics and limits in offline HTML (requires full install)",
+        requires_full=True,
+    ),
     "pareto-dash": CommandSpec(
         "tools.pareto_dash",
         "launch Pareto dashboard (requires full install)",
@@ -256,7 +269,12 @@ TOOL_COMMANDS: dict[str, CommandSpec] = {
         "transform Pareto result data (requires full install)",
         requires_full=True,
     ),
-    "streamline-json": CommandSpec("tools.streamline_json", "reformat config or result JSON"),
+    "streamline-json": CommandSpec(
+        "tools.streamline_json", "reformat config or result JSON"
+    ),
+    "clean-config": CommandSpec(
+        "tools.clean_config", "clean/export configs or format JSON with explicit output paths"
+    ),
     "trailing-inspect": CommandSpec(
         "tools.trailing_inspect",
         "explain trailing_martingale entry and close thresholds",
@@ -313,7 +331,9 @@ def _build_root_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", metavar="command")
     for name, spec in CORE_COMMANDS.items():
         subparsers.add_parser(name, help=spec.summary)
-    subparsers.add_parser("tool", help="run auxiliary tools (some require full install)")
+    subparsers.add_parser(
+        "tool", help="run auxiliary tools (some require full install)"
+    )
     return parser
 
 
@@ -385,7 +405,7 @@ def _expected_python(prefix: Path) -> Path:
 def _install_command_line(command: str, prefix: Path | None = None) -> str:
     if prefix is not None:
         return f"{_expected_python(prefix)} -m pip install -e {command}"
-    return f'python3 -m pip install -e {command}'
+    return f"python3 -m pip install -e {command}"
 
 
 def _install_guidance(prefix: Path | None = None) -> str:
@@ -427,7 +447,9 @@ def _ensure_expected_environment() -> None:
     actual_python = _resolve_path(sys.executable)
     if _path_is_within(actual_python, prefix):
         return
-    if any(current_prefix == prefix for current_prefix in _current_interpreter_prefixes()):
+    if any(
+        current_prefix == prefix for current_prefix in _current_interpreter_prefixes()
+    ):
         return
 
     script = _resolve_path(sys.argv[0]) if sys.argv and sys.argv[0] else None
@@ -436,7 +458,11 @@ def _ensure_expected_environment() -> None:
         return
 
     expected_python = _expected_python(prefix)
-    if expected_script.exists() and expected_python.exists() and not os.environ.get(ENV_REEXEC_GUARD_ENV):
+    if (
+        expected_script.exists()
+        and expected_python.exists()
+        and not os.environ.get(ENV_REEXEC_GUARD_ENV)
+    ):
         os.environ[ENV_REEXEC_GUARD_ENV] = "1"
         os.execv(
             str(expected_python),
@@ -456,7 +482,11 @@ def _full_install_message(prog_name: str, missing_module: str | None = None) -> 
 
 
 def _missing_full_install_markers() -> list[str]:
-    return [name for name in FULL_INSTALL_MARKER_MODULES if importlib.util.find_spec(name) is None]
+    return [
+        name
+        for name in FULL_INSTALL_MARKER_MODULES
+        if importlib.util.find_spec(name) is None
+    ]
 
 
 def _is_help_request(argv: list[str]) -> bool:
@@ -480,7 +510,9 @@ def _invoke_module_main(module_name: str) -> tuple[bool, int]:
     return True, 0
 
 
-def _run_module(module_name: str, prog_name: str, argv: list[str], requires_full: bool = False) -> int:
+def _run_module(
+    module_name: str, prog_name: str, argv: list[str], requires_full: bool = False
+) -> int:
     if requires_full and not _is_help_request(argv):
         if _missing_full_install_markers():
             print(_full_install_message(prog_name), file=sys.stderr)
@@ -496,10 +528,17 @@ def _run_module(module_name: str, prog_name: str, argv: list[str], requires_full
             return exit_code
         runpy.run_module(module_name, run_name="__main__")
     except ModuleNotFoundError as exc:
-        if requires_full and exc.name and exc.name.split(".", 1)[0] in FULL_INSTALL_MODULE_HINTS:
+        if (
+            requires_full
+            and exc.name
+            and exc.name.split(".", 1)[0] in FULL_INSTALL_MODULE_HINTS
+        ):
             print(_full_install_message(prog_name, exc.name), file=sys.stderr)
             return 2
         raise
+    except GPUScreeningMigrationError as exc:
+        print(f"Configuration migration required: {exc}", file=sys.stderr)
+        return 2
     except SystemExit as exc:
         if exc.code is None:
             return 0

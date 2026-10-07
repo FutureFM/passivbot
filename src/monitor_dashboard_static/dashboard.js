@@ -437,6 +437,16 @@
         ])
           .map(([key, value]) => `${key} ${value}`)
           .join(" · ");
+      case "hsl.status":
+        return compactEntries([
+          ["observation", payload.observation_status],
+          ["tier", payload.tier],
+          ["scopes", payload.scope_count],
+          ["sample", Array.isArray(payload.scopes) ? payload.scopes.map((scope) =>
+            `${scope.symbol || scope.signal_mode || "portfolio"}/${scope.pside || "all"} ${scope.action || scope.availability || "inactive"} raw ${fmtCompact(scope.raw, 4)} ema ${fmtCompact(scope.ema, 4)}`
+          ).join("; ") : null],
+          ["omitted", payload.omitted_scopes],
+        ]).map(([key, value]) => `${key} ${value}`).join(" · ");
       case "hsl.transition":
         return compactEntries([
           ["tier", payload.tier],
@@ -492,6 +502,15 @@
     return "";
   }
 
+  function hslSummary(hsl) {
+    const counts = hsl.counts || {};
+    return `HSL ${hsl.signal_mode || "-"} · ${hsl.observation_status || "-"} · GREEN ${counts.green || 0} / RED ${counts.red || 0} / inactive ${counts.inactive || 0} / unavailable ${counts.unavailable || 0} / estimated ${counts.estimated || 0}`;
+  }
+
+  function hslScopeStatus(scope) {
+    return scope.action || scope.tier || scope.availability;
+  }
+
   function renderBotOverview(botEntries) {
     els.botOverview.innerHTML = "";
     const activeCount = botEntries.filter(([, entry]) => botRelayStatus(entry) === "active").length;
@@ -538,7 +557,7 @@
           </div>
           <div class="overview-metric">
             <p class="label">HSL</p>
-            <p class="value">${escapeHtml(`L ${hsl.long?.tier || "-"} / S ${hsl.short?.tier || "-"}`)}</p>
+            <p class="value">${escapeHtml(hslSummary(hsl))}</p>
           </div>
         </div>
         <p class="overview-foot">events ${escapeHtml(String(botEntry.recentEvents.length))} · ticks ${escapeHtml(String(botEntry.recentTicks.size))} · uptime ${escapeHtml(fmtUptimeMs(health.uptime_ms))}</p>
@@ -559,8 +578,15 @@
       ["Orders", `${fmtCompact(health.orders_placed, 0)} / ${fmtCompact(health.orders_cancelled, 0)}`],
       ["Fills", fmtCompact(health.fills, 0)],
       ["Uptime", fmtUptimeMs(health.uptime_ms)],
-      ["HSL", `L ${hsl.long?.tier || "-"} / S ${hsl.short?.tier || "-"}`],
+      ["HSL", hslSummary(hsl)],
     ];
+    if (Array.isArray(hsl.scopes)) {
+      for (const scope of (hsl.scopes || []).slice(0, 3)) {
+        const label = [scope.symbol, scope.pside].filter(Boolean).join(" ") || "portfolio";
+        rows.push([`HSL ${label}`, `${hslScopeStatus(scope)} · DD ${fmtCompact(scope.score, 4)} / ${fmtCompact(scope.threshold, 4)} · ${scope.estimated ? "estimated" : scope.availability}`]);
+      }
+      if ((hsl.scope_count || 0) > 3) rows.push(["More HSL scopes", String(hsl.scope_count - 3)]);
+    }
     els.summaryCards.innerHTML = "";
     for (const [label, value] of rows) {
       const card = document.createElement("article");

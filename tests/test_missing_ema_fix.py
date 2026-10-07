@@ -65,261 +65,6 @@ async def test_get_latest_ema_close_no_candles_returns_nan(tmp_path, monkeypatch
     assert math.isnan(ema)
 
 
-# ---------------------------------------------------------------------------
-# MissingEma graceful handling in passivbot.py
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_missing_ema_raises_from_snapshot(monkeypatch):
-    """MissingEma in calc_ideal_orders_orchestrator_from_snapshot re-raises."""
-    try:
-        import passivbot as pb_mod
-    except ImportError:
-        pytest.skip("passivbot module not importable in test environment")
-
-    class FakeBot:
-        positions = {}
-        balance = 1000.0
-        PB_modes = {}
-        effective_min_cost = {}
-        _config_hedge_mode = False
-        hedge_mode = False
-        equity_hard_stop_loss = {"panic_close_order_type": "limit"}
-
-        def config_get(self, keys):
-            return None
-
-        def _bot_params_to_rust_dict(self, pside, symbol):
-            return {
-                "n_positions": 1,
-                "total_wallet_exposure_limit": 1.0,
-                "wallet_exposure_limit": 1.0,
-            }
-
-        def live_value(self, key):
-            return False
-
-        def get_raw_balance(self):
-            return float(getattr(self, "balance", 0.0) or 0.0)
-
-        def get_hysteresis_snapped_balance(self):
-            return float(getattr(self, "balance", 0.0) or 0.0)
-
-    snapshot = {
-        "symbols": [],
-        "last_prices": {},
-        "m1_close_emas": {},
-        "m1_volume_emas": {},
-        "m1_log_range_emas": {},
-        "h1_log_range_emas": {},
-        "unstuck_allowances": {"long": 0.0, "short": 0.0},
-    }
-
-    def fake_compute(json_str):
-        raise Exception("MissingEma { symbol_idx: 0 }")
-
-    monkeypatch.setattr(pb_mod.pbr, "compute_ideal_orders_json", fake_compute)
-
-    bot = FakeBot()
-    method = pb_mod.Passivbot.calc_ideal_orders_orchestrator_from_snapshot
-    with pytest.raises(Exception, match="MissingEma"):
-        await method(bot, snapshot, return_snapshot=False)
-
-
-@pytest.mark.asyncio
-async def test_missing_ema_raises_from_snapshot_with_return(monkeypatch):
-    """MissingEma with return_snapshot=True also re-raises."""
-    try:
-        import passivbot as pb_mod
-    except ImportError:
-        pytest.skip("passivbot module not importable in test environment")
-
-    class FakeBot:
-        positions = {}
-        balance = 1000.0
-        PB_modes = {}
-        effective_min_cost = {}
-        _config_hedge_mode = False
-        hedge_mode = False
-        equity_hard_stop_loss = {"panic_close_order_type": "limit"}
-
-        def config_get(self, keys):
-            return None
-
-        def _bot_params_to_rust_dict(self, pside, symbol):
-            return {
-                "n_positions": 1,
-                "total_wallet_exposure_limit": 1.0,
-                "wallet_exposure_limit": 1.0,
-            }
-
-        def live_value(self, key):
-            return False
-
-        def get_raw_balance(self):
-            return float(getattr(self, "balance", 0.0) or 0.0)
-
-        def get_hysteresis_snapped_balance(self):
-            return float(getattr(self, "balance", 0.0) or 0.0)
-
-    snapshot = {
-        "symbols": [],
-        "last_prices": {},
-        "m1_close_emas": {},
-        "m1_volume_emas": {},
-        "m1_log_range_emas": {},
-        "h1_log_range_emas": {},
-        "unstuck_allowances": {"long": 0.0, "short": 0.0},
-    }
-
-    def fake_compute(json_str):
-        raise Exception("MissingEma { symbol_idx: 0 }")
-
-    monkeypatch.setattr(pb_mod.pbr, "compute_ideal_orders_json", fake_compute)
-
-    bot = FakeBot()
-    method = pb_mod.Passivbot.calc_ideal_orders_orchestrator_from_snapshot
-    with pytest.raises(Exception, match="MissingEma"):
-        await method(bot, snapshot, return_snapshot=True)
-
-
-@pytest.mark.asyncio
-async def test_snapshot_orchestrator_rejects_unknown_rust_symbol_before_conversion(
-    monkeypatch,
-):
-    try:
-        import passivbot as pb_mod
-    except ImportError:
-        pytest.skip("passivbot module not importable in test environment")
-
-    class FakeBot:
-        positions = {}
-        balance = 1000.0
-        PB_modes = {}
-        effective_min_cost = {}
-        _config_hedge_mode = False
-        hedge_mode = False
-        equity_hard_stop_loss = {"panic_close_order_type": "limit"}
-
-        def config_get(self, keys):
-            return None
-
-        def _bot_params_to_rust_dict(self, pside, symbol):
-            return {
-                "n_positions": 1,
-                "total_wallet_exposure_limit": 1.0,
-                "wallet_exposure_limit": 1.0,
-            }
-
-        def live_value(self, key):
-            return False
-
-        def get_raw_balance(self):
-            return float(self.balance)
-
-        def get_hysteresis_snapped_balance(self):
-            return float(self.balance)
-
-    snapshot = {
-        "symbols": [],
-        "last_prices": {},
-        "m1_close_emas": {},
-        "m1_volume_emas": {},
-        "m1_log_range_emas": {},
-        "h1_log_range_emas": {},
-        "unstuck_allowances": {"long": 0.0, "short": 0.0},
-        "realized_pnl_cumsum": {"max": 0.0, "last": 0.0},
-    }
-
-    def fake_compute(_json_str):
-        return json.dumps(
-            {
-                "orders": [
-                    {
-                        "symbol_idx": 999,
-                        "qty": 1.0,
-                        "price": 100.0,
-                        "order_type": "entry_initial_normal_long",
-                        "execution_type": "limit",
-                        "execution_priority": "ordinary",
-                    }
-                ],
-                "diagnostics": {},
-            }
-        )
-
-    monkeypatch.setattr(pb_mod.pbr, "compute_ideal_orders_json", fake_compute)
-
-    method = pb_mod.Passivbot.calc_ideal_orders_orchestrator_from_snapshot
-    with pytest.raises(FatalBotException, match="unknown symbol_idx 999"):
-        await method(FakeBot(), snapshot, return_snapshot=False)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("rust_output", "error"),
-    [
-        ({"diagnostics": {}}, "missing required orders field"),
-        ({"orders": [], "diagnostics": {}}, "missing required warnings"),
-    ],
-)
-async def test_snapshot_orchestrator_rejects_malformed_output_envelope(
-    monkeypatch, rust_output, error
-):
-    try:
-        import passivbot as pb_mod
-    except ImportError:
-        pytest.skip("passivbot module not importable in test environment")
-
-    class FakeBot:
-        positions = {}
-        balance = 1000.0
-        PB_modes = {}
-        effective_min_cost = {}
-        _config_hedge_mode = False
-        hedge_mode = False
-        equity_hard_stop_loss = {"panic_close_order_type": "limit"}
-
-        def config_get(self, keys):
-            return None
-
-        def _bot_params_to_rust_dict(self, pside, symbol):
-            return {
-                "n_positions": 1,
-                "total_wallet_exposure_limit": 1.0,
-                "wallet_exposure_limit": 1.0,
-            }
-
-        def live_value(self, key):
-            return False
-
-        def get_raw_balance(self):
-            return float(self.balance)
-
-        def get_hysteresis_snapped_balance(self):
-            return float(self.balance)
-
-    snapshot = {
-        "symbols": [],
-        "last_prices": {},
-        "m1_close_emas": {},
-        "m1_volume_emas": {},
-        "m1_log_range_emas": {},
-        "h1_log_range_emas": {},
-        "unstuck_allowances": {"long": 0.0, "short": 0.0},
-        "realized_pnl_cumsum": {"max": 0.0, "last": 0.0},
-    }
-
-    monkeypatch.setattr(
-        pb_mod.pbr,
-        "compute_ideal_orders_json",
-        lambda _json_str: json.dumps(rust_output),
-    )
-
-    method = pb_mod.Passivbot.calc_ideal_orders_orchestrator_from_snapshot
-    with pytest.raises(FatalBotException, match=error):
-        await method(FakeBot(), snapshot, return_snapshot=False)
 
 
 def _rust_bot_params(**overrides):
@@ -354,6 +99,8 @@ def _rust_bot_params(**overrides):
         "risk_we_excess_allowance_pct": 0.0,
         "unstuck_close_pct": 0.0,
         "unstuck_ema_dist": 0.0,
+        "unstuck_ema_span_0": 10.0,
+        "unstuck_ema_span_1": 20.0,
         "unstuck_loss_allowance_pct": 0.0,
         "unstuck_threshold": 0.0,
     }
@@ -363,11 +110,11 @@ def _rust_bot_params(**overrides):
 
 def _rust_strategy_params(**overrides):
     params = {
-        "ema_span_0": 10.0,
-        "ema_span_1": 20.0,
         "volatility_ema_span_1h": 0.0,
         "volatility_ema_span_1m": 60.0,
         "entry": {
+            "ema_span_0": 10.0,
+            "ema_span_1": 20.0,
             "double_down_factor": 1.0,
             "initial_ema_dist": 0.0,
             "initial_qty_pct": 0.1,
@@ -773,6 +520,8 @@ class _BundleReproBot:
         return bool(self.positions.get(symbol, {}).get(pside, {}).get("size", 0.0))
 
     def bp(self, pside, key, symbol=None):
+        if key == "entry_cooldown_weights_minutes":
+            return {"exposure_ratio": 0.0, "adverse_directionality": 0.0}
         if key == "ema_span_0":
             return 10.0
         if key == "ema_span_1":
@@ -797,7 +546,14 @@ class _BundleReproBot:
             return params["volatility_ema_span_1h"]
         return params[key]
 
+    def is_pside_enabled(self, pside):
+        from passivbot import Passivbot
+
+        return Passivbot.is_pside_enabled(self, pside)
+
     def bot_value(self, pside, key):
+        if key == "forager_score_weights":
+            return {"volume": 0.0, "ema_readiness": 0.0, "volatility": 1.0, "unilateralness": 0.0}
         if key in (
             "filter_volume_ema_span",
             "filter_volume_ema_span_1m",
@@ -1209,12 +965,9 @@ async def test_disabled_opposite_side_does_not_block_flat_forager_degradation():
         {"long": {symbol: None}, "short": {symbol: None}},
     )
 
-    assert bot._orchestrator_ema_unavailable_symbols == {symbol}
-    assert bot._orchestrator_ema_unavailable_reasons == {
-        "missing_required_forager_volume+missing_required_forager_log_range": {
-            symbol
-        }
-    }
+    assert bot._orchestrator_ema_unavailable_symbols == set()
+    assert bot._orchestrator_ema_unavailable_reasons == {}
+    assert bot._orchestrator_allow_missing_strategy_inputs_symbols == {symbol}
     assert bot._orchestrator_ema_entry_cancellation_order_keys == {
         (symbol, "long", "exchange_id", "ondo-forager-entry")
     }
@@ -1321,9 +1074,7 @@ async def test_forager_ranking_ema_degradation_authorizes_resting_entry_cancel()
         bot, [symbol], mode_overrides
     )
 
-    assert bot._orchestrator_ema_unavailable_reasons == {
-        "missing_required_forager_volume": {symbol}
-    }
+    assert bot._orchestrator_ema_unavailable_reasons == {}
     assert bot._orchestrator_ema_entry_cancellation_order_keys == {
         (
             symbol,
@@ -1405,11 +1156,8 @@ async def test_forager_ranking_degradation_authorizes_only_affected_side():
         symbol: {"long", "short"}
     }
 
-    # Rust's symbol-level tradable=false result may move both sides to manual
-    # even though only the long ranking feature was missing. Preserve dynamic
-    # eligibility independently of cancellation scope: the remaining short
-    # entry must not turn the next identical gap into an account-fatal error,
-    # and it must not become cancellable.
+    # Preserve dynamic eligibility independently of cancellation scope: the
+    # remaining short entry must not become cancellable.
     bot.PB_modes = {
         "long": {symbol: "manual"},
         "short": {symbol: "manual"},
@@ -1424,9 +1172,7 @@ async def test_forager_ranking_degradation_authorizes_only_affected_side():
         [symbol],
         {"long": {symbol: None}, "short": {symbol: None}},
     )
-    assert bot._orchestrator_ema_unavailable_reasons == {
-        "missing_required_forager_volume": {symbol}
-    }
+    assert bot._orchestrator_ema_unavailable_reasons == {}
     assert bot._orchestrator_ema_entry_cancellation_order_keys == set()
     assert bot._orchestrator_dynamic_forager_eligibility_psides_by_symbol == {
         symbol: {"long", "short"}
@@ -1838,7 +1584,7 @@ def _enable_forager_required_ranking(bot):
 
 
 @pytest.mark.asyncio
-async def test_explicit_normal_missing_required_forager_features_fails_loudly():
+async def test_explicit_normal_missing_required_forager_features_are_scoped_to_rust():
     try:
         import passivbot as pb_mod
     except ImportError:
@@ -1858,13 +1604,126 @@ async def test_explicit_normal_missing_required_forager_features_fails_loudly():
     _enable_forager_required_ranking(bot)
     mode_overrides = {"long": {symbol: "normal"}, "short": {symbol: "manual"}}
 
-    with pytest.raises(
-        RuntimeError,
-        match=r"missing required forager EMA for active/normal symbol HYPE/USDT:USDT",
+    result = await pb_mod.Passivbot._load_orchestrator_ema_bundle(
+        bot, [symbol], mode_overrides
+    )
+
+    assert result[0][symbol]
+    assert result[1][symbol] == {}
+    assert bot._orchestrator_ema_unavailable_symbols == set()
+    assert bot._orchestrator_allow_missing_strategy_inputs_symbols == {symbol}
+    assert bot._orchestrator_candidate_ema_unavailable_symbols == set()
+    assert bot._forager_rank_feature_unavailable_by_side == {
+        "long": {symbol},
+        "short": {symbol},
+    }
+
+
+@pytest.mark.asyncio
+async def test_current_forager_ranking_uses_bounded_internal_gap_policy_directly():
+    try:
+        import passivbot as pb_mod
+    except ImportError:
+        pytest.skip("passivbot module not importable in test environment")
+
+    symbol = "HYPE/USDT:USDT"
+    bot = _BundleReproBot(symbol, close_mode="value")
+    _enable_forager_required_ranking(bot)
+    bot.cm.get_last_refresh_ms = lambda _symbol: 100
+
+    async def quote_volume(
+        _symbol,
+        span,
+        max_age_ms=60_000,
+        allow_remote_fetch=True,
+        allow_provisional_internal_gaps=None,
     ):
+        bot.qv_provisional_flags.append(allow_provisional_internal_gaps)
+        return 250000.0 if allow_provisional_internal_gaps else float("nan")
+
+    async def log_range(
+        _symbol,
+        span,
+        tf=None,
+        max_age_ms=60_000,
+        allow_remote_fetch=True,
+        allow_provisional_internal_gaps=None,
+    ):
+        bot.lr_provisional_flags.append((tf or "1m", allow_provisional_internal_gaps))
+        return 0.0015 if allow_provisional_internal_gaps else float("nan")
+
+    bot.cm.get_latest_ema_quote_volume = quote_volume
+    bot.cm.get_latest_ema_log_range = log_range
+
+    result = await pb_mod.Passivbot._load_orchestrator_ema_bundle(
+        bot, [symbol], bot.PB_modes
+    )
+
+    assert result[1][symbol][10.0] == pytest.approx(250000.0)
+    assert bot._orchestrator_forager_m1_log_range_emas[symbol][10.0] == pytest.approx(
+        0.0015
+    )
+    assert bot.qv_provisional_flags == [True]
+    assert [flag for _tf, flag in bot.lr_provisional_flags if flag is not None] == [
+        True
+    ]
+
+
+@pytest.mark.asyncio
+async def test_forager_gap_consumption_logs_only_activation_and_recovery(caplog):
+    try:
+        import passivbot as pb_mod
+    except ImportError:
+        pytest.skip("passivbot module not importable in test environment")
+
+    symbol = "HYPE/USDT:USDT"
+    bot = _BundleReproBot(symbol, close_mode="value")
+    _enable_forager_required_ranking(bot)
+    usage = {"value": True}
+    bot.cm.ema_spans_use_provisional_internal_gap = (
+        lambda _symbol, _spans, **_kwargs: usage["value"]
+    )
+
+    with caplog.at_level(logging.INFO):
         await pb_mod.Passivbot._load_orchestrator_ema_bundle(
-            bot, [symbol], mode_overrides
+            bot, [symbol], bot.PB_modes
         )
+        await pb_mod.Passivbot._load_orchestrator_ema_bundle(
+            bot, [symbol], bot.PB_modes
+        )
+
+    activation_logs = [
+        record.message
+        for record in caplog.records
+        if "forager ranking input using bounded internal-gap continuity"
+        in record.message
+    ]
+    assert len(activation_logs) == 2
+    assert all(
+        "source=synthetic_zero_volume_continuity" in msg
+        for msg in activation_logs
+    )
+    assert bot._orchestrator_forager_provisional_gap_inputs_active == {
+        (symbol, "quote_volume"),
+        (symbol, "log_range"),
+    }
+
+    usage["value"] = False
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        await pb_mod.Passivbot._load_orchestrator_ema_bundle(
+            bot, [symbol], bot.PB_modes
+        )
+
+    recovery_logs = [
+        record.message
+        for record in caplog.records
+        if "forager ranking input resumed authoritative candles"
+        in record.message
+    ]
+    assert len(recovery_logs) == 2
+    assert bot._orchestrator_forager_provisional_gap_inputs_active == set()
+    assert not hasattr(bot, "_orchestrator_forager_gap_fallback_counts")
 
 
 @pytest.mark.asyncio
@@ -2060,13 +1919,13 @@ async def test_active_forager_open_tail_projects_strategy_required_log_range():
     assert m1_volume_emas[symbol][span0] == pytest.approx(250000.0)
     assert volumes_long[symbol] == pytest.approx(250000.0)
     assert _log_ranges_long[symbol] == pytest.approx(0.0015)
-    assert bot.qv_provisional_flags == [False]
-    assert bot.lr_provisional_flags == [("1m", False)]
+    assert bot.qv_provisional_flags == [True]
+    assert bot.lr_provisional_flags == [("1m", True)]
     assert bot._orchestrator_ema_projection_symbols == {symbol}
 
 
 @pytest.mark.asyncio
-async def test_candidate_only_missing_required_forager_features_marks_unavailable(caplog):
+async def test_candidate_only_missing_required_forager_features_stays_conditional(caplog):
     try:
         import passivbot as pb_mod
         from live.event_bus import EventTypes
@@ -2085,8 +1944,9 @@ async def test_candidate_only_missing_required_forager_features_marks_unavailabl
         lr1m_mode="nan",
     )
     bot.PB_modes = {"long": {}, "short": {}}
-    bot.cm.get_last_refresh_ms = lambda _symbol: int(time.time() * 1000)
-    bot.cm.get_last_final_ts = lambda _symbol: int(time.time() * 1000)
+    now_ms = int(time.time() * 1000)
+    bot.cm.get_last_refresh_ms = lambda _symbol: now_ms
+    bot.cm.get_last_final_ts = lambda _symbol: now_ms
     bot._candle_staleness_ms = lambda _symbol, now_ms=None: 0
     _enable_forager_required_ranking(bot)
     events = []
@@ -2114,8 +1974,13 @@ async def test_candidate_only_missing_required_forager_features_marks_unavailabl
     assert m1_log_range_emas[symbol] == {}
     assert symbol not in volumes_long
     assert symbol not in log_ranges_long
-    assert bot._orchestrator_ema_unavailable_symbols == {symbol}
-    assert bot._orchestrator_candidate_ema_unavailable_symbols == {symbol}
+    assert bot._orchestrator_ema_unavailable_symbols == set()
+    assert bot._orchestrator_allow_missing_strategy_inputs_symbols == {symbol}
+    assert bot._orchestrator_candidate_ema_unavailable_symbols == set()
+    assert bot._forager_rank_feature_unavailable_by_side == {
+        "long": {symbol},
+        "short": {symbol},
+    }
     assert not any(
         "missing required forager EMA HYPE" in record.message
         and "action=mark_nontradable_until_fresh" in record.message
@@ -2128,14 +1993,10 @@ async def test_candidate_only_missing_required_forager_features_marks_unavailabl
         if event_type == EventTypes.EMA_UNAVAILABLE
     ]
     assert len(unavailable_events) == 1
+    assert unavailable_events[0]["level"] == "debug"
     event_data = unavailable_events[0]["data"]
     assert event_data["candidate_unavailable"]["count"] == 0
-    assert event_data["unavailable"]["sample"] == [symbol]
-    assert any(
-        group["reason"] == "missing_required_forager_volume+missing_required_forager_log_range"
-        and group["symbols"]["sample"] == [symbol]
-        for group in event_data["unavailable_reasons"]
-    )
+    assert event_data["unavailable"]["count"] == 0
 
 
 @pytest.mark.asyncio
@@ -2730,9 +2591,14 @@ async def test_batched_ema_failure_retries_each_span_before_carry_forward(monkey
         _cm,
         _symbol,
         spans_by_metric,
-        **_kwargs,
+        **kwargs,
     ):
-        batch_requests.append(dict(spans_by_metric))
+        batch_requests.append(
+            (
+                dict(spans_by_metric),
+                kwargs.get("allow_provisional_internal_gaps"),
+            )
+        )
         raise RuntimeError("widest EMA window unavailable")
 
     original_close = bot.cm.get_latest_ema_close
@@ -2766,11 +2632,18 @@ async def test_batched_ema_failure_retries_each_span_before_carry_forward(monkey
     )
     assert m1_volume_emas[symbol][10.0] == pytest.approx(250000.0)
     assert m1_log_range_emas[symbol][10.0] == pytest.approx(0.0015)
-    assert {next(iter(request)) for request in batch_requests} >= {
+    assert {next(iter(request)) for request, _allow_provisional in batch_requests} >= {
         "close",
         "qv",
         "log_range",
     }
+    request_flags = [
+        (next(iter(request)), allow_provisional)
+        for request, allow_provisional in batch_requests
+    ]
+    assert ("close", True) in request_flags
+    assert ("qv", True) in request_flags
+    assert ("log_range", True) in request_flags
 
 
 @pytest.mark.asyncio
@@ -3086,11 +2959,11 @@ async def test_trailing_martingale_weight_group_uses_later_nonzero_path():
 
     def trailing_martingale_params(_pside, _symbol=None):
         return {
-            "ema_span_0": 10.0,
-            "ema_span_1": 20.0,
             "volatility_ema_span_1m": 6.0,
             "volatility_ema_span_1h": 0.0,
             "entry": {
+                "ema_span_0": 10.0,
+                "ema_span_1": 20.0,
                 "threshold_volatility_1m_weight": 0.0,
                 "retracement_volatility_1m_weight": 1.0,
                 "threshold_volatility_1h_weight": 0.0,
@@ -3235,11 +3108,20 @@ class _PacingProbeBot:
         return False
 
     def bp(self, pside, key, symbol=None):
+        if key == "entry_cooldown_weights_minutes":
+            return {"exposure_ratio": 0.0, "adverse_directionality": 0.0}
         if key == "ema_span_0":
             return 10.0
         return 0.0
 
+    def is_pside_enabled(self, pside):
+        from passivbot import Passivbot
+
+        return Passivbot.is_pside_enabled(self, pside)
+
     def bot_value(self, pside, key):
+        if key == "forager_score_weights":
+            return {"volume": 0.0, "ema_readiness": 0.0, "volatility": 1.0, "unilateralness": 0.0}
         return 0.0
 
 
@@ -3263,28 +3145,60 @@ async def test_ema_bundle_keeps_parallel_fetches_when_exchange_has_zero_delay(mo
 
 
 @pytest.mark.asyncio
-async def test_ema_bundle_serializes_fetches_when_exchange_has_default_pacing(monkeypatch):
-    try:
-        import passivbot as pb_mod
-    except ImportError:
-        pytest.skip("passivbot module not importable in test environment")
+@pytest.mark.parametrize("exchange", ["bybit", "hyperliquid", "kucoin"])
+async def test_ema_bundle_serializes_without_post_symbol_sleeps(monkeypatch, exchange):
+    import passivbot as pb_mod
 
     original_sleep = asyncio.sleep
+    sleeps = []
 
-    async def _no_delay(_seconds):
-        return None
+    async def record_sleep(seconds):
+        sleeps.append(seconds)
 
     monkeypatch.setattr(pb_mod.random, "shuffle", lambda items: None)
-    monkeypatch.setattr(pb_mod.asyncio, "sleep", _no_delay)
-    bot = _PacingProbeBot(exchange="bybit", sleep_fn=original_sleep)
-
-    await pb_mod.Passivbot._load_orchestrator_ema_bundle(
-        bot,
-        ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT"],
-        {"long": {}, "short": {}},
-    )
+    monkeypatch.setattr(pb_mod.asyncio, "sleep", record_sleep)
+    bot = _PacingProbeBot(exchange=exchange, sleep_fn=original_sleep)
+    symbols = ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT"]
+    modes = {"long": {}, "short": {}}
+    result = await pb_mod.Passivbot._load_orchestrator_ema_bundle(bot, symbols, modes)
 
     assert bot.cm.max_concurrency == 1
+    assert sleeps == [0, 0, 0]  # Cooperative yields, no cache-only pacing floor.
+    parallel_bot = _PacingProbeBot(exchange="binance", sleep_fn=original_sleep)
+    parallel_result = await pb_mod.Passivbot._load_orchestrator_ema_bundle(
+        parallel_bot, symbols, modes
+    )
+    assert result == parallel_result
+
+
+@pytest.mark.asyncio
+async def test_paced_cached_ema_bundle_yields_to_background_tasks(monkeypatch):
+    import passivbot as pb_mod
+
+    loads = []
+    observations = []
+    done = False
+
+    async def cached_read(_seconds):
+        loads.append(True)  # Cache hits complete synchronously, despite being async.
+
+    async def background():
+        while not done:
+            observations.append(len(loads))
+            await asyncio.sleep(0)
+
+    monkeypatch.setattr(pb_mod.random, "shuffle", lambda items: None)
+    bot = _PacingProbeBot(exchange="hyperliquid", sleep_fn=cached_read)
+    task = asyncio.create_task(background())
+    try:
+        await pb_mod.Passivbot._load_orchestrator_ema_bundle(
+            bot, ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT"],
+            {"long": {}, "short": {}},
+        )
+    finally:
+        done = True
+        await task
+    assert any(0 < count < len(loads) for count in observations)
 
 
 @pytest.mark.asyncio
@@ -3304,3 +3218,389 @@ async def test_ema_bundle_parallel_shutdown_cancel_propagates(monkeypatch):
             ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT"],
             {"long": {}, "short": {}},
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("projected", [False, True])
+@pytest.mark.parametrize("held", [False, True])
+@pytest.mark.parametrize("failure", ["missing", "timeout", "inf"])
+async def test_unstuck_only_ema_absence_preserves_strategy_inputs(
+    projected, held, failure, caplog
+):
+    from passivbot import Passivbot
+
+    symbol = "BTC/USDT:USDT"
+    bot = _BundleReproBot(
+        symbol,
+        "value",
+        project_open_tail=projected,
+        projected_close_ema={10.0: 100.0, 20.0: 100.0, math.sqrt(200): 100.0},
+    )
+    bot.positions[symbol]["long"] = {"size": 1.0 if held else 0.0, "price": 100.0}
+    original_bp = bot.bp
+
+    def bp(side, key, symbol=None):
+        return {
+            "unstuck_enabled": True,
+            "unstuck_ema_gating_enabled": True,
+            "unstuck_ema_span_0": 1000.0,
+            "unstuck_ema_span_1": 2000.0,
+            "unstuck_loss_allowance_pct": 0.1,
+            "unstuck_close_pct": 0.1,
+            "unstuck_threshold": 0.2,
+            "total_wallet_exposure_limit": 1.0,
+        }.get(key, original_bp(side, key, symbol))
+
+    bot.bp = bp
+    requests = []
+    original_project = bot.cm.get_projected_open_tail_ema_metrics
+
+    async def project(sym, metrics, **kwargs):
+        spans = metrics.get("close", [])
+        requests.extend(spans)
+        if any(span >= 1000 for span in spans):
+            if failure == "timeout":
+                raise TimeoutError("unstuck window unavailable")
+            return (
+                {"close": {span: float("inf") for span in spans}}
+                if failure == "inf"
+                else {"close": {}}
+            )
+        return await original_project(sym, metrics, **kwargs)
+
+    bot.cm.get_projected_open_tail_ema_metrics = project
+
+    async def close(sym, span, **kwargs):
+        requests.append(span)
+        if span >= 1000:
+            if failure == "timeout":
+                raise TimeoutError("unstuck window unavailable")
+            return float("inf") if failure == "inf" else float("nan")
+        return 100.0
+
+    bot.cm.get_latest_ema_close = close
+    if held and failure == "inf":
+        with pytest.raises((RuntimeError, FatalBotException), match="non-finite"):
+            await Passivbot._load_orchestrator_ema_bundle(bot, [symbol], bot.PB_modes)
+        return
+    with caplog.at_level(logging.WARNING):
+        bundles = await Passivbot._load_orchestrator_ema_bundle(
+            bot, [symbol], bot.PB_modes
+        )
+    close_map = bundles[0][symbol]
+    assert close_map == {10.0: 100.0, 20.0: 100.0, math.sqrt(200): 100.0}
+    assert symbol not in bot._orchestrator_ema_unavailable_symbols
+    assert (symbol in bot._orchestrator_allow_missing_strategy_inputs_symbols) == held
+    assert any(span >= 1000 for span in requests) == held
+    if held:
+        assert "scope_unstuck_in_rust" in caplog.text
+    payload = _make_orchestrator_payload(symbol, sorted(close_map.items()), [], [])
+    sym_input = payload["symbols"][0]
+    sym_input["allow_missing_strategy_inputs"] = held
+    sym_input["long"]["position"] = {"size": 10.0 if held else 0.0, "price": 30.0 if held else 0.0}
+    sym_input["long"]["bot_params"].update(
+        unstuck_enabled=True, unstuck_ema_gating_enabled=True,
+        unstuck_ema_span_0=1000.0, unstuck_ema_span_1=2000.0,
+        unstuck_close_pct=0.1, unstuck_threshold=0.2, unstuck_loss_allowance_pct=0.1,
+    )
+    payload["global"]["unstuck_allowance_long"] = 100.0
+    import passivbot_rust as pbr
+
+    result = json.loads(pbr.compute_ideal_orders_json(json.dumps(payload)))
+    sym_input["long"]["bot_params"]["unstuck_enabled"] = False
+    expected = json.loads(pbr.compute_ideal_orders_json(json.dumps(payload)))
+    assert result["orders"] == expected["orders"]
+    assert any(
+        ("close" if held else "entry") in order["order_type"]
+        for order in result["orders"]
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pside", ["long", "short"])
+@pytest.mark.parametrize(
+    "skip_reason",
+    [
+        "manual",
+        "panic",
+        "unstuck_loss_allowance_pct",
+        "unstuck_close_pct",
+        "unstuck_threshold",
+        "total_wallet_exposure_limit",
+    ],
+)
+async def test_ineligible_unstuck_consumer_does_not_read_emas(
+    pside, skip_reason, caplog
+):
+    from passivbot import Passivbot
+
+    symbol = "BTC/USDT:USDT"
+    bot = _BundleReproBot(symbol, "value")
+    bot.positions[symbol][pside] = {
+        "size": 1.0 if pside == "long" else -1.0,
+        "price": 100.0,
+    }
+    bot.PB_modes[pside][symbol] = (
+        skip_reason if skip_reason in {"manual", "panic"} else "normal"
+    )
+    values = {
+        "unstuck_enabled": True,
+        "unstuck_ema_gating_enabled": True,
+        "unstuck_ema_span_0": 1000.0,
+        "unstuck_ema_span_1": 2000.0,
+        "unstuck_loss_allowance_pct": 0.1,
+        "unstuck_close_pct": 0.1,
+        "unstuck_threshold": 0.2,
+        "total_wallet_exposure_limit": 1.0,
+    }
+    if skip_reason in values:
+        values[skip_reason] = 0.0
+    original_bp = bot.bp
+    bot.bp = lambda side, key, symbol=None: (
+        values[key] if key in values else original_bp(side, key, symbol)
+    )
+    requests = []
+
+    async def close(sym, span, **kwargs):
+        requests.append(span)
+        if span >= 1000:
+            raise AssertionError("ineligible unstuck consumer requested candles")
+        return 100.0
+
+    bot.cm.get_latest_ema_close = close
+    with caplog.at_level(logging.WARNING):
+        await Passivbot._load_orchestrator_ema_bundle(bot, [symbol], bot.PB_modes)
+    assert requests and max(requests) < 1000
+    assert "unstuck EMA unavailable" not in caplog.text
+    assert not bot._orchestrator_allow_missing_strategy_inputs_symbols
+
+
+@pytest.mark.parametrize("pside", ["long", "short"])
+def test_zero_exposure_held_side_does_not_require_unstuck_band_in_rust(pside):
+    import passivbot_rust as pbr
+
+    payload = _make_orchestrator_payload(
+        "BTC/USDT:USDT", [(10.0, 30.0), (math.sqrt(200), 30.0), (20.0, 30.0)], [], []
+    )
+    sym = payload["symbols"][0]
+    opposite = "short" if pside == "long" else "long"
+    sym[opposite]["mode"] = "manual"
+    sym[pside]["mode"] = "tp_only"
+    sym[pside]["position"] = {"size": 10.0 if pside == "long" else -10.0, "price": 30.0}
+    sym[pside]["bot_params"].update(
+        n_positions=1,
+        total_wallet_exposure_limit=0.0,
+        unstuck_enabled=True,
+        unstuck_ema_gating_enabled=True,
+        unstuck_ema_span_0=1000.0,
+        unstuck_ema_span_1=2000.0,
+        unstuck_close_pct=0.1,
+        unstuck_threshold=0.2,
+        unstuck_loss_allowance_pct=0.1,
+    )
+    payload["global"]["global_bot_params"][pside].update(
+        n_positions=1, total_wallet_exposure_limit=1.0
+    )
+    result = json.loads(pbr.compute_ideal_orders_json(json.dumps(payload)))
+    assert any("close" in order["order_type"] for order in result["orders"]), result
+    sym[pside]["bot_params"]["total_wallet_exposure_limit"] = 1.0
+    payload["global"]["global_bot_params"][pside]["total_wallet_exposure_limit"] = 1.0
+    with pytest.raises(ValueError, match="MissingEma"):
+        pbr.compute_ideal_orders_json(json.dumps(payload))
+
+
+@pytest.mark.asyncio
+async def test_missing_live_rms_does_not_authorize_unrelated_ema_omissions(monkeypatch):
+    from passivbot import Passivbot
+    from live import unilateralness
+
+    symbol = "BTC/USDT:USDT"
+    bot = _BundleReproBot(symbol, close_mode="value")
+    bot.is_pside_enabled = lambda side: side == "long"
+    bot.is_forager_mode = lambda side=None: side in (None, "long")
+    original = bot.bot_value
+    bot.bot_value = lambda side, key: (
+        {"volume": 0.0, "volatility": 1.0, "ema_readiness": 0.0, "unilateralness": 1.0}
+        if key == "forager_score_weights" else original(side, key)
+    )
+    missing = {symbol: {"current": [60.0], "forager": []}}
+    async def load(*args):
+        return {symbol: {}}, {symbol: {60.0: 0.2}}, missing
+    monkeypatch.setattr(unilateralness, "load", load)
+    await Passivbot._load_orchestrator_ema_bundle(bot, [symbol], bot.PB_modes)
+    assert bot._orchestrator_unilateralness_unavailable == missing
+    assert bot._orchestrator_allow_missing_strategy_inputs_symbols == set()
+    # A subsequent complete bundle clears the RMS marker too.
+    async def ready(*args):
+        return {symbol: {60.0: 0.2}}, {symbol: {60.0: 0.2}}, {}
+    monkeypatch.setattr(unilateralness, "load", ready)
+    await Passivbot._load_orchestrator_ema_bundle(bot, [symbol], bot.PB_modes)
+    assert bot._orchestrator_unilateralness_unavailable == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("side", ["long", "short"])
+@pytest.mark.parametrize("ranking", [False, True])
+@pytest.mark.parametrize("adverse", [False, True])
+@pytest.mark.parametrize("approved", [False, True])
+async def test_live_bundle_loads_rms_only_for_possible_consumers(monkeypatch, side, ranking, adverse, approved):
+    import numpy as np
+    from candlestick_manager import CANDLE_DTYPE
+    from live import unilateralness
+    from passivbot import Passivbot
+
+    symbol = "BTC/USDT:USDT"
+    bot = _BundleReproBot(symbol, "value")
+    bot.is_pside_enabled = lambda pside: True
+    bot.is_approved = lambda pside, sym: approved
+    consumes_adverse = adverse and approved
+    bot.is_forager_mode = lambda pside=None: ranking and pside in (None, side)
+    bot.get_exchange_time = lambda: 21 * 60000
+    original_bot_value, original_bp = bot.bot_value, bot.bp
+
+    def bot_value(pside, key):
+        if key == "forager_score_weights":
+            return {**original_bot_value(pside, key), "unilateralness": 1.0}
+        if key == "unilateralness_ema_span_1m":
+            # The opposite side never ranks or consumes adverse RMS. Its huge
+            # configured span must not enlarge an active side's candle request.
+            return 1.0 if pside == side else 100000.0
+        return original_bot_value(pside, key)
+
+    def bp(pside, key, symbol=None):
+        values = {
+            "entry_cooldown_weights_minutes": {
+                "exposure_ratio": 0.0,
+                "adverse_directionality": 10.0 if adverse and pside == side else 0.0,
+            },
+            "risk_entry_cooldown_minutes": 0.0,
+            "entry_cooldown_min_duration_minutes": 0.0,
+            "entry_cooldown_max_duration_minutes": 60.0,
+        }
+        return values[key] if key in values else original_bp(pside, key, symbol)
+
+    bot.bot_value, bot.bp = bot_value, bp
+    calls = []
+
+    async def candles(sym, **kwargs):
+        calls.append(kwargs)
+        assert kwargs["start_ts"] == (-600000 if ranking else 0)
+        assert kwargs["end_ts"] == 20 * 60000
+        rows = np.zeros(21, dtype=CANDLE_DTYPE)
+        rows["ts"] = np.arange(21) * 60000
+        rows["c"] = 100.0
+        return rows
+
+    bot.cm.get_candles = candles
+    if not ranking and not consumes_adverse:
+        async def unexpected_load(*args, **kwargs):
+            pytest.fail("unused score-only RMS must skip the loader entirely")
+        monkeypatch.setattr(unilateralness, "load", unexpected_load)
+    await Passivbot._load_orchestrator_ema_bundle(bot, [symbol], bot.PB_modes)
+    assert len(calls) == int(ranking or consumes_adverse)
+    if ranking or consumes_adverse:
+        assert bot._orchestrator_signed_unilateralness == {symbol: {1.0: 0.0}}
+    else:
+        assert bot._orchestrator_signed_unilateralness == {}
+    assert bot._orchestrator_unilateralness_unavailable == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("side", ["long", "short"])
+@pytest.mark.parametrize("held_eligibility", ["outside", "approved", "age", "inactive", "zero_exposure"])
+async def test_live_rms_ranks_competitors_after_ineligible_position_occupies_slot(side, held_eligibility):
+    import numpy as np
+    import passivbot_rust as pbr
+    from candlestick_manager import CANDLE_DTYPE
+    from passivbot import Passivbot
+    from test_orchestrator_json_api import make_input, make_symbol, bot_params_pair, compute
+
+    names = ["OLD/USDT:USDT", "AAA/USDT:USDT", "BBB/USDT:USDT"]
+    bot = _BundleReproBot(names[0], "value")
+    bot.positions = {
+        name: {s: {"size": (1.0 if s == "long" else -1.0) if i == 0 and s == side else 0.0,
+                   "price": 100.0} for s in ("long", "short")}
+        for i, name in enumerate(names)
+    }
+    bot.PB_modes = {s: {name: None for name in names} for s in ("long", "short")}
+    bot.approved_coins_minus_ignored_coins = {s: set(names[1:]) for s in ("long", "short")}
+    if held_eligibility != "outside":
+        bot.approved_coins_minus_ignored_coins = {s: set(names) for s in ("long", "short")}
+    bot.is_approved = lambda s, name: name in bot.approved_coins_minus_ignored_coins[s] and not (held_eligibility == "age" and name == names[0])
+    bot.markets_dict = {names[0]: {"active": held_eligibility != "inactive"}}
+    original_bp = bot.bp
+    bot.bp = lambda s, key, symbol=None: (
+        (0.0 if symbol == names[0] and held_eligibility == "zero_exposure" else 1.0)
+        if key == "wallet_exposure_limit" else original_bp(s, key, symbol)
+    )
+    slots = 2 if held_eligibility == "outside" else 3
+    span = 100000.0 if held_eligibility in {"approved", "age"} else 1.0
+    bot.live_value = lambda key: ""
+    bot.get_max_n_positions = lambda s: Passivbot.get_max_n_positions(bot, s)
+    bot.is_forager_mode = lambda s=None: (
+        any(Passivbot.is_forager_mode(bot, p) for p in ("long", "short"))
+        if s is None else Passivbot.is_forager_mode(bot, s)
+    )
+    bot.is_pside_enabled = lambda s: s == side
+    bot.get_exchange_time = lambda: 21 * 60000
+    original = bot.bot_value
+    weights = {"volume": 0.0, "volatility": 0.0, "ema_readiness": 0.0, "unilateralness": 1.0}
+
+    def bot_value(s, key):
+        values = {"forager_score_weights": weights, "unilateralness_ema_span_1m": span,
+                  "total_wallet_exposure_limit": 1.0, "n_positions": slots}
+        return values[key] if key in values else original(s, key)
+
+    bot.bot_value = bot_value
+    assert not bot.is_forager_mode(side)  # Two approved coins fit two configured slots.
+    calm = names[2]
+    missing = None
+    calls = []
+
+    async def candles(name, **kwargs):
+        calls.append(name)
+        rows = np.zeros(21, dtype=CANDLE_DTYPE)
+        rows["ts"] = np.arange(21) * 60000
+        rows["c"] = 100.0 if name == calm else 100 * np.exp(np.arange(21) * 0.001)
+        return rows[:-1] if name == missing else rows
+
+    bot.cm.get_candles = candles
+    params = {"n_positions": slots, "total_wallet_exposure_limit": 1.0,
+              "forager_score_weights": weights, "unilateralness_ema_span_1m": span}
+    symbols = [make_symbol(i, bid=100.0, ask=100.0, **{f"{side}_bp": params}) for i in range(3)]
+    symbols[0]["tradable"] = held_eligibility in {"approved", "age", "zero_exposure"}
+    if held_eligibility == "zero_exposure":
+        symbols[0][side]["bot_params"]["wallet_exposure_limit"] = 0.0
+    symbols[0][side]["position"] = bot.positions[names[0]][side].copy()
+    for symbol in symbols:
+        symbol[side]["mode"] = None
+    inp = make_input(balance=1000, global_bp=bot_params_pair(**{f"{side}_overrides": params}), symbols=symbols)
+
+    async def selection():
+        await Passivbot._load_orchestrator_ema_bundle(bot, names, bot.PB_modes)
+        for name, symbol in zip(names, symbols):
+            symbol["emas"]["m1"]["signed_unilateralness"] = sorted(bot._orchestrator_signed_unilateralness.get(name, {}).items())
+            symbol["forager_m1"] = {**symbol["emas"]["m1"], "signed_unilateralness": sorted(bot._orchestrator_forager_signed_unilateralness.get(name, {}).items())}
+            symbol["unilateralness_unavailable"] = bot._orchestrator_unilateralness_unavailable.get(name, {})
+        out = compute(pbr, inp)
+        result = next(x for x in out["diagnostics"]["forager_selections"] if x["pside"] == side)
+        assert result["ranking_required"] == (held_eligibility not in {"approved", "age"})
+        assert result["slots_to_fill"] == (2 if held_eligibility in {"approved", "age"} else 1)
+        return result["selected_symbol_indices"]
+
+    if held_eligibility in {"approved", "age"}:
+        assert set(await selection()) == {1, 2}
+        assert calls == []  # Even a supported 100000-minute span does no RMS replay.
+        return
+    assert await selection() == [2]
+    assert set(calls) == set(names)
+    # Every bundle must replay fresh scores, and missing data must not reuse a
+    # prior score or silently rank only the available competitor.
+    calm = names[1]
+    assert await selection() == [1]
+    missing = names[1]
+    assert await selection() == []
+    assert bot._orchestrator_forager_signed_unilateralness[names[1]] == {}
+    assert bot._orchestrator_unilateralness_unavailable[names[1]]["forager"] == [1.0]
+    missing = None
+    assert await selection() == [1]

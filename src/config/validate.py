@@ -1,7 +1,6 @@
 import math
 
 from live.event_bus import STARTUP_TIMING_PHASES
-from risk_limits import normalize_we_excess_allowance_mode
 
 from .access import require_config_dict
 from .bot import (
@@ -9,7 +8,8 @@ from .bot import (
     validate_bot_config,
     validate_forager_config,
 )
-from .coerce import normalize_hsl_cooldown_position_policy, normalize_hsl_signal_mode
+from .coerce import normalize_hsl_signal_mode
+from .param_paths import require_existing_config_path
 from .shared_bot import get_grouped_bot_value
 from .schema import MAX_EXCHANGE_SYMBOL_UNAVAILABLE_COOLDOWN_HOURS
 from .strategy import (
@@ -19,6 +19,38 @@ from .strategy import (
 )
 
 _STARTUP_BUDGET_KEYS = frozenset({"elapsed_ms", "since_previous_ms"})
+
+
+def _validate_fixed_runtime_overrides(config: dict) -> None:
+    overrides = config.get("optimize", {}).get("fixed_runtime_overrides")
+    if not isinstance(overrides, dict):
+        raise TypeError("config.optimize.fixed_runtime_overrides must be a dict")
+    from .hsl import validate_override_paths
+
+    validate_override_paths(config, overrides)
+    resolved_sources: dict[tuple[str, ...], str] = {}
+    for dotted_path in overrides:
+        if not isinstance(dotted_path, str):
+            raise TypeError(
+                "config.optimize.fixed_runtime_overrides keys must be dotted strings"
+            )
+        resolved = require_existing_config_path(config, dotted_path)
+        prior = resolved_sources.get(resolved)
+        if prior is not None:
+            raise ValueError(
+                "config.optimize.fixed_runtime_overrides paths "
+                f"{prior!r} and {dotted_path!r} resolve to the same setting "
+                f"{'.'.join(resolved)!r}"
+            )
+        resolved_sources[resolved] = dotted_path
+        target = config
+        for part in resolved:
+            target = target[part]
+        if isinstance(target, dict):
+            raise TypeError(
+                "config.optimize.fixed_runtime_overrides must target leaf settings; "
+                f"{dotted_path!r} resolves to a mapping"
+            )
 
 
 def _validate_startup_phase_budgets(live_config: dict) -> None:
@@ -61,12 +93,36 @@ def _validate_time_stop(side: dict, path: str, *, partial=False):
             raise ValueError(f"{path}.risk.{name} is outside its finite valid range")
 
 
+def validate_limit_order_fill_buffer_pct(value) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or not 0.0 <= value < 1.0
+    ):
+        raise ValueError(
+            "backtest.limit_order_fill_buffer_pct must be finite and in [0, 1)"
+        )
+    return float(value)
+
+
 def validate_config(
     config: dict, *, raw_optimize=None, verbose: bool = True, tracker=None
 ) -> None:
     from analysis_visibility import validate_visible_metrics_config
     from optimization.config_adapter import validate_optimize_bounds_against_bot_config
 
+    from .hsl import normalize_hsl
+    from .schema import get_template_config
+
+    normalize_hsl(config, get_template_config(), verbose=verbose)
+    if not isinstance(config["backtest"]["hsl_detailed_report"], bool):
+        raise ValueError("backtest.hsl_detailed_report must be a boolean")
+    if not isinstance(config.get("backtest", {}).get("offline", False), bool):
+        raise ValueError("backtest.offline must be a boolean")
+    validate_limit_order_fill_buffer_pct(
+        config["backtest"]["limit_order_fill_buffer_pct"]
+    )
     bt = require_config_dict(config, "backtest")
     if not isinstance(bt["organillo_mode"], bool):
         raise ValueError("backtest.organillo_mode must be a boolean")
@@ -75,6 +131,11 @@ def validate_config(
     ):
         raise ValueError("backtest.organillo_carton_path is required in Organillo mode")
     require_config_dict(config, "monitor")
+    _validate_fixed_runtime_overrides(config)
+    fixed_runtime = {
+        require_existing_config_path(config, key): value
+        for key, value in config["optimize"]["fixed_runtime_overrides"].items()
+    }
     strategy_kind = normalize_strategy_kind(config["live"].get("strategy_kind"))
     optimize_bounds = (
         raw_optimize.get("bounds")
@@ -87,36 +148,55 @@ def validate_config(
     for pside in BOT_POSITION_SIDES:
         bot_side = require_config_dict(config, f"bot.{pside}")
         require_config_dict(bot_side, "strategy")
+        span = bot_side["forager"]["unilateralness_ema_span_1m"]
+        if (
+            isinstance(span, bool)
+            or not isinstance(span, (int, float))
+            or not math.isfinite(span)
+            or not 1 <= span <= 100_000
+        ):
+            raise ValueError(
+                f"bot.{pside}.forager.unilateralness_ema_span_1m must be between 1 and 100000"
+            )
+        from .entry_cooldown import validate_entry_cooldown
+
+        validate_entry_cooldown(bot_side["entry_cooldown"], path=f"bot.{pside}.entry_cooldown")
+        from .optimize_bounds import flatten_optimize_bounds
+        from optimization.bounds import Bound
+
+        flat_bounds = flatten_optimize_bounds(optimize_bounds, strategy_kind=strategy_kind)
+        for modifier in ("exposure_ratio", "adverse_directionality"):
+            key = f"{pside}_entry_cooldown_weights_minutes_{modifier}"
+            if key not in flat_bounds:
+                continue
+            # Runtime pins win over sampled genes, including an explicit null
+            # ceiling or a zero weight that disables the searched modifier.
+            weight = fixed_runtime.get(
+                ("bot", pside, "entry_cooldown", "weights_minutes", modifier),
+                Bound.from_config(key, flat_bounds[key]).high,
+            )
+            ceiling_key = f"{pside}_entry_cooldown_max_duration_minutes"
+            ceiling = fixed_runtime.get(
+                ("bot", pside, "entry_cooldown", "max_duration_minutes"),
+                Bound.from_config(ceiling_key, flat_bounds[ceiling_key]).low
+                if ceiling_key in flat_bounds
+                else bot_side["entry_cooldown"]["max_duration_minutes"],
+            )
+            if weight > 0 and (
+                isinstance(ceiling, bool)
+                or not isinstance(ceiling, (int, float))
+                or not math.isfinite(ceiling)
+            ):
+                raise ValueError(
+                    f"bot.{pside}.entry_cooldown.max_duration_minutes must be finite when searching modifier weights"
+                )
+        # RMS candle compatibility is checked after dataset selection, when
+        # approved lists and per-coin overrides determine entry eligibility.
         entry_cooldown_minutes = float(
             get_grouped_bot_value(bot_side, "risk_entry_cooldown_minutes", 0.0) or 0.0
         )
         if entry_cooldown_minutes < 0.0:
-            raise ValueError(f"bot.{pside}.risk.entry_cooldown_minutes must be >= 0.0")
-        cooldown_factor = get_grouped_bot_value(
-            bot_side, "risk_entry_cooldown_factor_per_fill", 1.0
-        )
-        if (
-            isinstance(cooldown_factor, bool)
-            or not isinstance(cooldown_factor, (int, float))
-            or not math.isfinite(cooldown_factor)
-            or cooldown_factor <= 0.0
-        ):
-            raise ValueError(
-                f"bot.{pside}.risk.entry_cooldown_factor_per_fill must be finite and > 0"
-            )
-        cooldown_max = get_grouped_bot_value(
-            bot_side, "risk_entry_cooldown_max_minutes", 1440.0
-        )
-        if (
-            isinstance(cooldown_max, bool)
-            or not isinstance(cooldown_max, (int, float))
-            or not math.isfinite(cooldown_max)
-            or cooldown_max <= 0.0
-            or cooldown_max > 1440.0
-        ):
-            raise ValueError(
-                f"bot.{pside}.risk.entry_cooldown_max_minutes must be in (0, 1440]"
-            )
+            raise ValueError(f"bot.{pside}.entry_cooldown.base_duration_minutes must be >= 0.0")
         _validate_time_stop(bot_side, f"bot.{pside}")
         divergence_enabled = get_grouped_bot_value(bot_side, "divergence_filter_enabled")
         if not isinstance(divergence_enabled, bool):
@@ -151,15 +231,13 @@ def validate_config(
             raise ValueError(
                 f"bot.{pside}.risk.divergence_min_timeframes must be 1..{max_timeframes}"
             )
-        normalize_we_excess_allowance_mode(
-            get_grouped_bot_value(bot_side, "risk_we_excess_allowance_mode"),
-            path=f"bot.{pside}.risk.we_excess_allowance_mode",
-        )
         normalize_twel_enforcer_policy(
             get_grouped_bot_value(bot_side, "risk_twel_enforcer_policy"),
             path=f"bot.{pside}.risk.total_exposure_enforcer_policy",
         )
-        active_strategy = get_active_strategy_side(bot_side, strategy_kind=strategy_kind, pside=pside)
+        active_strategy = get_active_strategy_side(
+            bot_side, strategy_kind=strategy_kind, pside=pside
+        )
         if not isinstance(active_strategy, dict) or not active_strategy:
             raise ValueError(
                 f"bot.{pside}.strategy.{strategy_kind} must be a non-empty dict for active strategy_kind"
@@ -177,27 +255,7 @@ def validate_config(
                 if not isinstance(override_side, dict):
                     continue
                 _validate_time_stop(override_side, f"coin_overrides.{coin}.bot.{pside}", partial=True)
-                if "risk_we_excess_allowance_mode" in override_side:
-                    normalize_we_excess_allowance_mode(
-                        override_side.get("risk_we_excess_allowance_mode"),
-                        path=(
-                            f"coin_overrides.{coin}.bot.{pside}."
-                            "risk_we_excess_allowance_mode"
-                        ),
-                    )
-                risk_cfg = override_side.get("risk")
-                if isinstance(risk_cfg, dict) and "we_excess_allowance_mode" in risk_cfg:
-                    normalize_we_excess_allowance_mode(
-                        risk_cfg.get("we_excess_allowance_mode"),
-                        path=(
-                            f"coin_overrides.{coin}.bot.{pside}.risk."
-                            "we_excess_allowance_mode"
-                        ),
-                    )
     normalize_hsl_signal_mode(config["live"]["hsl_signal_mode"])
-    normalize_hsl_cooldown_position_policy(
-        config["live"]["hsl_position_during_cooldown_policy"]
-    )
     _validate_startup_phase_budgets(config["live"])
     ticker_strategy = str(
         config["live"].get("market_snapshot_ticker_strategy", "auto")
@@ -264,7 +322,9 @@ def validate_config(
             "config.live.max_active_candle_tail_gap_minutes must be finite and > 0.0"
         )
     try:
-        forager_refresh_seconds = float(config["live"]["max_forager_candle_refresh_seconds"])
+        forager_refresh_seconds = float(
+            config["live"]["max_forager_candle_refresh_seconds"]
+        )
     except (TypeError, ValueError) as exc:
         raise TypeError(
             "config.live.max_forager_candle_refresh_seconds must be numeric"
@@ -307,7 +367,9 @@ def validate_config(
     try:
         fee_conversion_max_age_ms = int(fee_conversion_max_age_ms_raw)
     except (TypeError, ValueError) as exc:
-        raise TypeError("config.live.fee_conversion_max_age_ms must be an integer") from exc
+        raise TypeError(
+            "config.live.fee_conversion_max_age_ms must be an integer"
+        ) from exc
     if str(fee_conversion_max_age_ms_raw).strip() != str(fee_conversion_max_age_ms):
         raise TypeError("config.live.fee_conversion_max_age_ms must be an integer")
     if fee_conversion_max_age_ms < 0:
@@ -333,10 +395,7 @@ def validate_config(
         raise ValueError(
             "config.live.exchange_symbol_unavailable_cooldown_hours must be >= 0"
         )
-    if (
-        exchange_symbol_cooldown_hours
-        > MAX_EXCHANGE_SYMBOL_UNAVAILABLE_COOLDOWN_HOURS
-    ):
+    if exchange_symbol_cooldown_hours > MAX_EXCHANGE_SYMBOL_UNAVAILABLE_COOLDOWN_HOURS:
         raise ValueError(
             "config.live.exchange_symbol_unavailable_cooldown_hours must be <= "
             f"{MAX_EXCHANGE_SYMBOL_UNAVAILABLE_COOLDOWN_HOURS:g}"

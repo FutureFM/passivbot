@@ -6,13 +6,26 @@ mod constants;
 mod divergence;
 mod dynamic;
 mod entries;
-mod equity_hard_stop_loss;
+mod entry_cooldown;
+mod gpu;
+mod hsl;
+mod hsl_candle_free;
+mod hsl_controller;
+mod hsl_evaluator;
+mod hsl_history;
+mod hsl_json;
+mod hsl_prices;
+mod hsl_snapshot;
+mod hsl_sum;
+mod hsl_trace;
+mod limit_fills;
 mod orchestrator;
 mod python;
 mod risk;
 mod strategies;
 mod trailing;
 mod types;
+mod unilateralness;
 mod utils;
 
 use coin_selection::{select_coin_indices_py, select_forager_candidates_py};
@@ -33,13 +46,125 @@ fn runtime_build_info(py: Python<'_>) -> PyResult<PyObject> {
     Ok(info.into())
 }
 
+#[pyfunction]
+fn mps_ema_anchor_source_py() -> &'static str {
+    gpu::mps_ema_anchor_source()
+}
+
+#[pyfunction]
+fn mps_ema_anchor_long_no_hsl_source_py() -> &'static str {
+    gpu::mps_ema_anchor_long_no_hsl_source()
+}
+
+#[pyfunction]
+fn mps_ema_anchor_short_no_hsl_source_py() -> &'static str {
+    gpu::mps_ema_anchor_short_no_hsl_source()
+}
+
+#[pyfunction]
+fn mps_ema_anchor_multicoin_source_py() -> &'static str {
+    gpu::mps_ema_anchor_multicoin_source()
+}
+
+#[pyfunction]
+fn mps_ema_anchor_multicoin_long_source_py() -> &'static str {
+    gpu::mps_ema_anchor_multicoin_long_source()
+}
+
+#[pyfunction]
+fn mps_trailing_martingale_source_py() -> &'static str {
+    gpu::mps_trailing_martingale_source()
+}
+
+#[pyfunction]
+fn mps_trailing_martingale_long_hsl_source_py() -> &'static str {
+    gpu::mps_trailing_martingale_long_hsl_source()
+}
+
+#[pyfunction]
+fn mps_trailing_martingale_short_hsl_source_py() -> &'static str {
+    gpu::mps_trailing_martingale_short_hsl_source()
+}
+
+#[pyfunction]
+fn mps_trailing_martingale_long_no_hsl_source_py() -> &'static str {
+    gpu::mps_trailing_martingale_long_no_hsl_source()
+}
+
+#[pyfunction]
+fn mps_trailing_martingale_short_no_hsl_source_py() -> &'static str {
+    gpu::mps_trailing_martingale_short_no_hsl_source()
+}
+
+#[pyfunction]
+fn mps_trailing_martingale_multicoin_source_py() -> &'static str {
+    gpu::mps_trailing_martingale_multicoin_source()
+}
+
+#[pyfunction]
+fn mps_strategy_eq_recovery_distribution_source_py() -> &'static str {
+    gpu::mps_strategy_eq_recovery_distribution_source()
+}
+
 /// A Python module implemented in Rust.
 #[pymodule]
 fn passivbot_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<HlcvsBundlePy>()?;
-    m.add_class::<EquityHardStopRollingPeakPy>()?;
-    m.add_class::<EquityHardStopRuntimePy>()?;
+    m.add_function(wrap_pyfunction!(
+        unilateralness::calc_signed_unilateralness,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        entry_cooldown::entry_cooldown_durations_json,
+        m
+    )?)?;
     m.add_function(wrap_pyfunction!(runtime_build_info, m)?)?;
+    m.add_function(wrap_pyfunction!(hsl::signal_py, m)?)?;
+    m.add_function(wrap_pyfunction!(hsl_controller::hsl_controller, m)?)?;
+    m.add_function(wrap_pyfunction!(hsl_trace::hsl_trace, m)?)?;
+    m.add_function(wrap_pyfunction!(hsl_evaluator::hsl_evaluate, m)?)?;
+    m.add_function(wrap_pyfunction!(hsl_evaluator::hsl_evaluate_grids, m)?)?;
+    m.add_class::<hsl_prices::HslPriceGrid>()?;
+    m.add_class::<hsl_prices::HslCandleSource>()?;
+    m.add_function(wrap_pyfunction!(hsl_prices::hsl_native_price_grid, m)?)?;
+    m.add_function(wrap_pyfunction!(hsl_history::hsl_history, m)?)?;
+    m.add_function(wrap_pyfunction!(hsl_prices::hsl_prices, m)?)?;
+    m.add_function(wrap_pyfunction!(hsl_prices::hsl_price_grid, m)?)?;
+    m.add_function(wrap_pyfunction!(hsl_snapshot::hsl_snapshot, m)?)?;
+    m.add_function(wrap_pyfunction!(hsl_candle_free::hsl_candle_free, m)?)?;
+    m.add_function(wrap_pyfunction!(mps_ema_anchor_source_py, m)?)?;
+    m.add_function(wrap_pyfunction!(mps_ema_anchor_long_no_hsl_source_py, m)?)?;
+    m.add_function(wrap_pyfunction!(mps_ema_anchor_short_no_hsl_source_py, m)?)?;
+    m.add_function(wrap_pyfunction!(mps_ema_anchor_multicoin_source_py, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        mps_ema_anchor_multicoin_long_source_py,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(mps_trailing_martingale_source_py, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        mps_trailing_martingale_long_hsl_source_py,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        mps_trailing_martingale_short_hsl_source_py,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        mps_trailing_martingale_long_no_hsl_source_py,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        mps_trailing_martingale_short_no_hsl_source_py,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        mps_trailing_martingale_multicoin_source_py,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        mps_strategy_eq_recovery_distribution_source_py,
+        m
+    )?)?;
     m.add_function(wrap_pyfunction!(round_, m)?)?;
     m.add_function(wrap_pyfunction!(round_up, m)?)?;
     m.add_function(wrap_pyfunction!(round_dn, m)?)?;
@@ -82,16 +207,13 @@ fn passivbot_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(order_type_snake_to_id, m)?)?;
     m.add_function(wrap_pyfunction!(get_order_id_type_from_string_alias, m)?)?;
     m.add_function(wrap_pyfunction!(compute_ideal_orders_json, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_protective_closes_json, m)?)?;
     m.add_function(wrap_pyfunction!(get_strategy_spec, m)?)?;
     m.add_function(wrap_pyfunction!(get_strategy_kinds, m)?)?;
     m.add_function(wrap_pyfunction!(gate_entries_by_twel_py, m)?)?;
     m.add_function(wrap_pyfunction!(calc_unstucking_close_py, m)?)?;
     m.add_function(wrap_pyfunction!(trailing_bundle_default_py, m)?)?;
-    m.add_function(wrap_pyfunction!(hsl_no_restart_triggered, m)?)?;
-    m.add_function(wrap_pyfunction!(hsl_coin_drawdown_signal, m)?)?;
-    m.add_function(wrap_pyfunction!(hsl_red_episode_finalization, m)?)?;
     m.add_function(wrap_pyfunction!(update_trailing_bundle_py, m)?)?;
-    m.add_function(wrap_pyfunction!(equity_hard_stop_step_py, m)?)?;
     m.add_function(wrap_pyfunction!(select_coin_indices_py, m)?)?;
     m.add_function(wrap_pyfunction!(select_forager_candidates_py, m)?)?;
     m.add_function(wrap_pyfunction!(calc_ema_anchor_quote_series_py, m)?)?;

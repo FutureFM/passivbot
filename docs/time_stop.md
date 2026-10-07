@@ -53,8 +53,9 @@ For grid strategies, the completed reduction's execution price becomes the entry
 reference until the next entry fill. This does not change the real average entry
 price or PnL. EMA-anchor quotes retain their existing geometry.
 
-The existing entry cooldown still applies; this feature adds no separate reentry
-cooldown after flattening. Stop duration has no 24-hour strategy cap.
+The adaptive entry cooldown (`bot.<side>.entry_cooldown`) still applies; this feature adds
+no separate reentry cooldown after flattening. Stop duration has no 24-hour strategy cap.
+Time stops are CPU-only; GPU optimization rejects configs or bounds that enable them.
 
 Optimizer bounds use the same nested paths under `optimize.bounds.<side>.risk`.
 Default stop bounds are fixed at disabled settings. Set explicit bounds when tuning

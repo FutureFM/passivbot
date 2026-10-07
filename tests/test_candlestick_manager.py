@@ -53,6 +53,99 @@ def _resolution_candles(*minutes, close_offset=0.0):
 
 
 @pytest.mark.asyncio
+async def test_native_history_deadlines_resume_persisted_prefix_after_restart(tmp_path):
+    period = 5 * ONE_MIN_MS
+    start = 1_800_000_000_000
+    end = start + 5 * period
+    cache_dir = str(tmp_path / "caches")
+    calls = []
+
+    class Exchange:
+        id = "demo"
+
+    def manager():
+        cm = CandlestickManager(exchange=Exchange(), cache_dir=cache_dir)
+        cm._now_ms_callback = lambda: end + period
+
+        async def budgeted_fetch(symbol, since, until, *, on_batch=None, **kwargs):
+            calls.append((since, until))
+            timestamps = list(range(since, until, period))
+            batch = np.array(
+                [(ts, 100.0, 101.0, 99.0, 100.0, 1.0) for ts in timestamps[:2]],
+                dtype=CANDLE_DTYPE,
+            )
+            on_batch(batch)
+            if len(timestamps) > 2:
+                raise TimeoutError("synthetic acquisition deadline")
+            return batch
+
+        cm._fetch_ohlcv_paginated = budgeted_fetch
+        return cm
+
+    # A fresh manager each time proves progress is durable rather than RAM-only.
+    for attempt in range(5):
+        cm = manager()
+        try:
+            result = await cm.get_candles(
+                "TEST", start_ts=start, end_ts=end, timeframe="5m", standardize=False
+            )
+            break
+        except TimeoutError:
+            assert attempt < 4, "repeated reads must progress beyond the old prefix"
+    assert list(result["ts"]) == list(range(start, end + period, period))
+    assert [since for since, _ in calls] == [start + i * period for i in range(5)]
+
+
+@pytest.mark.asyncio
+async def test_native_missing_spans_keep_sparse_evidence_and_later_failure(tmp_path):
+    period = 5 * ONE_MIN_MS
+    start = 1_800_000_000_000
+    end = start + 11 * period
+
+    class Exchange:
+        id = "kucoinfutures"
+
+    cm = CandlestickManager(exchange=Exchange(), cache_dir=str(tmp_path / "caches"))
+    cm._now_ms_callback = lambda: end + period
+    cached = np.array(
+        [
+            (start + i * period, 100.0, 101.0, 99.0, 100.0, 1.0)
+            for i in [0, 1, 2, 3, 5, 6, 7, 8, 9]
+        ],
+        dtype=CANDLE_DTYPE,
+    )
+    cm._persist_batch("TEST", cached, timeframe="5m")
+    calls = []
+
+    async def fetch(symbol, since, limit, *, end_exclusive_ms=None, **kwargs):
+        calls.append((since, end_exclusive_ms))
+        if end_exclusive_ms == end + period:
+            raise TimeoutError("synthetic tail failure")
+        return [[start + i * period, 100.0, 101.0, 99.0, 100.0, 1.0] for i in [3, 5]]
+
+    cm._ccxt_fetch_ohlcv_once = fetch
+    with pytest.raises(TimeoutError):
+        await cm.get_candles(
+            "TEST", start_ts=start, end_ts=end, timeframe="5m", standardize=False
+        )
+    assert calls == [
+        (start + 2 * period, start + 6 * period),
+        (start + 8 * period, end + period),
+    ]
+    partial = await cm.get_candles(
+        "TEST",
+        start_ts=start,
+        end_ts=end,
+        timeframe="5m",
+        standardize=False,
+        allow_remote_fetch=False,
+    )
+    assert list(partial["ts"]) == list(range(start, start + 10 * period, period))
+    assert partial["bv"][4] == 0.0  # Proven by neighbours in the same response.
+    assert not cm._candle_range_has_full_coverage(partial, start, end, period)
+
+
+@pytest.mark.asyncio
 async def test_resolution_ladder_stops_when_exact_1m_reaches_start():
     calls = []
 
@@ -1729,10 +1822,16 @@ def test_persist_batch_observer_receives_saved_batch(tmp_path):
     assert np.array_equal(batch, arr)
 
 
-def test_disk_load_observer_receives_summary_and_is_best_effort(tmp_path):
+@pytest.mark.parametrize(
+    "minute_offset, expected_days", [(720, 1), (1439, 2)], ids=["same-day", "utc-midnight"]
+)
+def test_disk_load_observer_receives_summary_and_is_best_effort(
+    tmp_path, minute_offset, expected_days
+):
     cm = CandlestickManager(exchange=None, exchange_name="ex", cache_dir=str(tmp_path / "caches"))
     symbol = "LOAD/USDT"
-    ts0 = _floor_minute(int(time.time() * 1000)) - 5 * ONE_MIN_MS
+    # Fixed UTC day: exercise both one shard and a midnight crossing without wall-clock flakiness.
+    ts0 = 1704067200000 + minute_offset * ONE_MIN_MS
     ts1 = ts0 + ONE_MIN_MS
     arr = np.array(
         [
@@ -1761,8 +1860,8 @@ def test_disk_load_observer_receives_summary_and_is_best_effort(tmp_path):
     assert payload["loaded_rows"] == 2
     assert payload["loaded_start_ts"] == ts0
     assert payload["loaded_end_ts"] == ts1
-    assert payload["days"] == 1
-    assert payload["source_days"] == {"primary": 1, "legacy": 0, "merged": 0}
+    assert payload["days"] == expected_days
+    assert payload["source_days"] == {"primary": expected_days, "legacy": 0, "merged": 0}
     assert payload["elapsed_ms"] >= 0
 
     def failing_observer(_payload):
@@ -4295,6 +4394,83 @@ async def test_live_ema_provisionally_fills_bounded_unknown_gap_and_recomputes(
     )
     assert authoritative_ema == pytest.approx(expected_authoritative)
     assert authoritative_ema != pytest.approx(provisional)
+
+
+@pytest.mark.asyncio
+async def test_forager_metrics_bridge_bounded_internal_gap_without_persistence(
+    monkeypatch, tmp_path
+):
+    now = 11 * ONE_MIN_MS
+    monkeypatch.setattr("time.time", lambda: now / 1000.0)
+    cm = CandlestickManager(
+        exchange=None,
+        exchange_name="kucoinfutures",
+        cache_dir=str(tmp_path / "caches"),
+        provisional_internal_gap_tolerance_minutes=10,
+    )
+    cm._now_ms_callback = lambda: now
+    symbol = "SPARSE/USDT:USDT"
+    start = 8 * ONE_MIN_MS
+    missing = 9 * ONE_MIN_MS
+    end = 10 * ONE_MIN_MS
+    cm._cache[symbol] = np.array(
+        [
+            (start, 100.0, 101.0, 99.0, 100.0, 1.0),
+            (end, 120.0, 121.0, 119.0, 120.0, 1.0),
+        ],
+        dtype=CANDLE_DTYPE,
+    )
+    cm._add_known_gap(
+        symbol,
+        missing,
+        missing,
+        reason=GAP_REASON_FETCH_FAILED,
+    )
+    spans = {"qv": [3.0], "log_range": [3.0]}
+
+    strict = await cm.get_latest_ema_metric_spans(
+        symbol,
+        spans,
+        allow_remote_fetch=False,
+        allow_provisional_internal_gaps=False,
+    )
+    assert math.isnan(strict["qv"][3.0])
+    assert math.isnan(strict["log_range"][3.0])
+
+    refreshed = await cm.get_latest_ema_metric_spans(
+        symbol,
+        spans,
+        allow_remote_fetch=False,
+        allow_provisional_internal_gaps=True,
+    )
+    expected_qv = cm._ema(np.asarray([100.0, 0.0, 120.0]), 3.0)
+    expected_log_range = cm._ema(
+        np.log(np.asarray([101.0 / 99.0, 1.0, 121.0 / 119.0])),
+        3.0,
+    )
+    assert refreshed["qv"][3.0] == pytest.approx(expected_qv)
+    assert refreshed["log_range"][3.0] == pytest.approx(expected_log_range)
+    assert cm.ema_spans_use_provisional_internal_gap(
+        symbol, [3.0], timeframe="1m"
+    )
+    assert np.array_equal(
+        cm._cache[symbol]["ts"],
+        np.asarray([start, end], dtype=np.int64),
+    )
+
+    cm._persist_batch(
+        symbol,
+        np.array(
+            [(missing, 110.0, 110.0, 110.0, 110.0, 2.0)],
+            dtype=CANDLE_DTYPE,
+        ),
+        timeframe="1m",
+        merge_cache=True,
+        last_refresh_ms=now,
+    )
+    assert not cm.ema_spans_use_provisional_internal_gap(
+        symbol, [3.0], timeframe="1m"
+    )
 
 
 def test_synthetic_timestamp_retention_uses_replay_clock(monkeypatch, tmp_path):

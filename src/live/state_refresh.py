@@ -1,14 +1,36 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 import logging
 import sys
+from copy import deepcopy
 
 from config.access import get_optional_config_value
 from live import event_emitters
-from live.balance_composition import malformed_balance_composition, unavailable_balance_composition
+from live.balance_composition import (
+    malformed_balance_composition,
+    unavailable_balance_composition,
+)
 from live.diagnostic_safety import bounded_exception_type
 from utils import ts_to_date, utc_ms
+
+
+@dataclass(frozen=True)
+class DeferredAuthoritativeSurface:
+    """Explicit fail-closed result for a temporarily untrustworthy surface."""
+
+    surface: str
+    reason: str
+
+
+class AuthoritativeSurfaceUnavailable(RuntimeError):
+    """Signal that a fetched surface must not be committed or used for trading."""
+
+    def __init__(self, surface: str, reason: str):
+        self.surface = str(surface)
+        self.reason = str(reason)
+        super().__init__(f"{self.surface} unavailable: {self.reason}")
 
 
 def _utc_ms() -> int:
@@ -32,19 +54,38 @@ async def refresh_authoritative_state(bot) -> bool:
     """Refresh authoritative account state before planning/execution."""
     if bot.stop_signal_received:
         return False
-    bot._begin_authoritative_refresh_epoch()
-    return await bot._refresh_authoritative_state_staged()
+    from live import hsl_live
+
+    return await refresh_protective_authoritative_state(bot, require_balance=True)
 
 
-async def refresh_protective_authoritative_state(bot) -> bool:
+async def refresh_protective_authoritative_state(
+    bot, *, require_balance: bool = True
+) -> bool:
     """Refresh only account state required for protective cancels/reduce-only closes."""
+    from live import hsl_live
+
+    async with hsl_live.owner(bot)._refresh_lock:
+        return await _refresh_protective_authoritative_state(
+            bot, require_balance=require_balance
+        )
+    return await _refresh_protective_authoritative_state(
+        bot, require_balance=require_balance
+    )
+
+
+async def _refresh_protective_authoritative_state(
+    bot, *, require_balance: bool
+) -> bool:
     if bot.stop_signal_received:
         return False
     bot._begin_authoritative_refresh_epoch()
     bot._last_authoritative_block_reason = None
     bot._last_authoritative_pending_pnl_count = 0
     bot._last_authoritative_degraded_pnl_count = 0
-    plan = {"balance", "positions", "open_orders"}
+    plan = {"positions", "open_orders"}
+    if require_balance:
+        plan.add("balance")
     bot._authoritative_refresh_plan_surfaces = set(plan)
     snapshot = await bot._fetch_authoritative_state_staged_snapshot(plan)
     fetched_balance = snapshot.get("balance")
@@ -52,16 +93,26 @@ async def refresh_protective_authoritative_state(bot) -> bool:
     fetched_positions = snapshot.get("positions")
     fetched_open_orders = snapshot.get("open_orders")
 
-    prepared_balance_snapshot = bot._prepare_balance_snapshot(fetched_balance)
-    if prepared_balance_snapshot is None:
-        return False
-    if balance_composition is not None:
-        prepared_balance_snapshot["balance_composition"] = balance_composition
+    prepared_balance_snapshot = None
+    if require_balance:
+        if isinstance(fetched_balance, DeferredAuthoritativeSurface):
+            bot._last_authoritative_block_reason = fetched_balance.reason
+            return False
+
+        prepared_balance_snapshot = bot._prepare_balance_snapshot(fetched_balance)
+        if prepared_balance_snapshot is None:
+            return False
+        if balance_composition is not None:
+            prepared_balance_snapshot["balance_composition"] = balance_composition
     if fetched_positions in [None, False]:
         return False
     if fetched_open_orders in [None, False]:
         return False
 
+    # Validate execution prerequisites on this cohort, not an earlier startup read.
+    validator = getattr(bot, "_validate_protective_position_snapshot", None)
+    if callable(validator):
+        validator(fetched_positions)
     open_orders_ok = await bot._apply_open_orders_snapshot(
         fetched_open_orders,
         allow_followup_positions_refresh=False,
@@ -69,11 +120,14 @@ async def refresh_protective_authoritative_state(bot) -> bool:
     )
     if not open_orders_ok:
         return False
-    _old_positions, fetched_positions_new = bot._apply_positions_snapshot(fetched_positions)
-    bot._commit_balance_snapshot(prepared_balance_snapshot)
-    bot._record_authoritative_surface(
-        "balance", round(float(bot.get_hysteresis_snapped_balance()), 12)
+    _old_positions, fetched_positions_new = bot._apply_positions_snapshot(
+        fetched_positions
     )
+    if require_balance:
+        bot._commit_balance_snapshot(prepared_balance_snapshot)
+        bot._record_authoritative_surface(
+            "balance", round(float(bot.get_hysteresis_snapped_balance()), 12)
+        )
     bot._record_authoritative_surface(
         "positions",
         bot._positions_signature(fetched_positions_new),
@@ -82,7 +136,54 @@ async def refresh_protective_authoritative_state(bot) -> bool:
         sorted(bot.positions), now_ms=int(bot.get_exchange_time())
     )
     bot._finalize_authoritative_refresh_consistency(plan)
+    queue_protective_account_report(
+        bot, _old_positions, fetched_positions_new, require_balance=require_balance
+    )
     return True
+
+
+def queue_protective_account_report(
+    bot, old_positions, new_positions, *, require_balance
+):
+    """Bounded observational receipt; never an account or trading authority."""
+    previous = getattr(bot, "_protective_account_report", None)
+    bot._protective_account_report = (
+        previous[0] if previous is not None else deepcopy(old_positions),
+        deepcopy(new_positions),
+        require_balance or (previous is not None and previous[2]),
+    )
+
+
+async def publish_protective_account_report(bot):
+    receipt = getattr(bot, "_protective_account_report", None)
+    if receipt is None or bot.stop_signal_received:
+        return
+    bot._protective_account_report = None
+    old_positions, new_positions, report_balance = receipt
+
+    async def report_balance_observation():
+        event_emitters.publish_committed_balance_observation(bot)
+
+    for name, operation in (
+        (
+            "position-change",
+            lambda: bot.log_position_changes(old_positions, new_positions),
+        ),
+        ("balance-change", report_balance_observation),
+    ):
+        if bot.stop_signal_received:
+            return
+        if name == "balance-change" and not report_balance:
+            continue
+        try:
+            await operation()
+        except Exception as exc:
+            # Reporting must not interrupt protection or suppress the next hook.
+            logging.error(
+                "[state] %s diagnostics failed | error_type=%s action=continue",
+                name,
+                bounded_exception_type(exc),
+            )
 
 
 async def refresh_authoritative_state_staged(bot) -> bool:
@@ -119,9 +220,14 @@ async def refresh_authoritative_state_staged(bot) -> bool:
                 bot._last_authoritative_block_reason = "degraded_pnl"
             elif bot._last_authoritative_pending_pnl_count:
                 bot._last_authoritative_block_reason = "pending_pnl"
+            else:
+                bot._last_authoritative_block_reason = "fills_unavailable"
         return False
     prepared_balance_snapshot = None
     if "balance" in plan:
+        if isinstance(fetched_balance, DeferredAuthoritativeSurface):
+            bot._last_authoritative_block_reason = fetched_balance.reason
+            return False
         prepared_balance_snapshot = bot._prepare_balance_snapshot(fetched_balance)
         if prepared_balance_snapshot is None:
             return False
@@ -178,25 +284,44 @@ async def refresh_authoritative_state_staged(bot) -> bool:
     return True
 
 
-async def capture_balance_staged_snapshot(bot) -> tuple[object, dict, float]:
+async def capture_balance_staged_snapshot(
+    bot,
+) -> tuple[object, dict, float | DeferredAuthoritativeSurface]:
     """Fetch one raw balance response plus bounded diagnostics and normalized value."""
-    if hasattr(bot, "capture_balance_snapshot"):
-        raw_balance, balance = await bot.capture_balance_snapshot()
-        normalizer = getattr(bot, "_normalize_balance_diagnostics", None)
-        if not callable(normalizer):
-            return raw_balance, unavailable_balance_composition(), balance
-        try:
-            return raw_balance, normalizer(raw_balance), balance
-        except Exception:
-            return (
-                raw_balance,
-                malformed_balance_composition(
-                    source="normalizer", reason="normalizer_error"
-                ),
-                balance,
-            )
-    balance = await bot.fetch_balance()
-    return None, unavailable_balance_composition(), balance
+    if getattr(bot, "balance_override", None) is not None:
+        return (
+            None,
+            unavailable_balance_composition(reason="balance_override"),
+            bot.get_raw_balance(),
+        )
+    try:
+        if hasattr(bot, "capture_balance_snapshot"):
+            raw_balance, balance = await bot.capture_balance_snapshot()
+            normalizer = getattr(bot, "_normalize_balance_diagnostics", None)
+            if not callable(normalizer):
+                return raw_balance, unavailable_balance_composition(), balance
+            try:
+                return raw_balance, normalizer(raw_balance), balance
+            except AuthoritativeSurfaceUnavailable:
+                raise
+            except Exception:
+                return (
+                    raw_balance,
+                    malformed_balance_composition(
+                        source="normalizer", reason="normalizer_error"
+                    ),
+                    balance,
+                )
+        balance = await bot.fetch_balance()
+        return None, unavailable_balance_composition(), balance
+    except AuthoritativeSurfaceUnavailable as exc:
+        if exc.surface != "balance":
+            raise
+        return (
+            None,
+            unavailable_balance_composition(reason=exc.reason),
+            DeferredAuthoritativeSurface(surface=exc.surface, reason=exc.reason),
+        )
 
 
 async def capture_positions_staged_snapshot(bot) -> tuple[object, list[dict]]:
@@ -210,9 +335,7 @@ async def capture_positions_staged_snapshot(bot) -> tuple[object, list[dict]]:
 def authoritative_staged_refresh_plan(bot) -> set[str]:
     """Return the minimal staged authoritative surfaces needed this cycle."""
     pending = set(getattr(bot, "_authoritative_pending_confirmations", {}) or {})
-    trailing_recovery_due = getattr(
-        bot, "_trailing_fill_recovery_prefetch_due", None
-    )
+    trailing_recovery_due = getattr(bot, "_trailing_fill_recovery_prefetch_due", None)
     should_prefetch_trailing_recovery = bool(
         callable(trailing_recovery_due) and trailing_recovery_due()
     )
@@ -235,9 +358,7 @@ def authoritative_staged_refresh_plan(bot) -> set[str]:
         elif (
             should_prefetch_trailing_recovery
             and bot._staged_fills_can_prefetch_routine()
-            and bot._schedule_routine_fill_refresh_prefetch(
-                reason="trailing_recovery"
-            )
+            and bot._schedule_routine_fill_refresh_prefetch(reason="trailing_recovery")
         ):
             plan.discard("fills")
             logging.debug(
@@ -245,12 +366,16 @@ def authoritative_staged_refresh_plan(bot) -> set[str]:
             )
         elif not bot._staged_fills_refresh_due():
             plan.discard("fills")
-            logging.debug("[state] staged fills refresh deferred until next minute boundary")
+            logging.debug(
+                "[state] staged fills refresh deferred until next minute boundary"
+            )
         elif bot._staged_fills_can_prefetch_routine() and (
             bot._schedule_routine_fill_refresh_prefetch(reason="minute_boundary")
         ):
             plan.discard("fills")
-            logging.debug("[state] staged routine fills refresh scheduled in background")
+            logging.debug(
+                "[state] staged routine fills refresh scheduled in background"
+            )
     bot._authoritative_refresh_plan_surfaces = set(plan)
     return plan
 
@@ -328,7 +453,9 @@ async def routine_fill_refresh_prefetch_task(bot, *, reason: str) -> None:
         )
 
 
-async def timed_authoritative_fetch(bot, surface: str, coro, timings_ms: dict[str, int]):
+async def timed_authoritative_fetch(
+    bot, surface: str, coro, timings_ms: dict[str, int]
+):
     """Measure one staged authoritative fetch while preserving exceptions."""
     started = _utc_ms()
     remote_call_id = event_emitters.emit_authoritative_remote_call_event(
@@ -396,9 +523,7 @@ def log_staged_refresh_timings(
     routine_without_fills = {"balance", "open_orders", "positions"}
     plan_set = set(plan)
     unusual_plan = plan_set not in (full_plan, routine_without_fills)
-    epoch_changed = set(
-        bot._ensure_freshness_ledger().changed_surfaces_at_epoch()
-    )
+    epoch_changed = set(bot._ensure_freshness_ledger().changed_surfaces_at_epoch())
     meaningful_surfaces = epoch_changed - {"balance"}
     if pending_confirmations and plan_set == {"open_orders"} and wall_ms < 2_000:
         meaningful_surfaces -= {"open_orders"}
@@ -524,7 +649,8 @@ def record_staged_refresh_timing_summary(
     if count < 60 and now - first_ms < 15 * 60 * 1000:
         return
     surface_parts = [
-        f"{surface}={format_stats(stats)}" for surface, stats in sorted(surfaces.items())
+        f"{surface}={format_stats(stats)}"
+        for surface, stats in sorted(surfaces.items())
     ]
     event_emitters.emit_state_refresh_timing_summary_event(
         bot,
@@ -540,7 +666,7 @@ def record_staged_refresh_timing_summary(
     if _state_refresh_structured_console_available(bot):
         summaries.pop(plan_key, None)
         return
-    logging.info(
+    logging.debug(
         "[state] staged refresh timing summary | plan=%s | count=%d since=%s | wall=%s | surface_sum=%s | surface_max=%s | residual=%s | %s",
         plan_key,
         count,
@@ -575,9 +701,7 @@ async def log_staged_refresh_progress_until(
     interval_s = max(5.0, threshold_s)
     logged_pending: set[tuple[str, ...]] = set()
     try:
-        await bot._sleep_unless_shutdown(
-            threshold_s, stage="staged_refresh_progress"
-        )
+        await bot._sleep_unless_shutdown(threshold_s, stage="staged_refresh_progress")
         while not bot._shutdown_requested():
             pending = tuple(
                 sorted(name for name, task in tasks.items() if not task.done())

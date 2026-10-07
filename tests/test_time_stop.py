@@ -227,12 +227,14 @@ def test_live_rebuild_uses_an_unfilled_open_order_target():
     assert state['pending_target_size']==7.5 and state['anchor_timestamp_ms']==1000
 
 
-def test_live_rust_payload_includes_fill_factor_cap_and_time_stop_policy():
+def test_live_rust_payload_includes_time_stop_and_divergence_policy():
     from config_utils import get_template_config
     from config.shared_bot import flatten_shared_bot_side
     from passivbot import Passivbot
     side = get_template_config()['bot']['long']
-    side['risk'].update(entry_cooldown_factor_per_fill=2.,entry_cooldown_max_minutes=1440.,time_stop_max_age_days=7.,time_stop_close_pct=.25)
+    side['risk'].update(time_stop_max_age_days=7.,time_stop_close_pct=.25,
+                        divergence_filter_enabled=True,divergence_extended_horizons=True,
+                        divergence_min_timeframes=2)
     flat=flatten_shared_bot_side(side)
     flat['wallet_exposure_limit']=1.
     def value(pside,key,*args):
@@ -241,10 +243,11 @@ def test_live_rust_payload_includes_fill_factor_cap_and_time_stop_policy():
         for part in parts[1:]:
             result=result[part]
         return result
-    bot=SimpleNamespace(bp=value,bot_value=value)
+    bot=SimpleNamespace(bp=value,bot_value=value,config={'live':{'hsl_signal_mode':'coin'},'bot':{'long':side}},coin_overrides={})
     params=Passivbot._bot_params_to_rust_dict(bot,'long',SYMBOL)
-    assert params['risk_entry_cooldown_factor_per_fill']==2.
-    assert params['risk_entry_cooldown_max_minutes']==1440.
+    assert params['divergence_filter_enabled'] is True
+    assert params['divergence_extended_horizons'] is True
+    assert params['divergence_min_timeframes']==2
     assert params['risk_time_stop_max_age_days']==7.
     assert params['risk_time_stop_close_pct']==.25
 
@@ -288,8 +291,9 @@ def test_real_backtest_temporal_losses_use_taker_fees_and_restart_completed_inte
                                        "short": ["BTC"] if pside == "short" else []})
     for side in ("long", "short"):
         cfg["bot"][side]["risk"].update(n_positions=int(side == pside),
-            total_wallet_exposure_limit=float(side == pside), entry_cooldown_minutes=1000.,
+            total_wallet_exposure_limit=float(side == pside),
             time_stop_max_age_days=10./1440 if side == pside else 0., time_stop_close_pct=pct)
+        cfg["bot"][side]["entry_cooldown"]["base_duration_minutes"] = 1000.
         cfg["bot"][side]["unstuck"]["enabled"] = False
         cfg["bot"][side]["forager"].update(volatility_ema_span_1m=1., volume_ema_span_1m=1.,
             score_weights={"ema_readiness": 0., "volatility": 1., "volume": 0.})

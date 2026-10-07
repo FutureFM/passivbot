@@ -10,19 +10,18 @@ connectors and a shared fill-event interface.
 
 from __future__ import annotations
 
+from passivbot_exceptions import FillEventDataError
+
 import argparse
 import asyncio
 import errno
-import fcntl
 import inspect
 import json
 import logging
 import math
 import os
-import random
 import re
 import shutil
-import tempfile
 import time
 from collections import defaultdict, deque
 from copy import deepcopy
@@ -114,7 +113,37 @@ class FillEventCacheDiskFullError(RuntimeError):
 
 
 class FillEventCacheContractError(RuntimeError):
-    """Raised when persisted fill events use an unsafe legacy accounting contract."""
+    """Raised when persisted fills or their metadata violate the cache contract."""
+
+
+def _fill_number(value, converter):
+    try:
+        return converter(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise FillEventDataError("invalid numeric fill value") from exc
+
+
+def _fill_float(value) -> float:
+    return _fill_number(value, float)
+
+
+def _fill_int(value) -> int:
+    return _fill_number(value, int)
+
+
+def _fill_datetime(timestamp) -> str:
+    try:
+        return ts_to_date(timestamp)
+    except (TypeError, ValueError, OverflowError, OSError) as exc:
+        raise FillEventDataError("invalid fill timestamp") from exc
+
+
+def _cache_metadata_timestamp(metadata: Dict[str, object], key: str) -> int:
+    """Classify invalid persisted bounds at their data boundary, not as code bugs."""
+    try:
+        return int(metadata.get(key, 0) or 0)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise FillEventCacheContractError(f"invalid fill-cache metadata timestamp: {key}") from exc
 
 
 def _is_disk_full_error(exc: BaseException) -> bool:
@@ -128,178 +157,6 @@ def _is_disk_full_error(exc: BaseException) -> bool:
     )
 
 
-# ---------------------------------------------------------------------------
-# Rate Limit Coordination
-# ---------------------------------------------------------------------------
-
-# Default rate limits per exchange (calls per minute)
-_DEFAULT_RATE_LIMITS: Dict[str, Dict[str, int]] = {
-    "binance": {"fetch_my_trades": 1200, "fetch_income_history": 120, "default": 1200},
-    "bybit": {"fetch_my_trades": 120, "fetch_positions_history": 120, "default": 120},
-    "bitget": {"fill_history": 120, "fetch_order": 60, "default": 120},
-    "hyperliquid": {"fetch_my_trades": 120, "default": 120},
-    "weex": {"fetch_my_trades": 120, "fetch_order": 60, "default": 120},
-    "gateio": {"fetch_closed_orders": 120, "default": 120},
-    "kucoin": {
-        "fetch_my_trades": 120,
-        "fetch_positions_history": 120,
-        "fetch_order": 60,
-        "default": 120,
-    },
-    # OKX: /fills = 60 req/2s, /fills-history = 10 req/2s (conservative estimates)
-    "okx": {"fetch_my_trades": 1800, "fills_history": 300, "default": 300},
-}
-
-# Window for rate limit tracking (ms)
-_RATE_LIMIT_WINDOW_MS = 60_000
-
-# Default jitter range for staggered startup (seconds)
-_STARTUP_JITTER_MIN = 0.0
-_STARTUP_JITTER_MAX = 30.0
-
-
-class RateLimitCoordinator:
-    """Coordinates rate limiting across multiple bot instances via shared temp file.
-
-    Each exchange has a temp file that logs recent API calls. Instances check this
-    file before making API calls and add jitter if approaching rate limits.
-    """
-
-    def __init__(
-        self,
-        exchange: str,
-        user: str,
-        *,
-        temp_dir: Optional[Path] = None,
-        window_ms: int = _RATE_LIMIT_WINDOW_MS,
-        limits: Optional[Dict[str, int]] = None,
-    ) -> None:
-        self.exchange = exchange.lower()
-        self.user = user
-        self.window_ms = window_ms
-        self.limits = limits or _DEFAULT_RATE_LIMITS.get(self.exchange, {"default": 120})
-
-        if temp_dir is None:
-            temp_dir = Path(tempfile.gettempdir()) / "passivbot_rate_limits"
-        self.temp_dir = temp_dir
-        self.temp_dir.mkdir(parents=True, exist_ok=True)
-        self.temp_file = self.temp_dir / f"{self.exchange}.json"
-
-    def _load_calls(self) -> List[Dict[str, object]]:
-        """Load recent API calls from temp file."""
-        if not self.temp_file.exists():
-            return []
-        try:
-            with self.temp_file.open("r") as f:
-                fcntl.flock(f.fileno(), fcntl.LOCK_SH)
-                try:
-                    data = json.load(f)
-                finally:
-                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-                return data.get("calls", [])
-        except Exception as exc:
-            logger.debug("RateLimitCoordinator: failed to load %s: %s", self.temp_file, exc)
-            return []
-
-    def _save_calls(self, calls: List[Dict[str, object]]) -> None:
-        """Save API calls to temp file atomically."""
-        now_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
-
-        # Prune old entries
-        cutoff = now_ms - self.window_ms
-        calls = [c for c in calls if c.get("timestamp_ms", 0) > cutoff]
-
-        data = {
-            "calls": calls,
-            "window_ms": self.window_ms,
-            "limits": self.limits,
-            "last_update": now_ms,
-        }
-
-        tmp_file = self.temp_file.with_suffix(".tmp")
-        try:
-            with tmp_file.open("w") as f:
-                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-                try:
-                    json.dump(data, f)
-                finally:
-                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-            os.replace(tmp_file, self.temp_file)
-        except Exception as exc:
-            logger.debug("RateLimitCoordinator: failed to save %s: %s", self.temp_file, exc)
-
-    def get_current_usage(self, endpoint: str) -> int:
-        """Get current call count for an endpoint in the current window."""
-        calls = self._load_calls()
-        now_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
-        cutoff = now_ms - self.window_ms
-        return sum(
-            1 for c in calls if c.get("endpoint") == endpoint and c.get("timestamp_ms", 0) > cutoff
-        )
-
-    def get_limit(self, endpoint: str) -> int:
-        """Get rate limit for an endpoint."""
-        return self.limits.get(endpoint, self.limits.get("default", 120))
-
-    def record_call(self, endpoint: str) -> None:
-        """Record an API call."""
-        calls = self._load_calls()
-        calls.append(
-            {
-                "endpoint": endpoint,
-                "timestamp_ms": int(datetime.now(tz=timezone.utc).timestamp() * 1000),
-                "user": self.user,
-            }
-        )
-        self._save_calls(calls)
-
-    async def wait_if_needed(self, endpoint: str) -> float:
-        """Check rate limit and wait if needed. Returns time waited (seconds)."""
-        current = self.get_current_usage(endpoint)
-        limit = self.get_limit(endpoint)
-
-        if current >= limit:
-            # At or over limit - wait for full window
-            wait_time = self.window_ms / 1000.0
-            logger.info(
-                "RateLimitCoordinator: %s:%s at limit (%d/%d), waiting %.1fs",
-                self.exchange,
-                endpoint,
-                current,
-                limit,
-                wait_time,
-            )
-            await asyncio.sleep(wait_time)
-            return wait_time
-        elif current >= limit * 0.8:
-            # Approaching limit - add jitter
-            jitter = random.uniform(0.1, 2.0)
-            logger.debug(
-                "RateLimitCoordinator: %s:%s approaching limit (%d/%d), jitter %.2fs",
-                self.exchange,
-                endpoint,
-                current,
-                limit,
-                jitter,
-            )
-            await asyncio.sleep(jitter)
-            return jitter
-
-        return 0.0
-
-    @staticmethod
-    async def startup_jitter(
-        min_seconds: float = _STARTUP_JITTER_MIN,
-        max_seconds: float = _STARTUP_JITTER_MAX,
-    ) -> float:
-        """Apply random jitter at startup to stagger multiple bot launches."""
-        jitter = random.uniform(min_seconds, max_seconds)
-        if jitter > 0:
-            logger.info("RateLimitCoordinator: startup jitter %.2fs", jitter)
-            await asyncio.sleep(jitter)
-        return jitter
-
-
 def _format_ms(ts: Optional[int]) -> str:
     if ts is None:
         return "None"
@@ -310,54 +167,55 @@ def _day_key(timestamp_ms: int) -> str:
     return datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
 
 
-def _merge_fee_lists(
-    fees_a: Optional[Sequence], fees_b: Optional[Sequence]
-) -> Optional[List[Dict[str, object]]]:
-    def to_list(fees):
-        if not fees:
-            return []
-        if isinstance(fees, dict):
-            return [fees]
-        return list(fees)
-
+def _merge_fee_lists(fees_a: object, fees_b: object) -> Optional[List[Dict[str, object]]]:
     merged: Dict[str, Dict[str, object]] = {}
-    for entry in to_list(fees_a) + to_list(fees_b):
-        if not isinstance(entry, dict):
+    preserved: List[Dict[str, object]] = []
+    for entry in _fee_entries(fees_a) + _fee_entries(fees_b):
+        # Do not turn missing or malformed amounts into an authoritative zero.
+        # Keep these entries visible to the fee policy, including when other
+        # same-currency components have usable amounts.
+        raw_cost = entry.get("cost")
+        try:
+            cost = float(raw_cost)
+        except (TypeError, ValueError, OverflowError):
+            cost = None
+        if (
+            isinstance(raw_cost, bool)
+            or cost is None
+            or not math.isfinite(cost)
+            or not _fee_entry_has_reported_amount(entry)
+        ):
+            preserved.append(dict(entry))
             continue
-        currency = str(entry.get("currency") or entry.get("code") or "")
+        if set(entry) - {"cost", "currency", "code"}:
+            # Signed fields, rebates and rates determine cashflow independently
+            # of cost. Retain those components instead of inheriting only the
+            # first component's sign metadata after summing costs.
+            preserved.append(dict(entry))
+            continue
+        currency = _fee_entry_currency(entry)
         if currency not in merged:
             merged[currency] = dict(entry)
-            try:
-                merged[currency]["cost"] = float(entry.get("cost", 0.0))
-            except Exception:
-                merged[currency]["cost"] = 0.0
+            merged[currency]["cost"] = cost
         else:
-            try:
-                merged[currency]["cost"] += float(entry.get("cost", 0.0))
-            except Exception:
-                pass
-    if not merged:
-        return None
-    return [dict(value) for value in merged.values()]
+            merged[currency]["cost"] += cost
+    result = [dict(value) for value in merged.values()] + preserved
+    return result or None
 
 
 def _fee_entries(fees: object) -> List[Dict[str, object]]:
-    if not fees:
+    if fees is None:
         return []
     if isinstance(fees, dict):
-        return [fees]
-    if isinstance(fees, (int, float, str)) and not isinstance(fees, bool):
-        try:
-            cost = float(fees)
-        except (TypeError, ValueError):
-            return []
-        if cost != 0.0:
-            return [{"cost": cost}]
-        return []
+        return [fees] if fees else []
+    if isinstance(fees, (int, float, str, bool)):
+        # Preserve both explicit zero and unusable scalar evidence. The amount
+        # validator decides whether this is reported accounting or a fallback.
+        return [{"cost": fees}]
     try:
-        return [entry for entry in list(fees) if isinstance(entry, dict)]
-    except Exception:
-        return []
+        return [entry if isinstance(entry, dict) else {"cost": entry} for entry in fees]
+    except TypeError:
+        return [{"cost": fees}]
 
 
 def _fee_cost(fees: Optional[Sequence]) -> float:
@@ -409,6 +267,35 @@ def _fee_entry_signed_fee_paid(fee: Dict[str, object]) -> float:
 
 def _fee_entry_currency(fee: Dict[str, object]) -> str:
     return str(fee.get("currency") or fee.get("code") or fee.get("feeCoin") or "").strip().upper()
+
+
+def _fee_entry_has_reported_amount(fee: Dict[str, object]) -> bool:
+    """Distinguish a finite reported amount, including zero, from a missing fee."""
+    for key in ("fee_paid", "totalFee", "fee", "totalDeductionFee", "cost"):
+        value = fee.get(key)
+        if (key == "fee_paid" and key in fee) or value not in (None, ""):
+            try:
+                return not isinstance(value, bool) and math.isfinite(float(value))
+            except (TypeError, ValueError, OverflowError):
+                return False
+    return False
+
+
+def _reported_fee_amounts_by_currency(
+    entries: Sequence[Dict[str, object]],
+) -> Tuple[Dict[str, float], bool]:
+    """Net only finite reported cashflows; retain whether any component is unknown."""
+    amounts = defaultdict(float)
+    unresolved = False
+    for entry in entries:
+        if not _fee_entry_has_reported_amount(entry):
+            unresolved = True
+            continue
+        currency = _fee_entry_currency(entry)
+        amounts[currency] += _fee_entry_signed_fee_paid(entry)
+        if not math.isfinite(amounts[currency]):
+            unresolved = True
+    return amounts, unresolved
 
 
 def _quote_currency_from_symbol(symbol: object) -> str:
@@ -512,6 +399,24 @@ def _normalize_fee_paid_from_payload(
 
     payload_fee_source = str(payload.get("fee_source") or "")
     payload_fee_quality = str(payload.get("fee_quality") or "")
+    if payload_fee_source in (FEE_SOURCE_FALLBACK_PCT, FEE_SOURCE_ESTIMATED_RATE) and entries:
+        # Current-contract caches can contain an estimate chosen before explicit
+        # zero amounts were recognized. Upgrade only newly resolved evidence;
+        # preserve an unresolved historical fallback and its original policy.
+        candidate = dict(payload)
+        for key in ("fee_paid", "fee_source", "fee_quality", "pnl_contract"):
+            candidate.pop(key, None)
+        resolved_paid, resolved_meta = _normalize_fee_paid_from_payload(
+            candidate,
+            fee_pct_fallback=fee_pct_fallback,
+            fee_pct_sanity_abs_max=fee_pct_sanity_abs_max,
+            quote_currency=quote,
+            conversion_rates=conversion_rates,
+        )
+        if resolved_meta["fee_source"] in (
+            FEE_SOURCE_REPORTED_QUOTE, FEE_SOURCE_REPORTED_CONVERTED
+        ):
+            return resolved_paid, resolved_meta
     recheck_existing_fee = payload_fee_quality == FEE_QUALITY_SANITY_REPLACED and bool(entries)
     trusted_fee_paid = (
         "fee_paid" in payload
@@ -532,11 +437,9 @@ def _normalize_fee_paid_from_payload(
         converted_total = 0.0
         saw_quote = False
         saw_converted = False
-        for entry in entries:
-            signed = _fee_entry_signed_fee_paid(entry)
-            if signed == 0.0:
-                continue
-            currency = _fee_entry_currency(entry)
+        saw_ticker_conversion = False
+        amounts, unresolved_amount = _reported_fee_amounts_by_currency(entries)
+        for currency, signed in amounts.items():
             if not fee_currency and currency:
                 fee_currency = currency
             if not currency or (quote and currency == quote):
@@ -544,21 +447,22 @@ def _normalize_fee_paid_from_payload(
                 saw_quote = True
                 continue
             rate = conversion_rates.get(currency)
-            if rate is None:
+            if signed == 0.0:
+                # A zero balance impact needs no price conversion.
+                saw_converted = True
+                continue
+            if rate is None or not math.isfinite(float(rate)) or float(rate) <= 0.0:
                 unresolved_non_quote = True
                 continue
             converted_total += signed * float(rate)
             saw_converted = True
-        if converted_total != 0.0 and not unresolved_non_quote:
+            saw_ticker_conversion = True
+        if (saw_quote or saw_converted) and not (unresolved_amount or unresolved_non_quote):
             fee_paid = converted_total
-            if saw_converted and not saw_quote:
+            if saw_converted:
                 fee_source = FEE_SOURCE_REPORTED_CONVERTED
                 fee_quality = FEE_QUALITY_CONVERTED
-                conversion_source = "ticker"
-            elif saw_converted:
-                fee_source = FEE_SOURCE_REPORTED_CONVERTED
-                fee_quality = FEE_QUALITY_CONVERTED
-                conversion_source = "ticker"
+                conversion_source = "ticker" if saw_ticker_conversion else "zero_amount"
             else:
                 fee_source = FEE_SOURCE_REPORTED_QUOTE
                 fee_quality = FEE_QUALITY_EXACT
@@ -625,7 +529,14 @@ def _normalize_fee_paid_from_payload(
 
 def signed_fee_paid_from_fees(fees: object) -> float:
     """Return canonical signed fee cashflow from CCXT-style fee payloads."""
-    return sum(_fee_entry_signed_fee_paid(entry) for entry in _fee_entries(fees))
+    # Coalescing keeps unusable entries in the raw fee list. They cannot
+    # contribute a numeric amount here; the fee policy resolves the whole list
+    # (or applies its documented fallback) before publication.
+    return sum(
+        _fee_entry_signed_fee_paid(entry)
+        for entry in _fee_entries(fees)
+        if _fee_entry_has_reported_amount(entry)
+    )
 
 
 def signed_fee_paid_from_payload(payload: Dict[str, object]) -> float:
@@ -714,6 +625,17 @@ def _raw_quote_value(payload: Dict[str, object]) -> float:
 
 
 def _payload_contract_multiplier(payload: Dict[str, object]) -> float:
+    # Bitget UTA linear execQty is already in base units. Its rounded execValue
+    # is fee/notional evidence, not a contract-size measurement. Apply this on
+    # cache reads too, overriding multipliers previously inferred from that value.
+    raw_rows = _normalize_raw_field(payload.get("raw"))
+    if raw_rows and all(
+        raw.get("source") == "uta_fills"
+        and isinstance(raw.get("data"), dict)
+        and raw["data"].get("category") in ("USDT-FUTURES", "USDC-FUTURES")
+        for raw in raw_rows
+    ):
+        return 1.0
     try:
         explicit = float(payload.get("c_mult") or payload.get("contract_size") or 0.0)
     except Exception:
@@ -927,6 +849,13 @@ def compute_psize_pprice(
             ev["pprice"] = after_pprice
 
     return final_state
+
+
+def apply_exchange_raw_position_overrides(events: List[Dict[str, object]]) -> None:
+    apply_hyperliquid_raw_psize_overrides(events)
+    from exchanges.lighter_fill_events import apply_lighter_raw_position_overrides
+
+    apply_lighter_raw_position_overrides(events)
 
 
 def apply_hyperliquid_raw_psize_overrides(events: List[Dict[str, object]]) -> None:
@@ -1290,6 +1219,15 @@ def _hyperliquid_coalesced_reconciliation_failure(
     if parent_qty is None or any(qty is None for qty in child_qtys):
         return "signed_qty"
 
+    for component in (event, *children):
+        entries = _fee_entries(component.get("fees")) + _fee_entries(component.get("fee"))
+        # The general extractor is deliberately provisional for ingestion; an
+        # aggregate proof instead requires every reported component to be known.
+        if any(not _fee_entry_has_reported_amount(entry) for entry in entries):
+            return "accounting"
+        if not entries and not _fee_entry_has_reported_amount(component):
+            return "accounting"
+
     try:
         parent_pnl = float(event.get("pnl") or 0.0)
         child_pnl = sum(float(child.get("pnl") or 0.0) for child in children)
@@ -1555,7 +1493,9 @@ def _coalesce_events(events: List[Dict[str, object]]) -> List[Dict[str, object]]
             aggregated[key]["pnl_status"] = _payload_pnl_status(ev)
             aggregated[key]["pnl_source"] = _payload_pnl_source(ev)
             aggregated[key]["pnl_synthetic_reason"] = str(ev.get("pnl_synthetic_reason") or "")
-            aggregated[key]["fees"] = _merge_fee_lists(ev.get("fees"), None)
+            aggregated[key]["fees"] = _merge_fee_lists(
+                _fee_entries(ev.get("fees")) or [{"cost": None}], None
+            )
             aggregated[key]["raw"] = _normalize_raw_field(ev.get("raw"))
             aggregated[key]["_price_numerator"] = float(ev.get("price", 0.0)) * float(
                 ev.get("qty", 0.0)
@@ -1579,7 +1519,9 @@ def _coalesce_events(events: List[Dict[str, object]]) -> List[Dict[str, object]]
                 agg["pnl_source"] = _payload_pnl_source(ev)
                 if ev.get("pnl_synthetic_reason"):
                     agg["pnl_synthetic_reason"] = str(ev.get("pnl_synthetic_reason"))
-            agg["fees"] = _merge_fee_lists(agg.get("fees"), ev.get("fees"))
+            agg["fees"] = _merge_fee_lists(
+                agg.get("fees"), _fee_entries(ev.get("fees")) or [{"cost": None}]
+            )
             agg["raw"] = _normalize_raw_field(agg.get("raw")) + _normalize_raw_field(ev.get("raw"))
             agg["_price_numerator"] = float(agg.get("_price_numerator", 0.0)) + float(
                 ev.get("price", 0.0)
@@ -1828,13 +1770,13 @@ class FillEvent:
                 if not data.get("source_ids")
                 else [str(x) for x in data.get("source_ids") if x]
             ),
-            timestamp=int(data["timestamp"]),
-            datetime=str(data.get("datetime") or ts_to_date(int(data["timestamp"]))),
+            timestamp=_fill_int(data["timestamp"]),
+            datetime=str(data.get("datetime") or _fill_datetime(_fill_int(data["timestamp"]))),
             symbol=str(data["symbol"]),
             side=str(data["side"]).lower(),
-            qty=float(data["qty"]),
-            price=float(data["price"]),
-            pnl=float(data["pnl"]),
+            qty=_fill_float(data["qty"]),
+            price=_fill_float(data["price"]),
+            pnl=_fill_float(data["pnl"]),
             fee_paid=fee_paid,
             pnl_status=str(data.get("pnl_status") or "complete").lower(),
             pnl_source=(
@@ -1854,14 +1796,14 @@ class FillEvent:
             fee_quality=str(fee_meta.get("fee_quality") or FEE_QUALITY_FALLBACK),
             fee_currency=str(fee_meta.get("fee_currency") or ""),
             fee_conversion_source=str(fee_meta.get("fee_conversion_source") or "none"),
-            fee_notional=float(fee_meta.get("fee_notional") or 0.0),
-            fee_ratio=float(fee_meta.get("fee_ratio") or 0.0),
+            fee_notional=_fill_float(fee_meta.get("fee_notional") or 0.0),
+            fee_ratio=_fill_float(fee_meta.get("fee_ratio") or 0.0),
             fees=data.get("fees"),
             pb_order_type=str(data["pb_order_type"]),
             position_side=str(data["position_side"]).lower(),
             client_order_id=str(data["client_order_id"]),
-            psize=float(data.get("psize", 0.0)),
-            pprice=float(data.get("pprice", 0.0)),
+            psize=_fill_float(data.get("psize", 0.0)),
+            pprice=_fill_float(data.get("pprice", 0.0)),
             c_mult=_payload_contract_multiplier(data),
             raw=_normalize_raw_field(data.get("raw")),
             provenance=(
@@ -1898,6 +1840,32 @@ def _is_close_payload(payload: Dict[str, object]) -> bool:
     except Exception:
         closed_size = 0.0
     return closed_size > 0.0
+
+
+def _is_kucoin_close(payload: Dict[str, object]) -> bool:
+    # Order labels arrive after trade normalization and may be absent on manual fills.
+    return (payload.get("side"), payload.get("position_side")) in {
+        ("sell", "long"),
+        ("buy", "short"),
+    }
+
+
+def _kucoin_trade_pnl_needs_repair(payload: Dict[str, object]) -> bool:
+    # KuCoin trades contain no authoritative realized PnL. Older fetchers stamped
+    # batch-local estimates (including nonzero ones) authoritative before order
+    # enrichment identified the close. Cycle-reconciled and synthetic rows already
+    # carry explicit sources and must retain their accounting.
+    return (
+        payload.get("pnl_contract") == PNL_CONTRACT_CURRENT
+        and _is_kucoin_close(payload)
+        and _payload_pnl_status(payload) == "complete"
+        and _payload_pnl_source(payload) == PNL_SOURCE_AUTHORITATIVE
+        and any(
+            row.get("source") == "fetch_my_trades"
+            for row in _normalize_raw_field(payload.get("raw"))
+            if isinstance(row, dict)
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2236,8 +2204,8 @@ class FillEventCache:
         oldest = min(timestamps)
         newest = max(timestamps)
 
-        current_oldest = metadata.get("oldest_event_ts", 0)
-        current_newest = metadata.get("newest_event_ts", 0)
+        current_oldest = _cache_metadata_timestamp(metadata, "oldest_event_ts")
+        current_newest = _cache_metadata_timestamp(metadata, "newest_event_ts")
 
         if current_oldest == 0 or oldest < current_oldest:
             metadata["oldest_event_ts"] = oldest
@@ -2268,13 +2236,13 @@ class FillEventCache:
     def get_covered_start_ms(self) -> int:
         """Return earliest open-ended lookback start confirmed against exchange."""
         metadata = self.load_metadata()
-        return int(metadata.get("covered_start_ms", 0) or 0)
+        return _cache_metadata_timestamp(metadata, "covered_start_ms")
 
     def mark_covered_start(self, start_ts: int) -> None:
         """Persist earliest open-ended lookback start confirmed against exchange."""
         metadata = self.load_metadata()
         start_ts = int(start_ts)
-        current = int(metadata.get("covered_start_ms", 0) or 0)
+        current = _cache_metadata_timestamp(metadata, "covered_start_ms")
         if current == 0 or start_ts < current:
             metadata["covered_start_ms"] = start_ts
         metadata["last_refresh_ms"] = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
@@ -2722,11 +2690,9 @@ class BitgetFetcher(BaseFetcher):
                 events[event_id] = event
             detail_fetches += await self._flush_detail_tasks(pending_tasks)
             if on_batch:
-                batch_events = [
-                    dict(events[event_id])
-                    for event_id in batch_ids
-                    if events[event_id].get("client_order_id")
-                ]
+                # Client IDs describe attribution, not whether an exchange fill
+                # belongs in position/PnL history. Keep external executions too.
+                batch_events = [dict(events[event_id]) for event_id in batch_ids]
                 if batch_events:
                     on_batch(batch_events)
             oldest = min(int(raw["cTime"]) for raw in fill_list)
@@ -2923,9 +2889,8 @@ class BitgetFetcher(BaseFetcher):
                     detail_cache[event_id] = (event["client_order_id"], event.get("pb_order_type", ""))
                 events[event_id] = event
             if on_batch:
-                batch_events = [
-                    dict(events[i]) for i in batch_ids if events[i].get("client_order_id")
-                ]
+                # Match the complete returned history even without a clientOid.
+                batch_events = [dict(events[i]) for i in batch_ids]
                 if batch_events:
                     on_batch(batch_events)
             oldest = min(int(event["timestamp"]) for event in events.values() if event["id"] in batch_ids)
@@ -2961,19 +2926,19 @@ class BitgetFetcher(BaseFetcher):
         return event
 
     def _normalize_fill(self, raw: Dict[str, object]) -> Dict[str, object]:
-        timestamp = int(raw["cTime"])
+        timestamp = _fill_int(raw["cTime"])
         side, position_side = deduce_side_pside(raw)
         return {
             "id": raw.get("tradeId"),
             "order_id": raw.get("orderId"),
             "timestamp": timestamp,
-            "datetime": ts_to_date(timestamp),
+            "datetime": _fill_datetime(timestamp),
             "symbol": self._resolve_symbol(raw.get("symbol")),
             "symbol_external": raw.get("symbol"),
             "side": side,
-            "qty": float(raw.get("baseVolume", 0.0)),
-            "price": float(raw.get("price", 0.0)),
-            "pnl": float(raw.get("profit", 0.0)),
+            "qty": _fill_float(raw.get("baseVolume", 0.0)),
+            "price": _fill_float(raw.get("price", 0.0)),
+            "pnl": _fill_float(raw.get("profit", 0.0)),
             "fees": self._normalize_fee_detail(raw.get("feeDetail")),
             "pb_order_type": raw.get("pb_order_type", ""),
             "position_side": position_side,
@@ -3541,10 +3506,10 @@ class BinanceFetcher(BaseFetcher):
         self, entry: Dict[str, object], *, income_type: str = "REALIZED_PNL"
     ) -> Dict[str, object]:
         trade_id = entry.get("tradeId") or entry.get("id") or f"income-{entry.get('time')}"
-        timestamp = int(entry.get("time") or entry.get("timestamp") or 0)
+        timestamp = _fill_int(entry.get("time") or entry.get("timestamp") or 0)
         raw_symbol = entry.get("symbol")
         ccxt_symbol = self._resolve_symbol(raw_symbol)
-        income = float(entry.get("income") or entry.get("pnl") or 0.0)
+        income = _fill_float(entry.get("income") or entry.get("pnl") or 0.0)
         pnl = income if income_type == "REALIZED_PNL" else 0.0
         position_side = str(entry.get("positionSide") or entry.get("pside") or "unknown").lower()
         asset = str(entry.get("asset") or _quote_currency_from_symbol(ccxt_symbol) or "")
@@ -3554,7 +3519,7 @@ class BinanceFetcher(BaseFetcher):
         return {
             "id": str(trade_id),
             "timestamp": timestamp,
-            "datetime": ts_to_date(timestamp),
+            "datetime": _fill_datetime(timestamp),
             "symbol": ccxt_symbol,
             "side": entry.get("side") or "",
             "qty": 0.0,
@@ -3570,8 +3535,8 @@ class BinanceFetcher(BaseFetcher):
     def _normalize_trade(self, trade: Dict[str, object]) -> Dict[str, object]:
         info = trade.get("info") or {}
         trade_id = trade.get("id") or info.get("id")
-        timestamp = int(trade.get("timestamp") or info.get("time") or info.get("T") or 0)
-        pnl = float(info.get("realizedPnl") or trade.get("pnl") or 0.0)
+        timestamp = _fill_int(trade.get("timestamp") or info.get("time") or info.get("T") or 0)
+        pnl = _fill_float(info.get("realizedPnl") or trade.get("pnl") or 0.0)
         position_side = str(
             info.get("positionSide") or trade.get("position_side") or "unknown"
         ).lower()
@@ -3595,11 +3560,11 @@ class BinanceFetcher(BaseFetcher):
         return {
             "id": str(trade_id),
             "timestamp": timestamp,
-            "datetime": ts_to_date(timestamp),
+            "datetime": _fill_datetime(timestamp),
             "symbol": symbol or "",
             "side": trade.get("side") or "",
-            "qty": float(trade.get("amount") or trade.get("qty") or 0.0),
-            "price": float(trade.get("price") or 0.0),
+            "qty": _fill_float(trade.get("amount") or trade.get("qty") or 0.0),
+            "price": _fill_float(trade.get("price") or 0.0),
             "pnl": pnl,
             "fees": fees,
             "pb_order_type": "",
@@ -3666,7 +3631,6 @@ class FillEventsManager:
         user: str,
         fetcher: BaseFetcher,
         cache_path: Path,
-        rate_limit_coordinator: Optional[RateLimitCoordinator] = None,
         fee_pct_fallback: float = DEFAULT_FEE_PCT_FALLBACK,
         fee_pct_sanity_abs_max: float = DEFAULT_FEE_PCT_SANITY_ABS_MAX,
         fee_conversion_max_age_ms: int = DEFAULT_FEE_CONVERSION_MAX_AGE_MS,
@@ -3676,7 +3640,6 @@ class FillEventsManager:
         self.user = user
         self.fetcher = fetcher
         self.cache = FillEventCache(cache_path)
-        self.rate_limiter = rate_limit_coordinator or RateLimitCoordinator(exchange, user)
         self.fee_pct_fallback = float(fee_pct_fallback)
         self.fee_pct_sanity_abs_max = float(fee_pct_sanity_abs_max)
         self.fee_conversion_max_age_ms = int(fee_conversion_max_age_ms)
@@ -3690,9 +3653,13 @@ class FillEventsManager:
             if self.runtime_identity
             else {}
         )
-        self._fee_conversion_cache: Dict[Tuple[str, str], Optional[float]] = {}
+        # Pair -> (rate or failed lookup, fetch time, quote timestamp).
+        self._fee_conversion_cache: Dict[Tuple[str, str], Tuple[Optional[float], int, int]] = {}
         self._fee_warning_reported_ids: set[str] = set()
         self._events: List[FillEvent] = []
+        # A disposable proof that replay left this exact history unchanged.
+        # Own nested data too: frozen FillEvents still contain mutable raw/fee data.
+        self._empty_refresh_proof: Optional[Tuple[Tuple[float, float], List[FillEvent]]] = None
         self._loaded = False
         self._lock = asyncio.Lock()
         self._degraded_pnl_repair_attempted_keys: set[str] = set()
@@ -3731,11 +3698,28 @@ class FillEventsManager:
             return None
         cache_key = (fee_currency, quote_currency)
         if cache_key in self._fee_conversion_cache:
-            return self._fee_conversion_cache[cache_key]
+            rate, fetched_at_ms, quote_ts = self._fee_conversion_cache[cache_key]
+            age_ms = now_ms - fetched_at_ms
+            if rate is None:
+                # Failed lookups should recover promptly without retrying every fill.
+                retry_ms = min(self.fee_conversion_max_age_ms, 60_000)
+                if 0 <= age_ms < retry_ms:
+                    return None
+                self._fee_conversion_cache.pop(cache_key, None)
+            elif (
+                0 <= age_ms <= self.fee_conversion_max_age_ms
+                and abs(now_ms - quote_ts) <= self.fee_conversion_max_age_ms
+            ):
+                if fill_ts <= 0 or abs(quote_ts - int(fill_ts)) <= self.fee_conversion_max_age_ms:
+                    return rate
+                # This quote is still useful for other fills. A failed attempt
+                # to find one suitable for this timestamp must not evict it.
+            else:
+                self._fee_conversion_cache.pop(cache_key, None)
         api = getattr(self.fetcher, "api", None)
         fetch_ticker = getattr(api, "fetch_ticker", None)
         if fetch_ticker is None:
-            self._fee_conversion_cache[cache_key] = None
+            self._fee_conversion_cache.setdefault(cache_key, (None, now_ms, 0))
             return None
         symbols = [
             f"{fee_currency}/{quote_currency}",
@@ -3770,21 +3754,27 @@ class FillEventsManager:
             if not isinstance(ticker, dict):
                 continue
             ticker_ts = int(ticker.get("timestamp") or 0)
-            if (
-                ticker_ts > 0
-                and fill_ts > 0
-                and abs(ticker_ts - int(fill_ts)) > self.fee_conversion_max_age_ms
-            ):
+            quote_ts = ticker_ts if ticker_ts > 0 else now_ms
+            if abs(now_ms - quote_ts) > self.fee_conversion_max_age_ms:
                 continue
             for key in ("last", "close", "mark", "bid", "ask"):
                 try:
                     rate = float(ticker.get(key) or 0.0)
                 except Exception:
                     rate = 0.0
-                if rate > 0.0:
-                    self._fee_conversion_cache[cache_key] = rate
-                    return rate
-        self._fee_conversion_cache[cache_key] = None
+                if math.isfinite(rate) and rate > 0.0:
+                    # Quote freshness is pair-wide; suitability for this fill
+                    # is not. Retain a usable quote even when this fill is too
+                    # distant, so it cannot poison later fills' conversion.
+                    self._fee_conversion_cache[cache_key] = (rate, now_ms, quote_ts)
+                    if (
+                        fill_ts <= 0
+                        or abs(quote_ts - int(fill_ts)) <= self.fee_conversion_max_age_ms
+                    ):
+                        return rate
+                    break
+        if cache_key not in self._fee_conversion_cache:
+            self._fee_conversion_cache[cache_key] = (None, now_ms, 0)
         return None
 
     async def _apply_fee_policy_to_batch(self, batch: List[Dict[str, object]]) -> None:
@@ -3798,18 +3788,20 @@ class FillEventsManager:
         symbol_counts: Dict[str, int] = defaultdict(int)
         reason_counts: Dict[str, int] = defaultdict(int)
         examples = []
+        batch_rates: Dict[Tuple[str, str, int], Optional[float]] = {}
         for raw in batch:
             quote = _quote_currency_from_symbol(raw.get("symbol"))
             conversion_rates: Dict[str, float] = {}
-            for entry in _fee_entries(raw.get("fees")) + _fee_entries(raw.get("fee")):
-                currency = _fee_entry_currency(entry)
-                if not currency or currency == quote:
+            amounts, _ = _reported_fee_amounts_by_currency(
+                _fee_entries(raw.get("fees")) + _fee_entries(raw.get("fee"))
+            )
+            for currency, signed in amounts.items():
+                if not currency or currency == quote or signed == 0.0:
                     continue
-                rate = await self._fee_conversion_rate(
-                    currency,
-                    quote,
-                    int(raw.get("timestamp") or 0),
-                )
+                key = (currency, quote, int(raw.get("timestamp") or 0))
+                if key not in batch_rates:
+                    batch_rates[key] = await self._fee_conversion_rate(*key)
+                rate = batch_rates[key]
                 if rate is not None:
                     conversion_rates[currency] = rate
             meta = self._apply_fee_policy(raw, conversion_rates=conversion_rates)
@@ -3921,6 +3913,8 @@ class FillEventsManager:
             # Doctor mode loads legacy caches read-only first so backup/repair can
             # operate on the original files.
             if self._events and not allow_legacy_contract:
+                if self.exchange.lower() == "kucoin":
+                    self._run_kucoin_doctor({}, auto_repair=True)
                 payload = [ev.to_dict() for ev in self._events]
                 if self.exchange.lower() == "hyperliquid":
                     payload = _expand_hyperliquid_coalesced_events(payload)
@@ -3929,7 +3923,7 @@ class FillEventsManager:
                 ensure_qty_signage(payload)
                 order_same_timestamp_fills(payload)
                 compute_psize_pprice(payload)
-                apply_hyperliquid_raw_psize_overrides(payload)
+                apply_exchange_raw_position_overrides(payload)
                 synthesized_days = self._synthesize_missing_pnls(payload)
                 self._events = [FillEvent.from_dict(ev) for ev in payload]
                 normalized_days = {_day_key(ev.timestamp) for ev in self._events}
@@ -4376,10 +4370,16 @@ class FillEventsManager:
         currency = fee.get("currency") or fee.get("code")
         if currency:
             out["currency"] = str(currency)
+        raw_cost = fee.get("cost")
         try:
-            out["cost"] = float(fee.get("cost", 0.0))
-        except Exception:
-            out["cost"] = 0.0
+            cost = float(raw_cost)
+        except (TypeError, ValueError, OverflowError):
+            cost = None
+        out["cost"] = (
+            cost
+            if cost is not None and math.isfinite(cost) and not isinstance(raw_cost, bool)
+            else None
+        )
         if fee.get("rate") is not None:
             try:
                 out["rate"] = float(fee.get("rate"))
@@ -4764,7 +4764,7 @@ class FillEventsManager:
         ensure_qty_signage(payload)
         order_same_timestamp_fills(payload)
         compute_psize_pprice(payload)
-        apply_hyperliquid_raw_psize_overrides(payload)
+        apply_exchange_raw_position_overrides(payload)
         self._events = [FillEvent.from_dict(ev) for ev in payload]
         self.cache.save(self._events)
         self.cache.update_metadata_from_events(
@@ -4891,8 +4891,16 @@ class FillEventsManager:
             self.cache._data_files()
         )
         missing_fee_paid = [ev for ev in self._events if "fee_paid" not in ev.to_dict()]
-        anomaly_count = len(self._events) if legacy_contract else len(legacy_events) + len(missing_fee_paid)
-        report["legacy_contract"] = bool(legacy_contract)
+        trade_pnl_events = [
+            ev for ev in self._events if _kucoin_trade_pnl_needs_repair(ev.to_dict())
+        ]
+        contract_repair = bool(legacy_contract or legacy_events or missing_fee_paid)
+        anomaly_count = (
+            len(self._events)
+            if legacy_contract
+            else len({ev.id for ev in legacy_events + missing_fee_paid + trade_pnl_events})
+        )
+        report["legacy_contract"] = bool(legacy_contract or legacy_events)
         report["anomaly_events"] = anomaly_count
         if not anomaly_count:
             return report
@@ -4901,9 +4909,13 @@ class FillEventsManager:
                 "id": ev.id,
                 "symbol": ev.symbol,
                 "timestamp": ev.timestamp,
-                "reason": "legacy_or_missing_pnl_contract",
+                "reason": (
+                    "legacy_or_missing_pnl_contract"
+                    if contract_repair
+                    else "trade_pnl_mislabeled_authoritative"
+                ),
             }
-            for ev in self._events[:5]
+            for ev in (self._events if contract_repair else trade_pnl_events)[:5]
         ]
         if not auto_repair:
             return report
@@ -4912,7 +4924,20 @@ class FillEventsManager:
         payload = [ev.to_dict() for ev in self._events]
         ensure_qty_signage(payload)
         order_same_timestamp_fills(payload)
-        repaired_payload, degraded_count = self._repair_kucoin_payload_contract(payload)
+        if contract_repair:
+            repaired_payload, degraded_count = self._repair_kucoin_payload_contract(payload)
+        else:
+            for ev in payload:
+                self._apply_fee_policy(ev)
+                if _kucoin_trade_pnl_needs_repair(ev):
+                    ev["pnl_status"] = "pending"
+                    ev["pnl_source"] = PNL_SOURCE_PENDING
+            self._synthesize_missing_pnls(payload)
+            repaired_payload = payload
+            degraded_count = sum(
+                ev.get("pnl_source") == PNL_SOURCE_SYNTHETIC_DEGRADED
+                for ev in repaired_payload
+            )
         compute_psize_pprice(repaired_payload)
         self._events = [FillEvent.from_dict(ev) for ev in repaired_payload]
         self.cache.save(self._events)
@@ -5174,15 +5199,32 @@ class FillEventsManager:
         self._events = sorted(updated_map.values(), key=lambda ev: ev.timestamp)
         pnl_observations = list(getattr(self.fetcher, "pnl_observations", []) or [])
 
-        # Annotate psize/pprice for all events
-        if self._events:
+        # Empty successful fetches need not replay history once a full replay
+        # has demonstrated a fixed point. New rows (including duplicate fetches),
+        # PnL observations, policy changes and nested-data changes use the full path.
+        empty_refresh = not fetched_batches and not fetched_events and not pnl_observations
+        fee_policy = (self.fee_pct_fallback, self.fee_pct_sanity_abs_max)
+        proof = self._empty_refresh_proof
+        self._empty_refresh_proof = None
+        unchanged = bool(
+            empty_refresh
+            and proof is not None
+            and fee_policy == proof[0]
+            and self._events == proof[1]
+        )
+        before_replay = (
+            deepcopy(self._events) if empty_refresh and self._events and not unchanged else None
+        )
+
+        # Annotate psize/pprice for all events unless replay is proven redundant.
+        if self._events and not unchanged:
             payload = [ev.to_dict() for ev in self._events]
             for raw in payload:
                 self._apply_fee_policy(raw)
             ensure_qty_signage(payload)
             order_same_timestamp_fills(payload)
             compute_psize_pprice(payload)
-            apply_hyperliquid_raw_psize_overrides(payload)
+            apply_exchange_raw_position_overrides(payload)
             synthesized_days = self._synthesize_missing_pnls(payload)
             cycle_reconciled_days = self._reconcile_pnl_observations(payload, pnl_observations)
             self._events = [FillEvent.from_dict(ev) for ev in payload]
@@ -5210,6 +5252,13 @@ class FillEventsManager:
             # A successful bounded fetch proves the retried range even when the
             # exchange returns no new fills or only duplicates.
             self.cache.clear_gap(start_ms, end_ms)
+
+        # Retain proof only after all ordinary persistence/checkpoint work succeeds.
+        # Losing this cache (including restart) merely performs another full replay.
+        if unchanged:
+            self._empty_refresh_proof = proof
+        elif before_replay is not None and self._events == before_replay and not all_days_persisted:
+            self._empty_refresh_proof = (fee_policy, before_replay)
 
         # Consolidated refresh summary log
         # Only log at INFO when there are actually new fills; routine refreshes go to DEBUG
@@ -5261,7 +5310,7 @@ class FillEventsManager:
                 start_ms = self._events[idx].timestamp
         if last_refresh_overlap_ms is not None:
             metadata = self.cache.load_metadata()
-            last_refresh_ms = int(metadata.get("last_refresh_ms", 0) or 0)
+            last_refresh_ms = _cache_metadata_timestamp(metadata, "last_refresh_ms")
             if last_refresh_ms > 0:
                 metadata_start_ms = max(0, last_refresh_ms - int(last_refresh_overlap_ms))
                 if start_ms is None:
@@ -5663,9 +5712,21 @@ class FillEventsManager:
         """
         metadata = self.cache.load_metadata()
         history_scope = self.get_history_scope()
-        covered_start_ms = int(metadata.get("covered_start_ms", 0) or 0)
-        metadata_oldest = int(metadata.get("oldest_event_ts", 0) or 0)
-        metadata_newest = int(metadata.get("newest_event_ts", 0) or 0)
+        try:
+            covered_start_ms = _cache_metadata_timestamp(metadata, "covered_start_ms")
+            metadata_oldest = _cache_metadata_timestamp(metadata, "oldest_event_ts")
+            metadata_newest = _cache_metadata_timestamp(metadata, "newest_event_ts")
+        except FillEventCacheContractError:
+            # These bounds are cache evidence, not caller configuration. An
+            # unusable bound cannot prove coverage; zeroes below are diagnostic
+            # placeholders in an explicitly unavailable verdict only.
+            return {
+                "ready": False,
+                "reason": "malformed_cache_metadata",
+                "history_scope": history_scope,
+                "covered_start_ms": 0,
+                "oldest_event_ts": 0,
+            }
         status: Dict[str, object] = {
             "ready": False,
             "reason": "cache_not_loaded",
@@ -6299,13 +6360,13 @@ class BybitFetcher(BaseFetcher):
         info = trade.get("info", {})
         order_id = str(info.get("orderId", trade.get("order")))
         trade_id = str(trade.get("id") or info.get("execId") or order_id)
-        timestamp = int(trade.get("timestamp") or info.get("execTime", 0))
-        qty = float(trade.get("amount") or info.get("execQty", 0.0))
+        timestamp = _fill_int(trade.get("timestamp") or info.get("execTime", 0))
+        qty = _fill_float(trade.get("amount") or info.get("execQty", 0.0))
         side = str(trade.get("side") or info.get("side", "")).lower()
-        price = float(trade.get("price") or info.get("execPrice", 0.0))
-        closed_size = float(info.get("closedSize") or info.get("closeSize") or 0.0)
+        price = _fill_float(trade.get("price") or info.get("execPrice", 0.0))
+        closed_size = _fill_float(info.get("closedSize") or info.get("closeSize") or 0.0)
         position_side = BybitFetcher._determine_position_side(side, closed_size)
-        pnl = float(trade.get("pnl") or 0.0)
+        pnl = _fill_float(trade.get("pnl") or 0.0)
         client_order_id = info.get("orderLinkId") or trade.get("clientOrderId")
         fee = trade.get("fees") or trade.get("fee")
         symbol = trade.get("symbol") or info.get("symbol")
@@ -6314,7 +6375,7 @@ class BybitFetcher(BaseFetcher):
             "id": trade_id,
             "order_id": order_id,
             "timestamp": timestamp,
-            "datetime": ts_to_date(timestamp),
+            "datetime": _fill_datetime(timestamp),
             "symbol": symbol,
             "side": side,
             "qty": abs(qty),
@@ -6484,7 +6545,7 @@ class HyperliquidFetcher(BaseFetcher):
         info = trade.get("info", {}) or {}
         trade_id = str(trade.get("id") or info.get("hash") or info.get("tid") or "")
         order_id = str(trade.get("order") or info.get("oid") or "")
-        timestamp = int(
+        timestamp = _fill_int(
             trade.get("timestamp")
             or info.get("time")
             or info.get("tradeTime")
@@ -6493,10 +6554,12 @@ class HyperliquidFetcher(BaseFetcher):
         )
         symbol_raw = trade.get("symbol") or info.get("symbol") or info.get("coin")
         side = str(trade.get("side") or info.get("side") or "").lower()
-        qty = abs(float(trade.get("amount") or info.get("sz") or 0.0))
-        price = float(trade.get("price") or info.get("px") or 0.0)
-        pnl = float(trade.get("pnl") or info.get("closedPnl") or 0.0)
-        fee = trade.get("fee") or {"currency": info.get("feeToken"), "cost": info.get("fee")}
+        qty = abs(_fill_float(trade.get("amount") or info.get("sz") or 0.0))
+        price = _fill_float(trade.get("price") or info.get("px") or 0.0)
+        pnl = _fill_float(trade.get("pnl") or info.get("closedPnl") or 0.0)
+        fee = trade.get("fee")
+        if fee is None or (isinstance(fee, (dict, list, tuple)) and not fee):
+            fee = {"currency": info.get("feeToken"), "cost": info.get("fee")}
         client_order_id = trade.get("clientOrderId") or info.get("cloid") or info.get("clOrdId") or ""
         direction = str(info.get("dir", "")).lower()
         if "short" in direction:
@@ -6509,7 +6572,7 @@ class HyperliquidFetcher(BaseFetcher):
             "id": trade_id,
             "order_id": order_id,
             "timestamp": timestamp,
-            "datetime": ts_to_date(timestamp) if timestamp else "",
+            "datetime": _fill_datetime(timestamp) if timestamp else "",
             "symbol": str(symbol_raw or ""),
             "side": side,
             "qty": qty,
@@ -6520,7 +6583,7 @@ class HyperliquidFetcher(BaseFetcher):
             "position_side": position_side,
             "client_order_id": str(client_order_id or ""),
             "raw": [{"source": "fetch_my_trades", "data": trade}],
-            "c_mult": float(info.get("contractMultiplier") or info.get("multiplier") or 1.0),
+            "c_mult": _fill_float(info.get("contractMultiplier") or info.get("multiplier") or 1.0),
         }
 
 
@@ -6618,7 +6681,7 @@ class BitunixFetcher(BaseFetcher):
         info = trade.get("info") or {}
         trade_id = str(trade.get("id") or info.get("tradeId") or "")
         order_id = str(trade.get("order") or info.get("orderId") or "")
-        timestamp = int(trade.get("timestamp") or info.get("ctime") or 0)
+        timestamp = _fill_int(trade.get("timestamp") or info.get("ctime") or 0)
         symbol = str(trade.get("symbol") or "")
         side = str(trade.get("side") or "").lower()
         position_side = str(info.get("positionSide") or "").lower()
@@ -6632,11 +6695,11 @@ class BitunixFetcher(BaseFetcher):
             raise ValueError(
                 f"Bitunix fill has invalid positionSide: {position_side!r}"
             )
-        qty = abs(float(trade.get("amount") or info.get("qty") or 0.0))
-        price = float(trade.get("price") or info.get("price") or 0.0)
+        qty = abs(_fill_float(trade.get("amount") or info.get("qty") or 0.0))
+        price = _fill_float(trade.get("price") or info.get("price") or 0.0)
         if "realizedPNL" not in info:
             raise ValueError("Bitunix fill is missing realizedPNL")
-        pnl = float(info["realizedPNL"])
+        pnl = _fill_float(info["realizedPNL"])
         if not all(math.isfinite(value) for value in (qty, price, pnl)):
             raise ValueError("Bitunix fill has non-finite qty, price, or realizedPNL")
         if qty <= 0.0 or price <= 0.0:
@@ -6651,7 +6714,7 @@ class BitunixFetcher(BaseFetcher):
             "id": trade_id,
             "order_id": order_id,
             "timestamp": timestamp,
-            "datetime": ts_to_date(timestamp),
+            "datetime": _fill_datetime(timestamp),
             "symbol": symbol,
             "side": side,
             "qty": qty,
@@ -6755,7 +6818,7 @@ class WeexFetcher(BaseFetcher):
         info = trade.get("info") or {}
         trade_id = str(trade.get("id") or info.get("id") or "")
         order_id = str(trade.get("order") or info.get("orderId") or "")
-        timestamp = int(trade.get("timestamp") or info.get("time") or 0)
+        timestamp = _fill_int(trade.get("timestamp") or info.get("time") or 0)
         symbol = str(trade.get("symbol") or "")
         side = str(trade.get("side") or info.get("side") or "").lower()
         position_side = str(info.get("positionSide") or "").lower()
@@ -6770,11 +6833,11 @@ class WeexFetcher(BaseFetcher):
         client_order_id = str(
             trade.get("clientOrderId") or info.get("clientOrderId") or ""
         )
-        qty = abs(float(trade.get("amount") or info.get("qty") or 0.0))
-        price = float(trade.get("price") or info.get("price") or 0.0)
+        qty = abs(_fill_float(trade.get("amount") or info.get("qty") or 0.0))
+        price = _fill_float(trade.get("price") or info.get("price") or 0.0)
         if "realizedPnl" not in info:
             raise ValueError("WEEX fill is missing realizedPnl")
-        pnl = float(info["realizedPnl"])
+        pnl = _fill_float(info["realizedPnl"])
         if not all(math.isfinite(value) for value in (qty, price, pnl)):
             raise ValueError("WEEX fill has non-finite qty, price, or realizedPnl")
         if qty <= 0.0 or price <= 0.0:
@@ -6783,7 +6846,7 @@ class WeexFetcher(BaseFetcher):
             "id": trade_id,
             "order_id": order_id,
             "timestamp": timestamp,
-            "datetime": ts_to_date(timestamp),
+            "datetime": _fill_datetime(timestamp),
             "symbol": symbol,
             "side": side,
             "qty": qty,
@@ -7033,8 +7096,11 @@ class GateioFetcher(BaseFetcher):
             # Small delay to avoid rate limits
             await asyncio.sleep(0.15)
 
-        if fetch_count >= max_fetches:
-            logger.warning("GateioFetcher._fetch_trades: reached pagination cap (%d)", max_fetches)
+        else:
+            raise RuntimeError(
+                "GateioFetcher._fetch_trades: incomplete history after "
+                f"pagination cap ({max_fetches})"
+            )
 
         return list(collected.values())
 
@@ -7050,7 +7116,7 @@ class GateioFetcher(BaseFetcher):
         """
         # Parse timestamp from float seconds to ms
         create_time = raw.get("create_time", 0)
-        timestamp_ms = int(float(create_time) * 1000) if create_time else 0
+        timestamp_ms = _fill_int(_fill_float(create_time) * 1000) if create_time else 0
 
         # Get contract and convert to CCXT symbol format (e.g., BNB_USDT -> BNB/USDT:USDT)
         contract = str(raw.get("contract") or "")
@@ -7058,11 +7124,11 @@ class GateioFetcher(BaseFetcher):
         c_mult = _market_contract_size(self.api, symbol=symbol, market_id=contract)
 
         # Determine side from size sign (positive = buy, negative = sell)
-        size = float(raw.get("size") or 0)
+        size = _fill_float(raw.get("size") or 0)
         side = "buy" if size >= 0 else "sell"
 
         # Build fee structure
-        fee_cost = float(raw.get("fee") or 0)
+        fee_cost = _fill_float(raw.get("fee") or 0)
         fee = {"cost": fee_cost, "currency": "USDT"} if fee_cost else None
 
         return {
@@ -7072,7 +7138,7 @@ class GateioFetcher(BaseFetcher):
             "symbol": symbol,
             "side": side,
             "amount": abs(size),
-            "price": float(raw.get("price") or 0),
+            "price": _fill_float(raw.get("price") or 0),
             "fee": fee,
             "c_mult": c_mult,
             "info": raw,  # Keep raw data for _normalize_trade to access
@@ -7162,17 +7228,14 @@ class GateioFetcher(BaseFetcher):
         order_id = str(trade.get("order") or info.get("order_id") or "")
 
         ts_raw = trade.get("timestamp") or info.get("create_time") or 0
-        try:
-            timestamp = int(ensure_millis(float(ts_raw)))
-        except Exception:
-            timestamp = int(float(ts_raw)) if ts_raw else 0
+        timestamp = _fill_int(_fill_number(_fill_float(ts_raw), ensure_millis))
 
         symbol = str(trade.get("symbol") or info.get("contract") or "")
         side = str(trade.get("side") or info.get("side") or "").lower()
-        qty = abs(float(trade.get("amount") or info.get("size") or 0.0))
-        price = float(trade.get("price") or info.get("price") or 0.0)
+        qty = abs(_fill_float(trade.get("amount") or info.get("size") or 0.0))
+        price = _fill_float(trade.get("price") or info.get("price") or 0.0)
         fee = trade.get("fee")
-        c_mult = float(trade.get("c_mult") or info.get("c_mult") or 1.0)
+        c_mult = _fill_float(trade.get("c_mult") or info.get("c_mult") or 1.0)
 
         # Distribute PnL proportionally
         proportion = qty / total_qty if total_qty > 0 else 0
@@ -7192,7 +7255,7 @@ class GateioFetcher(BaseFetcher):
                 detail_cache[trade_id] = (client_order_id, pb_type)
 
         # Determine position side
-        close_size = float(info.get("close_size", 0))
+        close_size = _fill_float(info.get("close_size", 0))
         is_reduce_only = order.get("reduceOnly", False) or order_info.get("is_reduce_only", False)
         is_close = close_size > 0 or is_reduce_only or abs(order_pnl) > 0
         position_side = self._determine_position_side(side, is_close)
@@ -7201,7 +7264,7 @@ class GateioFetcher(BaseFetcher):
             "id": trade_id,
             "order_id": order_id,
             "timestamp": timestamp,
-            "datetime": ts_to_date(timestamp) if timestamp else "",
+            "datetime": _fill_datetime(timestamp) if timestamp else "",
             "symbol": symbol,
             "side": side,
             "qty": qty,
@@ -7260,7 +7323,7 @@ class KucoinFetcher(BaseFetcher):
         trades = await self._fetch_trades(since_ms, until_ms)
         trade_elapsed = time.time() - fetch_started
         logger.log(
-            logging.INFO if trades or trade_elapsed >= 10.0 else logging.DEBUG,
+            logging.INFO if trade_elapsed >= 10.0 else logging.DEBUG,
             "KucoinFetcher: fetched %d trade events in %.1fs",
             len(trades),
             trade_elapsed,
@@ -7272,34 +7335,30 @@ class KucoinFetcher(BaseFetcher):
         # are stored separately as signed balance cashflow in fee_paid.
         local_pnls, _ = compute_realized_pnls_from_trades(trades)
 
-        closes = [
-            t
-            for t in trades
-            if (t["side"] == "sell" and t["position_side"] == "long")
-            or (t["side"] == "buy" and t["position_side"] == "short")
-        ]
+        closes = [t for t in trades if _is_kucoin_close(t)]
         events: Dict[str, Dict[str, object]] = {}
         for t in trades:
             ev = dict(t)
             ev["fee_paid"] = signed_fee_paid_from_payload(ev)
             ev["pnl"] = local_pnls.get(ev["id"], 0.0)
-            ev["pnl_status"] = "pending" if _is_close_payload(ev) else "complete"
+            ev["pnl_status"] = "pending" if _is_kucoin_close(ev) else "complete"
             if ev["pnl_status"] == "pending":
                 ev["pnl_source"] = PNL_SOURCE_PENDING
             events[ev["id"]] = ev
 
         if closes:
             ph_started = time.time()
-            logger.info(
+            logger.debug(
                 "KucoinFetcher: fetching positions history for %d close fills",
                 len(closes),
             )
             ph_start_ms, ph_end_ms = self._positions_history_window(closes, self._now_func())
             ph = await self._fetch_positions_history(start_ms=ph_start_ms, end_ms=ph_end_ms)
-            logger.info(
+            ph_elapsed = time.time() - ph_started
+            logger.log(
+                logging.INFO if ph_elapsed >= 10.0 else logging.DEBUG,
                 "KucoinFetcher: fetched %d positions-history rows in %.1fs",
-                len(ph),
-                time.time() - ph_started,
+                len(ph), ph_elapsed,
             )
             self.pnl_observations = [
                 obs for pos in ph if (obs := self._position_history_observation(pos)) is not None
@@ -7364,7 +7423,7 @@ class KucoinFetcher(BaseFetcher):
                 start_at += buffer_ms
                 continue
 
-            batch_sorted = sorted(batch, key=lambda x: x.get("timestamp", 0))
+            batch_sorted = sorted(batch, key=lambda x: _fill_float(x.get("timestamp", 0)))
             for trade in batch_sorted:
                 event = self._normalize_trade(trade)
                 ts = event["timestamp"]
@@ -7373,14 +7432,17 @@ class KucoinFetcher(BaseFetcher):
                 key = (event.get("id") or "", event.get("order_id") or "")
                 collected[key] = event
 
-            last_ts = int(batch_sorted[-1].get("timestamp", start_at))
+            last_ts = _fill_int(batch_sorted[-1].get("timestamp", start_at))
             if last_ts <= start_at:
                 start_at = start_at + buffer_ms
             else:
                 start_at = last_ts + 1
 
-        if fetch_count >= max_fetches:
-            logger.warning("KucoinFetcher._fetch_trades: reached pagination cap (%d)", max_fetches)
+        if start_at < until_ts:
+            raise RuntimeError(
+                "KucoinFetcher._fetch_trades: incomplete history after "
+                f"{fetch_count} fetches"
+            )
 
         return sorted(collected.values(), key=lambda ev: ev["timestamp"])
 
@@ -7428,9 +7490,10 @@ class KucoinFetcher(BaseFetcher):
             else:
                 start_at = last_ts + 1
 
-        if fetch_count >= max_fetches:
-            logger.warning(
-                "KucoinFetcher._fetch_positions_history: reached pagination cap (%d)", max_fetches
+        if start_at < until_ts:
+            raise RuntimeError(
+                "KucoinFetcher._fetch_positions_history: incomplete history after "
+                f"{fetch_count} fetches"
             )
 
         return sorted(results.values(), key=lambda x: x.get("lastUpdateTimestamp", 0))
@@ -7661,20 +7724,16 @@ class KucoinFetcher(BaseFetcher):
             or info.get("updatedTime")
             or 0
         )
-        try:
-            timestamp = int(ensure_millis(float(ts_raw)))
-        except Exception:
-            try:
-                timestamp = int(float(ts_raw))
-            except Exception:
-                timestamp = 0
+        timestamp = _fill_int(_fill_number(_fill_float(ts_raw), ensure_millis))
+        if timestamp <= 0:
+            raise FillEventDataError("KuCoin fill timestamp must be positive")
         symbol = str(trade.get("symbol") or "")
         side = str(trade.get("side") or info.get("side") or "").lower()
-        qty = abs(float(trade.get("amount") or info.get("size") or info.get("amount") or 0.0))
-        price = float(trade.get("price") or info.get("price") or 0.0)
+        qty = abs(_fill_float(trade.get("amount") or info.get("size") or info.get("amount") or 0.0))
+        price = _fill_float(trade.get("price") or info.get("price") or 0.0)
         fee = trade.get("fees") or trade.get("fee")
         reduce_only = bool(trade.get("reduceOnly") or info.get("closeOrder") or False)
-        close_fee_pay = float(info.get("closeFeePay") or 0.0)
+        close_fee_pay = _fill_float(info.get("closeFeePay") or 0.0)
         position_side = KucoinFetcher._determine_position_side(side, reduce_only, close_fee_pay)
         raw_payload = [{"source": "fetch_my_trades", "data": dict(trade)}]
 
@@ -7682,7 +7741,7 @@ class KucoinFetcher(BaseFetcher):
             "id": trade_id,
             "order_id": order_id,
             "timestamp": timestamp,
-            "datetime": ts_to_date(timestamp) if timestamp else "",
+            "datetime": _fill_datetime(timestamp) if timestamp else "",
             "symbol": symbol,
             "side": side,
             "qty": qty,
@@ -8128,7 +8187,7 @@ class OkxFetcher(BaseFetcher):
         """Normalize a raw OKX fill to the canonical fill event format."""
         trade_id = str(raw.get("tradeId") or "")
         order_id = str(raw.get("ordId") or "")
-        timestamp = int(raw.get("ts") or raw.get("fillTime") or 0)
+        timestamp = _fill_int(raw.get("ts") or raw.get("fillTime") or 0)
         inst_id = str(raw.get("instId") or "")
 
         # Convert instId (e.g., "BTC-USDT-SWAP") to CCXT symbol format
@@ -8145,9 +8204,9 @@ class OkxFetcher(BaseFetcher):
                 symbol = f"{base}/{quote}:{quote}"
 
         side = str(raw.get("side") or "").lower()
-        qty = abs(float(raw.get("fillSz") or 0.0))
-        price = float(raw.get("fillPx") or 0.0)
-        pnl = float(raw.get("fillPnl") or 0.0)
+        qty = abs(_fill_float(raw.get("fillSz") or 0.0))
+        price = _fill_float(raw.get("fillPx") or 0.0)
+        pnl = _fill_float(raw.get("fillPnl") or 0.0)
         c_mult = _market_contract_size(self.api, symbol=symbol, market_id=inst_id)
 
         # Position side handling (supports both hedge and net modes)
@@ -8168,20 +8227,26 @@ class OkxFetcher(BaseFetcher):
 
         client_order_id = str(raw.get("clOrdId") or "")
         fee_ccy = str(raw.get("feeCcy") or "")
-        fee_amt = float(raw.get("fee") or 0.0)
+        raw_fee = raw.get("fee")
+        try:
+            fee_amt = _fill_float(raw_fee)
+        except (TypeError, ValueError, OverflowError):
+            fee_amt = None
+        if isinstance(raw_fee, bool) or (fee_amt is not None and not math.isfinite(fee_amt)):
+            fee_amt = None
         fee = None
         if fee_ccy:
             fee = {
                 "currency": fee_ccy,
-                "cost": abs(fee_amt),
-                "type": "rebate" if fee_amt > 0.0 else "fee",
+                "cost": abs(fee_amt) if fee_amt is not None else None,
+                "type": "rebate" if fee_amt is not None and fee_amt > 0.0 else "fee",
             }
 
         return {
             "id": trade_id,
             "order_id": order_id,
             "timestamp": timestamp,
-            "datetime": ts_to_date(timestamp) if timestamp else "",
+            "datetime": _fill_datetime(timestamp) if timestamp else "",
             "symbol": symbol,
             "side": side,
             "qty": qty,
@@ -8254,6 +8319,7 @@ EXCHANGE_BOT_CLASSES: Dict[str, Tuple[str, str]] = {
     "kucoin": ("exchanges.kucoin", "KucoinBot"),
     "okx": ("exchanges.okx", "OKXBot"),
     "weex": ("exchanges.weex", "WeexBot"),
+    "lighter": ("exchanges.lighter", "LighterBot"),
 }
 
 
@@ -8417,10 +8483,14 @@ def _build_fetcher_for_bot(bot, symbols: List[str]) -> BaseFetcher:
         return KucoinFetcher(api=bot.cca)
     if exchange == "okx":
         return OkxFetcher(api=bot.cca)
+    if exchange == "lighter":
+        from exchanges.lighter_fill_events import LighterFetcher
+
+        return LighterFetcher(api=bot.cca)
     if exchange == "weex":
         return WeexFetcher(api=bot.cca)
     supported = (
-        "binance, bitget, bitunix, bybit, fake, gateio, hyperliquid, kucoin, okx, weex"
+        "binance, bitget, bitunix, bybit, fake, gateio, hyperliquid, kucoin, lighter, okx, weex"
     )
     raise ValueError(
         f"Unsupported exchange '{exchange}' for live fill events; realized PnL, "

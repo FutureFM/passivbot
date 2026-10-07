@@ -136,9 +136,7 @@ async def test_reconciliation_trace_distinguishes_satisfied_and_no_candidate():
     assert to_create == []
     data = bot._fresh_entry_eligibility_trace.to_event_data()
     assert data["records"][0]["outcome"] == "already_satisfied"
-    assert data["records"][0]["reason_counts"] == {
-        "exact_reconciliation_match": 1
-    }
+    assert data["records"][0]["reason_counts"] == {"exact_reconciliation_match": 1}
 
     empty_bot = _reconciliation_bot(symbol, [])
     await reconciler.calc_orders_to_cancel_and_create_from_ideal(
@@ -146,9 +144,7 @@ async def test_reconciliation_trace_distinguishes_satisfied_and_no_candidate():
     )
     empty_data = empty_bot._fresh_entry_eligibility_trace.to_event_data()
     assert empty_data["records"][0]["outcome"] == "no_candidate"
-    assert empty_data["records"][0]["reason_counts"] == {
-        "rust_no_initial_candidate": 1
-    }
+    assert empty_data["records"][0]["reason_counts"] == {"rust_no_initial_candidate": 1}
 
 
 @pytest.mark.asyncio
@@ -195,6 +191,7 @@ async def test_malformed_open_order_snapshot_blocks_every_account_action():
 
 
 class _CreateBot:
+    _request_authoritative_confirmation = Passivbot._request_authoritative_confirmation
     _ensure_freshness_ledger = Passivbot._ensure_freshness_ledger
 
     def __init__(self, trace: FreshEntryEligibilityTrace):
@@ -226,9 +223,21 @@ class _CreateBot:
     def _resolve_pb_order_type(self, order):
         return str(order.get("pb_order_type") or "unknown")
 
+    def _build_order_params(self, _order):
+        return {}
+
+    def _emit_execution_connector_call_started_event(self, **_kwargs):
+        return None
+
     async def execute_orders(self, orders):
+        from types import SimpleNamespace
+
+        async def create_order(**_params):
+            return {"id": "created"}
+
+        self.cca = SimpleNamespace(create_order=create_order)
         self.submitted = list(orders)
-        return [{"id": "created", **order} for order in orders]
+        return [await Passivbot.execute_order(self, order) for order in orders]
 
     def did_create_order(self, _result):
         return True
@@ -250,6 +259,9 @@ class _CreateBot:
 async def test_final_batch_cap_classifies_eligible_and_blocked_without_changing_submission(
     monkeypatch,
 ):
+    from live.hsl_live import Owner
+
+    monkeypatch.setattr(Owner, "admit", lambda self, order: True)
     first = _initial("ADA/USDT:USDT")
     second = _initial("BTC/USDT:USDT")
     trace = FreshEntryEligibilityTrace()
@@ -259,8 +271,12 @@ async def test_final_batch_cap_classifies_eligible_and_blocked_without_changing_
     bot = _CreateBot(trace)
     emitted = []
 
-    monkeypatch.setattr(Passivbot, "_record_emitted_order_custom_id", lambda *args, **kwargs: None)
-    monkeypatch.setattr(Passivbot, "_emit_execution_order_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        Passivbot, "_record_emitted_order_custom_id", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        Passivbot, "_emit_execution_order_event", lambda *args, **kwargs: None
+    )
     monkeypatch.setattr(
         Passivbot,
         "_emit_initial_entry_eligibility_event",
@@ -272,9 +288,7 @@ async def test_final_batch_cap_classifies_eligible_and_blocked_without_changing_
     assert bot.submitted == [first]
     assert len(result) == 1
     assert len(emitted) == 1
-    records = {
-        item["symbol"]: item for item in emitted[0][0]["records"]
-    }
+    records = {item["symbol"]: item for item in emitted[0][0]["records"]}
     assert records[first["symbol"]]["outcome"] == "eligible"
     assert records[second["symbol"]]["outcome"] == "blocked_candidate"
     assert records[second["symbol"]]["reason_counts"] == {"batch_capacity": 1}
@@ -302,7 +316,9 @@ def test_fresh_entry_trace_recorder_diagnostic_bounds_hostile_exception_type(cap
     records = [
         record
         for record in caplog.records
-        if record.getMessage().startswith("[entry] fresh-entry eligibility trace disabled")
+        if record.getMessage().startswith(
+            "[entry] fresh-entry eligibility trace disabled"
+        )
     ]
     assert [(record.levelno, record.getMessage()) for record in records] == [
         (
@@ -345,7 +361,9 @@ def test_fresh_entry_payload_diagnostic_bounds_hostile_exception_type(caplog):
     records = [
         record
         for record in caplog.records
-        if record.getMessage().startswith("[entry] fresh-entry eligibility payload build failed")
+        if record.getMessage().startswith(
+            "[entry] fresh-entry eligibility payload build failed"
+        )
     ]
     assert [(record.levelno, record.getMessage()) for record in records] == [
         (
@@ -390,7 +408,9 @@ def test_fresh_entry_event_emission_diagnostic_bounds_hostile_exception_type(cap
     records = [
         record
         for record in caplog.records
-        if record.getMessage().startswith("[entry] fresh-entry eligibility event emission failed")
+        if record.getMessage().startswith(
+            "[entry] fresh-entry eligibility event emission failed"
+        )
     ]
     assert [(record.levelno, record.getMessage()) for record in records] == [
         (
@@ -511,9 +531,10 @@ async def test_pre_create_market_filter_records_exact_existing_gate_reasons():
     planning_bot = MarketBot(
         invalid=[{"surface": "positions", "reason": "epoch_too_old"}]
     )
-    assert await market_data.filter_fresh_market_snapshot_creations(
-        planning_bot, [order]
-    ) == []
+    assert (
+        await market_data.filter_fresh_market_snapshot_creations(planning_bot, [order])
+        == []
+    )
     planning_record = planning_bot._fresh_entry_eligibility_trace.to_event_data()[
         "records"
     ][0]
@@ -522,9 +543,12 @@ async def test_pre_create_market_filter_records_exact_existing_gate_reasons():
     }
 
     unavailable_bot = MarketBot(snapshot_error=RuntimeError("unavailable"))
-    assert await market_data.filter_fresh_market_snapshot_creations(
-        unavailable_bot, [order]
-    ) == []
+    assert (
+        await market_data.filter_fresh_market_snapshot_creations(
+            unavailable_bot, [order]
+        )
+        == []
+    )
     unavailable_record = unavailable_bot._fresh_entry_eligibility_trace.to_event_data()[
         "records"
     ][0]
@@ -533,15 +557,14 @@ async def test_pre_create_market_filter_records_exact_existing_gate_reasons():
     }
 
     distance_bot = MarketBot()
-    assert await market_data.filter_fresh_market_snapshot_creations(
-        distance_bot, [order]
-    ) == []
+    assert (
+        await market_data.filter_fresh_market_snapshot_creations(distance_bot, [order])
+        == []
+    )
     distance_record = distance_bot._fresh_entry_eligibility_trace.to_event_data()[
         "records"
     ][0]
-    assert distance_record["reason_counts"] == {
-        "limit_order_create_market_distance": 1
-    }
+    assert distance_record["reason_counts"] == {"limit_order_create_market_distance": 1}
 
 
 def test_disabled_generic_distance_guard_still_annotates_churn_distance():
@@ -566,19 +589,28 @@ def test_disabled_generic_distance_guard_still_annotates_churn_distance():
 
 @pytest.mark.asyncio
 async def test_eligibility_emitter_failure_cannot_change_connector_batch(monkeypatch):
+    from live.hsl_live import Owner
+
+    monkeypatch.setattr(Owner, "admit", lambda self, order: True)
     order = _initial("BTC/USDT:USDT")
     trace = FreshEntryEligibilityTrace()
     trace.record_ideal_orders([order])
     trace.record_evaluated(order["symbol"], "long")
     bot = _CreateBot(trace)
 
-    monkeypatch.setattr(Passivbot, "_record_emitted_order_custom_id", lambda *args, **kwargs: None)
-    monkeypatch.setattr(Passivbot, "_emit_execution_order_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        Passivbot, "_record_emitted_order_custom_id", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        Passivbot, "_emit_execution_order_event", lambda *args, **kwargs: None
+    )
 
     def fail_emission(*args, **kwargs):
         raise RuntimeError("diagnostic sink failed")
 
-    monkeypatch.setattr(Passivbot, "_emit_initial_entry_eligibility_event", fail_emission)
+    monkeypatch.setattr(
+        Passivbot, "_emit_initial_entry_eligibility_event", fail_emission
+    )
 
     result = await executor.execute_orders_parent(bot, [order])
 
@@ -591,21 +623,42 @@ async def test_eligibility_emitter_failure_cannot_change_connector_batch(monkeyp
 async def test_connector_bound_create_attempt_is_counted_once_even_when_ambiguous(
     monkeypatch,
 ):
+    from live.hsl_live import Owner
+
+    monkeypatch.setattr(Owner, "admit", lambda self, order: True)
     order = _initial("BTC/USDT:USDT")
     bot = _CreateBot(FreshEntryEligibilityTrace())
     bot._order_churn_gate_state = OrderChurnGateState()
 
-    async def fail_batch(_orders):
+    from types import SimpleNamespace
+
+    async def fail_create(**_params):
         raise RuntimeError("ambiguous connector failure")
 
+    async def fail_batch(orders):
+        return [await Passivbot.execute_order(bot, order) for order in orders]
+
+    bot.cca = SimpleNamespace(create_order=fail_create)
+    bot._build_order_params = lambda _order: {}
+    bot._record_emitted_order_custom_id = lambda *args, **kwargs: None
+    bot._record_order_churn_allowance_attempts = (
+        lambda count, **kwargs: Passivbot._record_order_churn_allowance_attempts(
+            bot, count, **kwargs
+        )
+    )
+    bot._emit_execution_connector_call_started_event = lambda **kwargs: None
     bot.execute_orders = fail_batch
     bot.add_to_recent_order_executions = lambda _order: None
     emitted = []
     bot._emit_order_churn_actions_accounted_event = lambda **kwargs: emitted.append(
         kwargs
     )
-    monkeypatch.setattr(Passivbot, "_record_emitted_order_custom_id", lambda *args, **kwargs: None)
-    monkeypatch.setattr(Passivbot, "_emit_execution_order_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        Passivbot, "_record_emitted_order_custom_id", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        Passivbot, "_emit_execution_order_event", lambda *args, **kwargs: None
+    )
 
     with pytest.raises(RuntimeError, match="ambiguous connector failure"):
         await executor.execute_orders_parent(bot, [order])
@@ -616,6 +669,72 @@ async def test_connector_bound_create_attempt_is_counted_once_even_when_ambiguou
             "action_count": 1,
             "action_kind": "create",
             "rolling_count": 1,
-            "wave": {"event_id": "ow_1"},
+            "wave": {
+                "event_id": "ow_1",
+                "requested_confirmations": {
+                    "balance": 1,
+                    "open_orders": 1,
+                    "positions": 1,
+                },
+            },
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_restart_after_mixed_create_results_omits_unclassified_eligibility(
+    monkeypatch,
+):
+    from live.hsl_live import Owner
+
+    monkeypatch.setattr(Owner, "admit", lambda self, order: True)
+    from types import MethodType, SimpleNamespace
+    from exchanges.ccxt_bot import CCXTBot
+    from passivbot_exceptions import RestartBotException
+
+    orders = [_initial("ADA/USDT:USDT"), _initial("BTC/USDT:USDT")]
+    for order in orders:
+        order["_planned_account_invalidation_generation"] = 0
+    trace = FreshEntryEligibilityTrace()
+    trace.record_ideal_orders(orders)
+    for order in orders:
+        trace.record_evaluated(order["symbol"], "long")
+    bot = _CreateBot(trace)
+    live_value = bot.live_value
+    bot.live_value = lambda key: (
+        2 if key == "max_n_creations_per_batch" else live_value(key)
+    )
+    bot.execute_order = MethodType(Passivbot.execute_order, bot)
+    bot.execute_orders = MethodType(CCXTBot.execute_orders, bot)
+    connector_calls = []
+
+    async def fail_create(**params):
+        connector_calls.append(params)
+        bot._account_invalidation_generation = 1
+        raise RuntimeError("connector write failed")
+
+    async def exhaust_error_budget(failures):
+        assert len(failures) == 1
+        raise RestartBotException("restart required")
+
+    bot.cca = SimpleNamespace(create_order=fail_create)
+    bot._handle_order_write_failures = exhaust_error_budget
+    emitted = []
+    monkeypatch.setattr(
+        Passivbot, "_record_emitted_order_custom_id", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        Passivbot, "_emit_execution_order_event", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        Passivbot,
+        "_emit_initial_entry_eligibility_event",
+        lambda *args, **kwargs: emitted.append(kwargs),
+    )
+
+    with pytest.raises(RestartBotException, match="restart required"):
+        await executor.execute_orders_parent(bot, orders)
+
+    assert len(connector_calls) == 1
+    assert emitted == []
+    assert bot._fresh_entry_eligibility_trace is None

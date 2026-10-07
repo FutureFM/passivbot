@@ -20,21 +20,15 @@ fn extend_nonzero(out: &mut Vec<Order>, orders: Vec<Order>) {
 }
 
 #[inline]
-fn would_fill_next_candle(low: f64, high: f64, qty: f64, price: f64) -> bool {
-    if qty > 0.0 {
-        low < price
-    } else if qty < 0.0 {
-        high > price
-    } else {
-        false
-    }
+fn would_fill_next_candle(low: f64, high: f64, qty: f64, price: f64, buffer: f64) -> bool {
+    crate::limit_fills::crosses_limit(low, high, qty, price, buffer)
 }
 
 #[inline]
-fn any_order_would_fill_next_candle(low: f64, high: f64, orders: &[Order]) -> bool {
+fn any_order_would_fill_next_candle(low: f64, high: f64, orders: &[Order], buffer: f64) -> bool {
     orders
         .iter()
-        .any(|order| would_fill_next_candle(low, high, order.qty, order.price))
+        .any(|order| would_fill_next_candle(low, high, order.qty, order.price, buffer))
 }
 
 pub fn generate_orders(side: StrategySide, request: StrategyRequest<'_>) -> GeneratedOrders {
@@ -97,6 +91,7 @@ pub fn generate_orders(side: StrategySide, request: StrategyRequest<'_>) -> Gene
                             next.high,
                             next_entry.qty,
                             next_entry.price,
+                            next.limit_order_fill_buffer_pct,
                         );
                     if expand_entries {
                         extend_nonzero(
@@ -179,7 +174,12 @@ pub fn generate_orders(side: StrategySide, request: StrategyRequest<'_>) -> Gene
                             request.position,
                             request.trailing,
                         );
-                        if any_order_would_fill_next_candle(next.low, next.high, &closes) {
+                        if any_order_would_fill_next_candle(
+                            next.low,
+                            next.high,
+                            &closes,
+                            next.limit_order_fill_buffer_pct,
+                        ) {
                             extend_nonzero(&mut generated.closes, closes);
                         } else {
                             push_if_nonzero(&mut generated.closes, next_close);
@@ -249,6 +249,7 @@ pub fn generate_orders(side: StrategySide, request: StrategyRequest<'_>) -> Gene
                             next.high,
                             next_entry.qty,
                             next_entry.price,
+                            next.limit_order_fill_buffer_pct,
                         );
                     if expand_entries {
                         extend_nonzero(
@@ -331,7 +332,12 @@ pub fn generate_orders(side: StrategySide, request: StrategyRequest<'_>) -> Gene
                             request.position,
                             request.trailing,
                         );
-                        if any_order_would_fill_next_candle(next.low, next.high, &closes) {
+                        if any_order_would_fill_next_candle(
+                            next.low,
+                            next.high,
+                            &closes,
+                            next.limit_order_fill_buffer_pct,
+                        ) {
                             extend_nonzero(&mut generated.closes, closes);
                         } else {
                             push_if_nonzero(&mut generated.closes, next_close);
@@ -397,6 +403,7 @@ mod tests {
             position,
             trailing,
             next_candle: Some(NextStepHint {
+                limit_order_fill_buffer_pct: 0.0,
                 low: next_low,
                 high: next_high,
                 tradable: true,
@@ -456,6 +463,16 @@ mod tests {
         assert_eq!(generated.closes.len(), 10);
         assert_eq!(generated.closes[0].price, 101.1);
         assert_eq!(generated.closes[9].price, 102.0);
+        let mut buffered_request = recursive_close_request(
+            &exchange, &state, &bot, &params, &position, &trailing, 0.0, 101.55,
+        );
+        buffered_request
+            .next_candle
+            .as_mut()
+            .unwrap()
+            .limit_order_fill_buffer_pct = 0.01;
+        let buffered = generate_orders(StrategySide::Long, buffered_request);
+        assert_eq!(buffered.closes.len(), 1);
     }
 
     #[test]
@@ -509,5 +526,100 @@ mod tests {
         assert_eq!(generated.closes.len(), 10);
         assert_eq!(generated.closes[0].price, 98.9);
         assert_eq!(generated.closes[9].price, 98.0);
+        let mut buffered_request = recursive_close_request(
+            &exchange, &state, &bot, &params, &position, &trailing, 98.05, 200.0,
+        );
+        buffered_request
+            .next_candle
+            .as_mut()
+            .unwrap()
+            .limit_order_fill_buffer_pct = 0.01;
+        let buffered = generate_orders(StrategySide::Short, buffered_request);
+        assert_eq!(buffered.closes.len(), 1);
+    }
+
+    #[test]
+    fn trailing_close_touch_is_quantized_before_every_peek_path() {
+        use crate::strategies::PeekBehavior;
+        for side in [StrategySide::Long, StrategySide::Short] {
+            let long = matches!(side, StrategySide::Long);
+            // A raw touch would fill the next candle, but its nearest tick would not.
+            let touch = if long { 101.006 } else { 98.994 };
+            let tick = if long { 101.01 } else { 98.99 };
+            let exchange = ExchangeParams {
+                qty_step: 0.01,
+                price_step: 0.01,
+                min_qty: 0.01,
+                min_cost: 0.0,
+                c_mult: 1.0,
+                ..Default::default()
+            };
+            let state = StateParams {
+                balance: 1000.0,
+                order_book: OrderBook {
+                    ask: touch,
+                    bid: touch,
+                },
+                ..Default::default()
+            };
+            let bot = BotParams {
+                wallet_exposure_limit: 1.0,
+                total_wallet_exposure_limit: 1.0,
+                risk_wel_enforcer_enabled: false,
+                ..Default::default()
+            };
+            let params = StrategyParams::TrailingMartingale(TrailingMartingaleParams {
+                close: TrailingMartingaleCloseParams {
+                    qty_pct: 1.0,
+                    threshold_base_pct: 0.001,
+                    retracement_base_pct: 0.001,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+            let position = Position {
+                size: if long { 1.0 } else { -1.0 },
+                price: 100.0,
+            };
+            let trailing = TrailingPriceBundle {
+                min_since_open: 98.0,
+                max_since_min: 99.0,
+                max_since_open: 102.0,
+                min_since_max: 101.0,
+            };
+            let next_low = if long { 100.0 } else { 98.992 };
+            let next_high = if long { 101.008 } else { 100.0 };
+            let mut prices = Vec::new();
+            for mode in 0..5 {
+                let mut request = recursive_close_request(
+                    &exchange, &state, &bot, &params, &position, &trailing, next_low, next_high,
+                );
+                match mode {
+                    0 => request.next_candle = None, // live/full generation
+                    1 => {}                          // next-candle fallback
+                    2 => request.next_candle.as_mut().unwrap().tradable = false,
+                    3 | 4 => {
+                        request.peek = Some(PeekBehavior {
+                            expand_entries: false,
+                            expand_closes: mode == 4,
+                        })
+                    }
+                    _ => unreachable!(),
+                }
+                let orders = generate_orders(side, request);
+                assert_eq!(orders.closes.len(), 1, "mode {mode}");
+                let order = &orders.closes[0];
+                assert_eq!(order.price, tick, "side {side:?}, mode {mode}");
+                assert!(!would_fill_next_candle(
+                    next_low,
+                    next_high,
+                    order.qty,
+                    order.price,
+                    0.0
+                ));
+                prices.push(order.price);
+            }
+            assert!(prices.iter().all(|price| *price == prices[0]));
+        }
     }
 }

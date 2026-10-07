@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections import Counter, deque
+from collections import Counter, OrderedDict, deque
 from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import datetime, timezone
 import hashlib
@@ -17,8 +17,8 @@ import weakref
 from typing import Any, Iterable, Mapping, Protocol
 
 from live.balance_composition import format_balance_composition_sample
+from live.console_admission import ConsoleAdmission
 from live.diagnostic_safety import bounded_exception_type
-
 
 SCHEMA_VERSION = 1
 REDACTED = "[redacted]"
@@ -110,6 +110,7 @@ _CONTROL_CHARACTER_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 def _empty_monitor_phase_timing() -> dict[str, int]:
     return {key: 0 for key in _MONITOR_PHASE_TIMING_KEYS}
 
+
 _STARTUP_PHASE_READINESS_CONTRACTS: Mapping[str, tuple[str, str]] = MappingProxyType(
     {
         "account": ("account_critical", "protective_blocker"),
@@ -172,6 +173,7 @@ class EventTypes:
     CYCLE_STARTED = "cycle.started"
     CYCLE_COMPLETED = "cycle.completed"
     CYCLE_DEGRADED = "cycle.degraded"
+    RISK_INPUT_STATUS = "risk.input.status"
     DATA_PACKET_UPDATED = "data_packet.updated"
     SNAPSHOT_BUILT = "snapshot.built"
     OPEN_ORDERS_SNAPSHOT_DELTA = "open_orders.snapshot_delta"
@@ -187,6 +189,7 @@ class EventTypes:
     EMA_UNAVAILABLE = "ema.unavailable"
     CANDLE_COVERAGE_CHECKED = "candle.coverage_checked"
     CANDLE_TAIL_PROJECTED = "candle.tail_projected"
+    CANDLE_WEBSOCKET_STATUS = "candle.websocket_status"
     CACHE_LOAD_COMPLETED = "cache.load.completed"
     CACHE_FLUSH_COMPLETED = "cache.flush.completed"
     CACHE_WARMUP_DECISION = "cache.warmup_decision"
@@ -205,9 +208,7 @@ class EventTypes:
     ORDER_WAVE_STARTED = "order_wave.started"
     ORDER_WAVE_COMPLETED = "order_wave.completed"
     EXECUTION_CREATE_SENT = "execution.create_sent"
-    EXECUTION_CREATE_CONNECTOR_CALL_STARTED = (
-        "execution.create_connector_call_started"
-    )
+    EXECUTION_CREATE_CONNECTOR_CALL_STARTED = "execution.create_connector_call_started"
     EXECUTION_CREATE_SUCCEEDED = "execution.create_succeeded"
     EXECUTION_CREATE_FAILED = "execution.create_failed"
     EXECUTION_CREATE_REJECTED = "execution.create_rejected"
@@ -221,9 +222,7 @@ class EventTypes:
     EXECUTION_CANCEL_DEFERRED = "execution.cancel_deferred"
     ENTRY_MIN_EFFECTIVE_COST_BLOCKED = "entry.min_effective_cost_blocked"
     EXECUTION_CANCEL_SENT = "execution.cancel_sent"
-    EXECUTION_CANCEL_CONNECTOR_CALL_STARTED = (
-        "execution.cancel_connector_call_started"
-    )
+    EXECUTION_CANCEL_CONNECTOR_CALL_STARTED = "execution.cancel_connector_call_started"
     EXECUTION_CANCEL_SUCCEEDED = "execution.cancel_succeeded"
     EXECUTION_CANCEL_FAILED = "execution.cancel_failed"
     EXECUTION_CANCEL_AMBIGUOUS_TERMINAL = "execution.cancel_ambiguous_terminal"
@@ -244,11 +243,6 @@ class EventTypes:
     HSL_TRANSITION = "hsl.transition"
     HSL_STATUS = "hsl.status"
     HSL_RAW_RED_PENDING = "hsl.raw_red_pending"
-    HSL_REPLAY_STARTED = "hsl.replay.started"
-    HSL_REPLAY_PROGRESS = "hsl.replay.progress"
-    HSL_REPLAY_COMPLETED = "hsl.replay.completed"
-    HSL_REPLAY_FAILED = "hsl.replay.failed"
-    HSL_REPLAY_CACHE = "hsl.replay.cache"
     HSL_RED_TRIGGERED = "hsl.red_triggered"
     HSL_RED_FINALIZED_WITHOUT_ORDER = "hsl.red_finalized_without_order"
     HSL_COOLDOWN_STARTED = "hsl.cooldown_started"
@@ -316,6 +310,8 @@ class EventTags:
 
 
 class ReasonCodes:
+    CURRENT_BALANCE_UNAVAILABLE = "current_balance_unavailable"
+    HSL_SIGNAL_UNAVAILABLE = "hsl_signal_unavailable"
     AUTHORITATIVE_CONFIRMATION = "authoritative_confirmation"
     AUTHORITATIVE_CONFIRMATION_TIMEOUT = "authoritative_confirmation_timeout"
     BALANCE_CHANGED = "balance_changed"
@@ -357,15 +353,11 @@ class ReasonCodes:
     OPTIONAL_EMA_DROPPED = "optional_ema_dropped"
     PENDING_EXCHANGE_CONFIG = "pending_exchange_config"
     PERIODIC_HEALTH_SUMMARY = "periodic_health_summary"
-    PRE_CREATE_MARKET_SNAPSHOT_UNAVAILABLE = (
-        "pre_create_market_snapshot_unavailable"
-    )
+    PRE_CREATE_MARKET_SNAPSHOT_UNAVAILABLE = "pre_create_market_snapshot_unavailable"
     PRE_CREATE_PLANNING_SNAPSHOT_INVALID = "pre_create_planning_snapshot_invalid"
     QUEUE_FULL = "queue_full"
     RANKING_FEATURES_UNAVAILABLE = "ranking_features_unavailable"
-    FORAGER_ELIGIBILITY_MEMBERSHIP_CHANGED = (
-        "forager_eligibility_membership_changed"
-    )
+    FORAGER_ELIGIBILITY_MEMBERSHIP_CHANGED = "forager_eligibility_membership_changed"
     CONFIG_MARKET_UNSUPPORTED = "config_market_unsupported"
     CONFIG_ISOLATED_ONLY_MARKET_BLOCKED = "config_isolated_only_market_blocked"
     CONFIG_STOCK_PERP_WRONG_EXCHANGE = "config_stock_perp_wrong_exchange"
@@ -388,12 +380,6 @@ class ReasonCodes:
         "hsl_price_history_symbol_fetch_completed"
     )
     HSL_PRICE_HISTORY_SYMBOL_FETCH_STARTED = "hsl_price_history_symbol_fetch_started"
-    HSL_REPLAY_CACHE_HIT = "hsl_replay_cache_hit"
-    HSL_REPLAY_CACHE_MISS = "hsl_replay_cache_miss"
-    HSL_REPLAY_CACHE_REJECTED = "hsl_replay_cache_rejected"
-    HSL_REPLAY_CACHE_WRITTEN = "hsl_replay_cache_written"
-    HSL_REPLAY_CACHE_WRITE_FAILED = "hsl_replay_cache_write_failed"
-    HSL_REPLAY_PENDING = "hsl_replay_pending"
     HSL_RAW_RED_PENDING_EMA_CONFIRMATION = "hsl_raw_red_pending_ema_confirmation"
     HSL_RED_FINALIZED_WITHOUT_EXCHANGE_ORDER = (
         "hsl_red_finalized_without_exchange_order"
@@ -532,6 +518,7 @@ PHASE1_EVENT_TYPES = {
     EventTypes.EMA_UNAVAILABLE,
     EventTypes.CANDLE_COVERAGE_CHECKED,
     EventTypes.CANDLE_TAIL_PROJECTED,
+    EventTypes.CANDLE_WEBSOCKET_STATUS,
     EventTypes.CACHE_LOAD_COMPLETED,
     EventTypes.CACHE_FLUSH_COMPLETED,
     EventTypes.CACHE_WARMUP_DECISION,
@@ -580,11 +567,6 @@ PHASE1_EVENT_TYPES = {
     EventTypes.RISK_MODE_CHANGED,
     EventTypes.HSL_TRANSITION,
     EventTypes.HSL_STATUS,
-    EventTypes.HSL_REPLAY_STARTED,
-    EventTypes.HSL_REPLAY_PROGRESS,
-    EventTypes.HSL_REPLAY_COMPLETED,
-    EventTypes.HSL_REPLAY_FAILED,
-    EventTypes.HSL_REPLAY_CACHE,
     EventTypes.HSL_RED_TRIGGERED,
     EventTypes.HSL_RED_FINALIZED_WITHOUT_ORDER,
     EventTypes.HSL_COOLDOWN_STARTED,
@@ -702,11 +684,20 @@ def _is_sensitive_key(key: object) -> bool:
     )
 
 
-def redact_payload(value: Any) -> Any:
+def _public_authoritative_timing(parent_key: str, key: object, value: Any) -> bool:
+    # Only this bounded numeric duration is public; auth-like strings/maps stay secret.
+    return (parent_key == "timings_ms" and key == "authoritative"
+            and type(value) in (int, float) and 0 <= value <= 2**63 - 1)
+
+
+def redact_payload(value: Any, *, _parent_key: str = "") -> Any:
     if isinstance(value, Mapping):
         return {
-            str(key): REDACTED if _is_sensitive_key(key) else redact_payload(item)
-            for key, item in value.items()
+            str(key): (
+                item if _public_authoritative_timing(_parent_key, key, item)
+                else REDACTED if _is_sensitive_key(key)
+                else redact_payload(item, _parent_key=str(key))
+            ) for key, item in value.items()
         }
     if isinstance(value, list):
         return [redact_payload(item) for item in value]
@@ -792,8 +783,7 @@ def _canonical_live_event_data(
 def _copy_canonical_live_event_value(value: Any) -> Any:
     if isinstance(value, dict):
         return {
-            key: _copy_canonical_live_event_value(item)
-            for key, item in value.items()
+            key: _copy_canonical_live_event_value(item) for key, item in value.items()
         }
     if isinstance(value, list):
         return [_copy_canonical_live_event_value(item) for item in value]
@@ -823,13 +813,19 @@ class _LiveEventBudgetState:
         )
 
     def changed(self) -> bool:
-        return any(getattr(self, field_name) for field_name in _LIVE_EVENT_BUDGET_COUNTER_FIELDS)
+        return any(
+            getattr(self, field_name)
+            for field_name in _LIVE_EVENT_BUDGET_COUNTER_FIELDS
+        )
 
 
 def _truncate_live_event_text(value: str, limit: int) -> str:
     if len(value) <= limit:
         return value
-    return value[: limit - len(_LIVE_EVENT_TRUNCATION_SUFFIX)] + _LIVE_EVENT_TRUNCATION_SUFFIX
+    return (
+        value[: limit - len(_LIVE_EVENT_TRUNCATION_SUFFIX)]
+        + _LIVE_EVENT_TRUNCATION_SUFFIX
+    )
 
 
 def _bounded_live_event_key(key: object) -> tuple[str, bool, bool]:
@@ -867,11 +863,7 @@ def _live_event_mapping_omitted_count(
     root_budget_key_present: bool,
 ) -> int:
     try:
-        total_keys = (
-            dict.__len__(value)
-            if isinstance(value, dict)
-            else len(value)
-        )
+        total_keys = dict.__len__(value) if isinstance(value, dict) else len(value)
     except Exception:
         return 1
     caller_key_count = total_keys - int(root_budget_key_present)
@@ -887,6 +879,7 @@ def _bounded_live_event_value(
     is_root: bool = False,
     omit_on_limit: bool = False,
     existing_budget_metadata: Mapping[str, int] | None = None,
+    parent_key: str = "",
 ) -> Any:
     if state.nodes >= LIVE_EVENT_MAX_NODES:
         state.add("node_limited")
@@ -894,7 +887,9 @@ def _bounded_live_event_value(
     state.nodes += 1
     if depth > LIVE_EVENT_MAX_DATA_DEPTH:
         state.add("depth_limited")
-        return _LIVE_EVENT_OMIT_LIST_ITEM if omit_on_limit else _LIVE_EVENT_DEPTH_LIMITED
+        return (
+            _LIVE_EVENT_OMIT_LIST_ITEM if omit_on_limit else _LIVE_EVENT_DEPTH_LIMITED
+        )
     if value is None or type(value) is bool:
         return value
     if isinstance(value, str):
@@ -953,12 +948,11 @@ def _bounded_live_event_value(
                 except (TypeError, ValueError):
                     state.add("unsupported_values")
                     continue
-                normalized_key, key_truncated, force_redaction = _bounded_live_event_key(key)
+                normalized_key, key_truncated, force_redaction = (
+                    _bounded_live_event_key(key)
+                )
                 if is_root and normalized_key == LIVE_EVENT_BUDGET_METADATA_KEY:
-                    if (
-                        existing_budget_metadata is None
-                        and not root_budget_key_present
-                    ):
+                    if existing_budget_metadata is None and not root_budget_key_present:
                         state.add("reserved_keys")
                     continue
                 if processed_keys >= LIVE_EVENT_MAX_MAPPING_KEYS:
@@ -979,7 +973,9 @@ def _bounded_live_event_value(
                 if normalized_key in normalized and (key_truncated or force_redaction):
                     state.add("omitted_keys")
                     continue
-                if force_redaction or _is_sensitive_key(normalized_key):
+                if not force_redaction and _public_authoritative_timing(parent_key, normalized_key, child):
+                    normalized[normalized_key] = child
+                elif force_redaction or _is_sensitive_key(normalized_key):
                     normalized[normalized_key] = REDACTED
                 else:
                     normalized[normalized_key] = _bounded_live_event_value(
@@ -987,6 +983,7 @@ def _bounded_live_event_value(
                         depth=depth + 1,
                         ancestors=ancestors,
                         state=state,
+                        parent_key=normalized_key,
                     )
             else:
                 state.add(
@@ -1145,9 +1142,7 @@ def bounded_live_event_data(value: Mapping[str, Any] | None) -> dict[str, Any]:
             LIVE_EVENT_BUDGET_COUNTER_MAX,
             base_omitted_keys + len(keys) - candidate_count,
         )
-        candidate = {
-            key: normalized[key] for key in keys[:candidate_count]
-        }
+        candidate = {key: normalized[key] for key in keys[:candidate_count]}
         candidate[LIVE_EVENT_BUDGET_METADATA_KEY] = metadata
         if _live_event_json_size(candidate) <= LIVE_EVENT_MAX_DATA_BYTES:
             retained_count = candidate_count
@@ -1162,9 +1157,7 @@ def bounded_live_event_data(value: Mapping[str, Any] | None) -> dict[str, Any]:
     if _live_event_json_size(payload) > LIVE_EVENT_MAX_DATA_BYTES:
         state.add("omitted_keys", retained_count)
         metadata = _live_event_budget_metadata(state)
-        payload = {
-            LIVE_EVENT_BUDGET_METADATA_KEY: metadata
-        }
+        payload = {LIVE_EVENT_BUDGET_METADATA_KEY: metadata}
     return _canonical_live_event_data(payload, budget_metadata=metadata)
 
 
@@ -1313,9 +1306,7 @@ DEFAULT_ROUTES: dict[str, EventRoute] = {
     EventTypes.BOT_STOPPED: EventRoute(console=True, text=True),
     EventTypes.HEALTH_SUMMARY: EventRoute(console=True, text=True),
     EventTypes.RESOURCE_MEMORY_SNAPSHOT: EventRoute(console=True, text=True),
-    EventTypes.MARKET_SNAPSHOT_DIAGNOSTIC_SKIPPED: EventRoute(
-        console=True, text=True
-    ),
+    EventTypes.MARKET_SNAPSHOT_DIAGNOSTIC_SKIPPED: EventRoute(console=True, text=True),
     EventTypes.CYCLE_STARTED: EventRoute(
         console=True, text=True, throttle_interval_ms=60_000
     ),
@@ -1323,6 +1314,7 @@ DEFAULT_ROUTES: dict[str, EventRoute] = {
         console=True, text=True, throttle_interval_ms=60_000
     ),
     EventTypes.CYCLE_DEGRADED: EventRoute(console=True, text=True),
+    EventTypes.RISK_INPUT_STATUS: EventRoute(console=True, text=True),
     EventTypes.DATA_PACKET_UPDATED: EventRoute(console=False),
     EventTypes.SNAPSHOT_BUILT: EventRoute(console=False),
     EventTypes.OPEN_ORDERS_SNAPSHOT_DELTA: EventRoute(console=True, text=True),
@@ -1346,6 +1338,7 @@ DEFAULT_ROUTES: dict[str, EventRoute] = {
     ),
     EventTypes.CANDLE_COVERAGE_CHECKED: EventRoute(console=False, text=False),
     EventTypes.CANDLE_TAIL_PROJECTED: EventRoute(console=False, text=False),
+    EventTypes.CANDLE_WEBSOCKET_STATUS: EventRoute(console=False, text=False),
     EventTypes.CACHE_LOAD_COMPLETED: EventRoute(console=False, text=False),
     EventTypes.CACHE_FLUSH_COMPLETED: EventRoute(console=False, text=False),
     EventTypes.CACHE_WARMUP_DECISION: EventRoute(console=False, text=False),
@@ -1406,11 +1399,6 @@ DEFAULT_ROUTES: dict[str, EventRoute] = {
     EventTypes.HSL_TRANSITION: EventRoute(console=True, text=True),
     EventTypes.HSL_STATUS: EventRoute(console=True, text=True),
     EventTypes.HSL_RAW_RED_PENDING: EventRoute(console=False, text=False),
-    EventTypes.HSL_REPLAY_STARTED: EventRoute(console=False, text=False),
-    EventTypes.HSL_REPLAY_PROGRESS: EventRoute(console=False, text=False),
-    EventTypes.HSL_REPLAY_COMPLETED: EventRoute(console=False, text=False),
-    EventTypes.HSL_REPLAY_FAILED: EventRoute(console=False, text=False),
-    EventTypes.HSL_REPLAY_CACHE: EventRoute(console=False, text=False),
     EventTypes.HSL_RED_TRIGGERED: EventRoute(console=False, text=False),
     EventTypes.HSL_RED_FINALIZED_WITHOUT_ORDER: EventRoute(console=False, text=False),
     EventTypes.HSL_COOLDOWN_STARTED: EventRoute(console=False, text=False),
@@ -1427,8 +1415,7 @@ DEFAULT_ROUTES: dict[str, EventRoute] = {
 
 
 class LiveEventSink(Protocol):
-    def write(self, event: LiveEvent) -> Any:
-        ...
+    def write(self, event: LiveEvent) -> Any: ...
 
 
 class _MonitorEventPrepareError(Exception):
@@ -1449,7 +1436,9 @@ class MonitorEventSink:
         except _MonitorEventPrepareError as exc:
             raise exc.error from exc
         if result is None:
-            raise RuntimeError(f"monitor publisher returned None for {event.event_type}")
+            raise RuntimeError(
+                f"monitor publisher returned None for {event.event_type}"
+            )
         return result
 
     def _write_with_timing(self, event: LiveEvent) -> tuple[Any, dict[str, int]]:
@@ -1511,6 +1500,7 @@ _CONSOLE_EVENT_TAGS = {
     EventTypes.CYCLE_STARTED: "cycle",
     EventTypes.CYCLE_COMPLETED: "cycle",
     EventTypes.CYCLE_DEGRADED: "cycle",
+    EventTypes.RISK_INPUT_STATUS: "risk",
     EventTypes.PLANNING_UNAVAILABLE: "gate",
     EventTypes.OPEN_ORDERS_SNAPSHOT_DELTA: "order",
     EventTypes.FORAGER_SELECTION: "forager",
@@ -1661,7 +1651,9 @@ def _console_order_summary(event: LiveEvent) -> list[str]:
     result_status = _data_str(data, "result_status")
     if result_status:
         parts.append(f"exchange_status={result_status}")
-    order_id = _data_str(data, "result_order_id_short") or _data_str(data, "order_id_short")
+    order_id = _data_str(data, "result_order_id_short") or _data_str(
+        data, "order_id_short"
+    )
     if order_id:
         parts.append(f"order_id={order_id}")
     client_id = _data_str(data, "result_client_order_id_short") or _data_str(
@@ -1725,12 +1717,14 @@ _MARKET_SNAPSHOT_DIAGNOSTIC_CONSOLE_RECORD_LIMIT = 188
 def _bounded_pre_create_skip_console_token(value: object, *, limit: int) -> str:
     cleaned = _format_console_label(value)
     token = "".join(
-        char
-        if char.isascii()
-        and char.isprintable()
-        and not char.isspace()
-        and char not in {",", "=", "|", "[", "]"}
-        else "_"
+        (
+            char
+            if char.isascii()
+            and char.isprintable()
+            and not char.isspace()
+            and char not in {",", "=", "|", "[", "]"}
+            else "_"
+        )
         for char in cleaned
     )
     return token[:limit] or "-"
@@ -1741,8 +1735,7 @@ def _format_pre_create_skip_console(event: LiveEvent) -> str:
     parts = ["[gate]", "skipped"]
     if event.cycle_id:
         parts.append(
-            "cycle="
-            + _bounded_pre_create_skip_console_token(event.cycle_id, limit=32)
+            "cycle=" + _bounded_pre_create_skip_console_token(event.cycle_id, limit=32)
         )
     order_count = _data_int(data, "order_count")
     if order_count is not None:
@@ -1762,8 +1755,7 @@ def _format_pre_create_skip_console(event: LiveEvent) -> str:
     error_type = _data_str(data, "error_type")
     if error_type:
         parts.append(
-            "error_type="
-            + _bounded_pre_create_skip_console_token(error_type, limit=24)
+            "error_type=" + _bounded_pre_create_skip_console_token(error_type, limit=24)
         )
     if event.reason_code:
         parts.append(
@@ -1797,19 +1789,14 @@ def format_market_snapshot_diagnostic_console(
         parts.append(safe_status)
     if cycle_id:
         parts.append(
-            "cycle="
-            + _bounded_pre_create_skip_console_token(cycle_id, limit=32)
+            "cycle=" + _bounded_pre_create_skip_console_token(cycle_id, limit=32)
         )
+    parts.append("context=" + _bounded_pre_create_skip_console_token(context, limit=32))
     parts.append(
-        "context=" + _bounded_pre_create_skip_console_token(context, limit=32)
+        "error_type=" + _bounded_pre_create_skip_console_token(error_type, limit=24)
     )
     parts.append(
-        "error_type="
-        + _bounded_pre_create_skip_console_token(error_type, limit=24)
-    )
-    parts.append(
-        "reason="
-        + _bounded_pre_create_skip_console_token(reason_code, limit=64)
+        "reason=" + _bounded_pre_create_skip_console_token(reason_code, limit=64)
     )
     return " ".join(parts)[:_MARKET_SNAPSHOT_DIAGNOSTIC_CONSOLE_RECORD_LIMIT]
 
@@ -2065,8 +2052,7 @@ def _format_console_position_changed(event: LiveEvent) -> str:
             f"{_format_position_console_percentage(_data_number(data, 'wele_ratio'))}",
             "TWEL="
             f"{_format_position_console_percentage(_data_number(data, 'twel_ratio'))}",
-            "uPnL="
-            f"{_format_console_number(_data_number(data, 'upnl'))}",
+            "uPnL=" f"{_format_console_number(_data_number(data, 'upnl'))}",
         )
     )
     return (
@@ -2094,6 +2080,21 @@ def _format_console_balance_changed(event: LiveEvent) -> str:
         f"{'snap':<5}{snapped_transition} | "
         f"equity={equity} source={source}"
     )
+    if data.get("initial_snapshot") is True:
+        rendered = (
+            f"[balance] initial raw={_format_console_number(_data_number(data, 'balance_raw'))} | "
+            f"snap={_format_console_number(_data_number(data, 'balance_snapped'))} | "
+            f"equity={equity} source={source}"
+        )
+    if data.get("equity_estimated") is True:
+        rendered += (
+            " estimate"
+            f" valuation={_format_console_label(_data_str(data, 'equity_valuation_source'))}"
+            f" observed_age_ms={_data_int(data, 'equity_observation_age_ms')}"
+        )
+    reason = _data_str(data, "equity_unavailable_reason")
+    if reason:
+        rendered += f" equity_reason={_format_console_label(reason)}"
     sample = format_balance_composition_sample(data.get("balance_composition"))
     return f"{rendered} assets={sample}" if sample else rendered
 
@@ -2320,7 +2321,7 @@ def _console_health_summary(event: LiveEvent) -> list[str]:
         parts.append(f"errors={errors}/h")
     ws = _data_int(data, "ws_reconnects")
     if ws:
-        parts.append(f"ws={ws}")
+        parts.append(f"ws_reconnects_total={ws}")
     rate_limits = _data_int(data, "rate_limits")
     if rate_limits:
         parts.append(f"rate_limits={rate_limits}")
@@ -2359,6 +2360,18 @@ def _format_console_duration_ms(duration_ms: int) -> str:
     return f"{seconds}s"
 
 
+def split_health_console(message: str, prefix: str = "[health]") -> list[str]:
+    parts, line = [], prefix
+    for word in message.removeprefix(prefix + ' ').split():
+        word = word[:max(1, 170 - len(prefix) - 1)]
+        if len(line) + len(word) + 1 > 170:
+            parts.append(line)
+            line = prefix
+        line += " " + word
+    parts.append(line)
+    return parts
+
+
 def format_periodic_health_summary(data: Mapping[str, Any]) -> str:
     """Render the bounded operator projection for a periodic health summary."""
     uptime_ms = _data_int(data, "uptime_ms")
@@ -2367,50 +2380,84 @@ def format_periodic_health_summary(data: Mapping[str, Any]) -> str:
     short_count = _data_int(data, "positions_short")
     parts = [
         f"up={_format_console_duration_ms(uptime_ms or 0)}",
-        f"loop={loop_ms / 1000.0:.1f}s" if loop_ms and loop_ms > 0 else "loop=n/a",
+        (
+            f"last_loop={loop_ms / 1000.0:.1f}s"
+            if loop_ms and loop_ms > 0
+            else "last_loop=n/a"
+        ),
         f"pos={long_count or 0}L/{short_count or 0}S",
     ]
 
-    balance = _data_number(data, "balance_raw")
-    quote = _data_str(data, "quote")
-    if balance is not None:
-        suffix = f" {quote}" if quote else ""
-        balance_part = f"bal={balance:.2f}{suffix}"
-        snapped = _data_number(data, "balance_snapped")
-        if snapped is not None and abs(balance - snapped) > 1e-9:
-            balance_part += f" (snap {snapped:.2f})"
-        parts.append(balance_part)
-
-    placed = _data_int(data, "orders_placed")
-    cancelled = _data_int(data, "orders_cancelled")
-    parts.append(f"ord=+{placed or 0}/-{cancelled or 0}")
-
-    fills = _data_int(data, "fills")
-    fills = fills if fills is not None else 0
-    fills_part = f"fills={fills}"
-    if fills > 0:
-        pnl = _data_number(data, "pnl")
-        if pnl is not None:
-            pnl_suffix = f" {quote}" if quote else ""
-            fills_part += f" (pnl={pnl:+.2f}{pnl_suffix})"
-    parts.append(fills_part)
+    label = _data_str(data, "bot_label")
+    if label:
+        parts.insert(0, "bot=" + re.sub(r"[^a-zA-Z0-9_.-]", "_", label)[:32])
+    open_count = _data_int(data, "open_order_count")
+    parts.append(
+        f"open_orders={open_count}" if open_count is not None else "open_orders=?"
+    )
+    if data.get("console_readiness") == "unavailable":
+        parts.append("readiness=unavailable")
+    coverage = data.get("close_coverage")
+    if isinstance(coverage, Mapping):
+        parts.append(
+            "close="
+            + "/".join(
+                f"{key}:{_data_int(coverage, key) or 0}"
+                for key in ("resting", "waiting", "blocked", "unknown")
+            )
+        )
+    age = _data_number(data, "account_age_ms")
+    parts.append(
+        f"account_age={age / 1000.:.1f}s" if age is not None else "account_age=?"
+    )
+    pending = data.get("account_pending")
+    if isinstance(pending, list) and pending:
+        parts.append("account_pending=" + ",".join(str(x) for x in pending[:3]))
+    fills_ages = data.get("account_surface_ages_ms", {})
+    if isinstance(fills_ages, Mapping):
+        age = _data_number(fills_ages, "fills")
+        if age is not None:
+            parts.append(f"fills_age={age / 1000.:.1f}s")
+    if data.get("fills_pending") is True:
+        parts.append("fills_pending=yes")
+    pending_age = _data_number(data, "ordinary_pending_age_ms")
+    if pending_age is not None:
+        parts.append(f"ordinary_pending={pending_age / 1000.:.1f}s")
+    waits = _data_int(data, "trailing_wait_count")
+    if waits:
+        age = _data_number(data, "trailing_wait_max_ms")
+        parts.append(f"trailing_input_wait={waits}" + (f"/{age / 1000.:.1f}s" if age is not None else ""))
+    overflow = _data_int(data, "trailing_wait_overflow_count")
+    if overflow:
+        parts.append(f"wait_untracked={overflow}")
+    samples = data.get("trailing_wait_samples")
+    if waits and isinstance(samples, list) and samples and isinstance(samples[0], Mapping):
+        row = samples[0]
+        parts.append("wait_scope=" + re.sub(r"[^a-zA-Z0-9_./:-]", "_", str(row.get("symbol", "?")))[:32]
+                     + ":" + re.sub(r"[^a-zA-Z0-9_]", "_", str(row.get("phase", "?")))[:24])
+    for field, label in (("last_cycle_completed_age_ms", "last_cycle"), ("last_write_age_ms", "last_write")):
+        age = _data_number(data, field)
+        parts.append(f"{label}={age / 1000.:.1f}s" if age is not None else f"{label}=?")
+    cpu = _data_number(data, "cpu_percent")
+    if cpu is not None:
+        parts.append(f"cpu={cpu:.0f}%")
 
     errors = _data_int(data, "errors_last_hour")
     error_budget_max = _data_int(data, "error_budget_max")
-    parts.append(f"err={errors or 0}/{error_budget_max or 10}")
+    parts.append(f"errors_1h={errors or 0}/{error_budget_max or 10}")
 
     ws = _data_int(data, "ws_reconnects")
     if ws:
-        parts.append(f"ws={ws}")
+        parts.append(f"ws_reconnects_total={ws}")
     rate_limits = _data_int(data, "rate_limits")
     if rate_limits:
-        parts.append(f"rate_lim={rate_limits}")
+        parts.append(f"rate_limits_total={rate_limits}")
     rss_bytes = _data_int(data, "rss_bytes")
     if rss_bytes is not None:
         parts.append(f"rss={rss_bytes / 1024.0 / 1024.0:.1f}MiB")
     summary_lag_ms = _data_int(data, "health_summary_lag_ms")
     if summary_lag_ms:
-        parts.append(f"lag={summary_lag_ms / 1000.0:.1f}s")
+        parts.append(f"summary_late={summary_lag_ms / 1000.0:.1f}s")
 
     slow_phases = data.get("slow_phases")
     if isinstance(slow_phases, list):
@@ -2452,6 +2499,17 @@ def _format_console_ratio(value: Any) -> str | None:
 
 def _console_hsl_status_summary(event: LiveEvent) -> list[str]:
     data = event.data if isinstance(event.data, Mapping) else {}
+    if data.get("engine") == "hsl":
+        counts = data.get("counts", {})
+        return [
+            "engine=hsl",
+            f"mode={data.get('signal_mode', '-')}",
+            f"observation={data.get('observation_status', '-')}",
+            *(
+                f"{key}={counts.get(key, 0)}"
+                for key in ("green", "red", "inactive", "unavailable", "estimated")
+            ),
+        ]
     parts: list[str] = []
     signal_mode = _data_str(data, "signal_mode")
     if signal_mode:
@@ -2530,10 +2588,13 @@ def _format_console_trailing_status(event: LiveEvent) -> str | None:
         return None
 
     parts = ["[trailing]"]
-    if event.status:
+    if event.symbol:
+        parts.append(f"symbol={_compact_trailing_console_label(event.symbol, limit=48)}")
+    if event.pside:
+        parts.append(f"pside={_compact_trailing_console_label(event.pside, limit=8)}")
+    # The strategy status already communicates success. Correlation stays durable.
+    if event.status and event.status != "succeeded":
         parts.append(event.status)
-    if event.cycle_id:
-        parts.append(f"cycle={_compact_trailing_console_label(event.cycle_id, limit=36)}")
 
     kind = _data_str(data, "kind")
     trailing_status = _data_str(data, "trailing_status")
@@ -2545,7 +2606,9 @@ def _format_console_trailing_status(event: LiveEvent) -> str | None:
     elif kind:
         parts.append(f"kind={_compact_trailing_console_label(kind, limit=12)}")
     elif trailing_status:
-        parts.append(f"status={_compact_trailing_console_label(trailing_status, limit=24)}")
+        parts.append(
+            f"status={_compact_trailing_console_label(trailing_status, limit=24)}"
+        )
 
     selected_mode = _data_str(data, "selected_mode")
     if selected_mode:
@@ -2573,7 +2636,9 @@ def _format_console_trailing_status(event: LiveEvent) -> str | None:
     retracement_pct = _data_number(data, "retracement_pct")
     retracement_price = _data_number(data, "retracement_price")
     if retracement_pct is not None and retracement_price:
-        parts.append(f"retracement={retracement_pct * 100.0:.4f}%@{retracement_price:g}")
+        parts.append(
+            f"retracement={retracement_pct * 100.0:.4f}%@{retracement_price:g}"
+        )
     elif retracement_pct is not None:
         parts.append(f"retracement={retracement_pct * 100.0:.4f}%")
     elif retracement_price:
@@ -2582,10 +2647,6 @@ def _format_console_trailing_status(event: LiveEvent) -> str | None:
     current_price = _data_number(data, "current_price")
     if current_price:
         parts.append(f"cur={current_price:g}")
-    if event.symbol:
-        parts.append(f"symbol={_compact_trailing_console_label(event.symbol, limit=48)}")
-    if event.pside:
-        parts.append(f"pside={_compact_trailing_console_label(event.pside, limit=8)}")
     return " ".join(parts)
 
 
@@ -2732,7 +2793,9 @@ def _operator_sink_event_visible(event: LiveEvent) -> bool:
     if data.get("operator_visible") is False:
         return False
     if event.event_type == EventTypes.STATE_REFRESH_TIMING:
-        return data.get("summary") is True or _state_refresh_timing_wall_ms(data) >= 10_000
+        return (
+            data.get("summary") is True or _state_refresh_timing_wall_ms(data) >= 10_000
+        )
     if event.event_type == EventTypes.FILL_INGESTED:
         return True
     if event.event_type == EventTypes.FORAGER_SELECTION:
@@ -2756,7 +2819,7 @@ def _console_sink_event_visible(event: LiveEvent) -> bool:
         data = event.data if isinstance(event.data, Mapping) else {}
         snapped_delta = _data_number(data, "balance_snapped_delta")
         # Missing or malformed materiality metadata must remain operator-visible.
-        return snapped_delta is None or snapped_delta != 0.0
+        return data.get("initial_snapshot") is True or snapped_delta is None or snapped_delta != 0.0
     return True
 
 
@@ -2802,7 +2865,8 @@ def _format_state_refresh_console_stats(value: object) -> str:
     if not isinstance(value, Mapping):
         return "-"
     return "/".join(
-        _format_state_refresh_console_ms(value.get(key)) for key in ("min", "mean", "max")
+        _format_state_refresh_console_ms(value.get(key))
+        for key in ("min", "mean", "max")
     )
 
 
@@ -2820,7 +2884,10 @@ def _format_state_refresh_console_timings(value: object) -> str:
     if not isinstance(value, Mapping):
         return "-"
     timings = [
-        (_format_state_refresh_console_label(surface), _format_state_refresh_console_ms(elapsed))
+        (
+            _format_state_refresh_console_label(surface),
+            _format_state_refresh_console_ms(elapsed),
+        )
         for surface, elapsed in value.items()
     ]
     timings.sort(key=lambda item: item[0])
@@ -2830,7 +2897,9 @@ def _format_state_refresh_console_timings(value: object) -> str:
     else:
         shown = timings[:3]
         suffix = ",+more"
-    return ",".join(f"{surface}:{elapsed}" for surface, elapsed in shown) + suffix or "-"
+    return (
+        ",".join(f"{surface}:{elapsed}" for surface, elapsed in shown) + suffix or "-"
+    )
 
 
 def _format_state_refresh_console_slowest_surface(value: object) -> str:
@@ -2844,7 +2913,9 @@ def _format_state_refresh_console_slowest_surface(value: object) -> str:
             maximum = int(stats.get("max", 0))
         except (TypeError, ValueError, OverflowError):
             maximum = 0
-        candidates.append((max(0, maximum), _format_state_refresh_console_label(surface), stats))
+        candidates.append(
+            (max(0, maximum), _format_state_refresh_console_label(surface), stats)
+        )
     if not candidates:
         return "-"
     _maximum, surface, stats = max(candidates, key=lambda item: (item[0], item[1]))
@@ -2959,17 +3030,11 @@ def _format_ema_fallback_console_example(
             f" age={_bounded_ema_console_count(example.get('max_age_ms'))}ms",
             f" n={_bounded_ema_console_count(example.get('max_fallbacks'))}",
             " ema="
-            + _bounded_ema_console_text(
-                example.get("ema_type"), limit=reason_limit
-            ),
+            + _bounded_ema_console_text(example.get("ema_type"), limit=reason_limit),
             " why="
-            + _bounded_ema_console_text(
-                example.get("reason_code"), limit=reason_limit
-            ),
+            + _bounded_ema_console_text(example.get("reason_code"), limit=reason_limit),
             " err="
-            + _bounded_ema_console_text(
-                example.get("error_type"), limit=reason_limit
-            ),
+            + _bounded_ema_console_text(example.get("error_type"), limit=reason_limit),
         )
     )
 
@@ -3001,9 +3066,7 @@ def format_ema_fallback_console(data: Mapping[str, Any]) -> str:
         symbol_count = "-"
     if isinstance(sample_values, (list, tuple, set, frozenset)):
         sample = ",".join(
-            _bounded_ema_console_text(
-                value, limit=_EMA_FALLBACK_CONSOLE_TOKEN_LIMIT
-            )
+            _bounded_ema_console_text(value, limit=_EMA_FALLBACK_CONSOLE_TOKEN_LIMIT)
             for index, value in enumerate(sample_values)
             if index < _EMA_FALLBACK_CONSOLE_SAMPLE_LIMIT
         )
@@ -3043,6 +3106,8 @@ _EMA_UNAVAILABLE_CONSOLE_RECORD_LIMIT = 188
 _EMA_UNAVAILABLE_COMPACT_GROUP_LIMIT = 19
 _EMA_UNAVAILABLE_COMPACT_ERROR_LIMIT = 13
 _EMA_UNAVAILABLE_COMPACT_SYMBOL_LIMIT = 14
+
+
 def _ema_unavailable_console_group(data: Mapping[str, Any]) -> Mapping[str, Any]:
     groups = data.get("candidate_unavailable_groups")
     if not isinstance(groups, (list, tuple)):
@@ -3106,9 +3171,7 @@ def format_ema_unavailable_console(data: Mapping[str, Any]) -> str:
         "[ema] unavailable",
         f"n={count}",
         "group="
-        + _bounded_ema_console_text(
-            reason, limit=_EMA_UNAVAILABLE_CONSOLE_GROUP_LIMIT
-        ),
+        + _bounded_ema_console_text(reason, limit=_EMA_UNAVAILABLE_CONSOLE_GROUP_LIMIT),
         "action=mark_nontradable_until_fresh",
         f"sym={_ema_unavailable_console_symbol_preview(group)}",
     ]
@@ -3152,12 +3215,14 @@ def _bounded_forager_eligibility_console_token(value: object, *, limit: int) -> 
     """Return a one-field, sanitized token for a coin-list console projection."""
     cleaned = _ANSI_ESCAPE_RE.sub("", str(value or ""))
     token = "".join(
-        char
-        if char.isascii()
-        and char.isprintable()
-        and not char.isspace()
-        and char not in {",", "=", "|", "[", "]"}
-        else "_"
+        (
+            char
+            if char.isascii()
+            and char.isprintable()
+            and not char.isspace()
+            and char not in {",", "=", "|", "[", "]"}
+            else "_"
+        )
         for char in cleaned
     )
     token = token[:limit]
@@ -3231,7 +3296,110 @@ def format_forager_eligibility_console(data: Mapping[str, Any]) -> str:
     return message[:_FORAGER_ELIGIBILITY_CONSOLE_RECORD_LIMIT]
 
 
+def _hsl_candle_source_console(data: Mapping) -> str | None:
+    """One bounded source cause, shared by structured and fallback consoles."""
+    sources = data.get("candle_sources")
+    failures = sources.get("failures") if isinstance(sources, Mapping) else None
+    if not (
+        isinstance(failures, list) and failures and isinstance(failures[0], Mapping)
+    ):
+        return None
+    failure = next(
+        (
+            row
+            for row in failures
+            if isinstance(row, Mapping) and row.get("stage") == "cache"
+        ),
+        failures[0],
+    )
+
+    def token(value: Any, limit: int) -> str:
+        return re.sub(r"[^a-zA-Z0-9_./:-]", "_", str(value or "-"))[:limit]
+
+    return (
+        "candle="
+        + token(failure.get("symbol"), 24)
+        + ":"
+        + token(failure.get("timeframe"), 4)
+        + "/"
+        + token(failure.get("stage"), 5)
+        + "/"
+        + token(failure.get("error_type"), 32)
+    )
+
+
+def _hsl_input_console(data: Mapping) -> tuple[Mapping | None, str | None]:
+    """Preserve required-input priority on both console paths."""
+    scopes = data.get("scopes")
+    rows = (
+        [row for row in scopes if isinstance(row, Mapping)]
+        if isinstance(scopes, list)
+        else []
+    )
+    row = next(
+        (row for row in rows if row.get("unavailable_reason")),
+        rows[0] if rows else None,
+    )
+    unavailable = data.get("unavailable_scope")
+    if isinstance(unavailable, Mapping) and unavailable.get("unavailable_reason"):
+        row = unavailable
+    if row is not None and row.get("unavailable_reason"):
+        reason = re.sub(r"[^a-zA-Z0-9_./:-]", "_", str(row["unavailable_reason"]))[:64]
+        return row, "unavailable_reason=" + reason
+    return row, _hsl_candle_source_console(data)
+
+
+def _format_hsl_console(event: LiveEvent) -> str:
+    data = event.data
+
+    # Explicit input quality rather than an ambiguous generic "degraded" label.
+    # Cycle correlation and individual estimation reasons remain in the event.
+    def token(value: Any, limit: int) -> str:
+        return re.sub(r"[^a-zA-Z0-9_./:-]", "_", str(value or "-"))[:limit]
+
+    counts = data.get("counts")
+    counts = counts if isinstance(counts, Mapping) else {}
+
+    def count(key: str) -> str:
+        value = _data_int(counts, key)
+        return "?" if value is None or value < 0 else str(min(value, 999_999))
+
+    parts = [
+        "[risk] HSL",
+        token(data.get("observation_status"), 22),
+        "mode=" + token(data.get("signal_mode"), 8),
+        *(
+            f"{key}={count(key)}"
+            for key in ("green", "red", "inactive", "unavailable", "estimated")
+        ),
+    ]
+    row, input_cause = _hsl_input_console(data)
+    if input_cause:
+        parts.append(input_cause)
+
+    def optional(value: str) -> None:
+        if len(" ".join((*parts, value))) <= 240:
+            parts.append(value)
+
+    missing = data.get("account_unavailable")
+    if isinstance(missing, list) and missing:
+        optional("account=" + ",".join(token(value, 12) for value in missing[:3]))
+    stale_reasons = data.get("stale_reasons")
+    if isinstance(stale_reasons, list) and stale_reasons:
+        optional("stale_reason=" + token(stale_reasons[0], 64))
+    if row is not None:
+        optional(
+            "scope=" + token(row.get("symbol"), 24) + "/" + token(row.get("pside"), 5)
+        )
+        reasons = row.get("estimates")
+        if not input_cause and isinstance(reasons, list) and reasons:
+            optional("estimate=" + token(reasons[0], 64))
+    return " ".join(parts)
+
+
 def format_console_event(event: LiveEvent) -> str:
+    if event.event_type == EventTypes.HSL_STATUS and event.data.get("engine") == "hsl":
+        return _format_hsl_console(event)
     if (
         event.event_type == EventTypes.HEALTH_SUMMARY
         and event.reason_code == ReasonCodes.PERIODIC_HEALTH_SUMMARY
@@ -3277,7 +3445,7 @@ def format_console_event(event: LiveEvent) -> str:
     base = f"[{_console_tag(event)}]"
     if event.status:
         base += f" {event.status}"
-    if event.cycle_id:
+    if event.cycle_id and event.event_type != EventTypes.ORDER_WAVE_COMPLETED:
         base += f" cycle={event.cycle_id}"
     for part in _console_data_summary(event):
         base += f" {part}"
@@ -3292,13 +3460,111 @@ def format_console_event(event: LiveEvent) -> str:
     return base
 
 
-class ConsoleSummarySink:
-    def __init__(self, logger: logging.Logger | None = None):
-        self.logger = logger or logging.getLogger(__name__)
+def _hsl_console_state(event: LiveEvent) -> tuple | None:
+    """Opt in only complete producer-owned state; old/unknown payloads stay visible."""
+    if event.event_type != EventTypes.HSL_STATUS or event.data.get("engine") != "hsl":
+        return None
+    data = event.data
+    token = data.get("console_state")
+    observation = data.get("observation_status")
+    missing = data.get("account_unavailable")
+    if (
+        not isinstance(token, str)
+        or re.fullmatch(r"[a-f0-9]{64}", token) is None
+        or not isinstance(observation, str)
+        or observation not in {"current", "stale", "diagnostic_unavailable"}
+        or not isinstance(missing, list)
+        or any(
+            not isinstance(value, str)
+            or value not in {"balance", "positions", "open_orders"}
+            for value in missing
+        )
+    ):
+        return None
+    return (token, observation, tuple(sorted(missing)), event.level, event.status)
 
-    def write(self, event: LiveEvent) -> str:
+
+class ConsoleSummarySink:
+    def __init__(
+        self,
+        logger: logging.Logger | None = None,
+        *,
+        admission: ConsoleAdmission | None = None,
+    ):
+        self.logger = logger or logging.getLogger(__name__)
+        self.admission = admission if admission is not None else ConsoleAdmission()
+        self._replaced_hsl: OrderedDict[tuple, tuple[int, int]] = OrderedDict()
+
+    def write(self, event: LiveEvent) -> str | None:
+        key = (event.exchange, event.user, event.bot_id, event.event_type)
+        state = _hsl_console_state(event)
+        if state is not None and event.data.get("console_replaced_observation") is True:
+            counts = event.data.get("counts", {})
+            if (
+                event.data.get("observation_status") == "stale"
+                and counts.get("red") == 0
+                and counts.get("unavailable") == 0
+            ):
+                count, age = self._replaced_hsl.get(key, (0, 0))
+                self._replaced_hsl[key] = (
+                    min(count + 1, 999999),
+                    max(age, _data_int(event.data, "age_ms") or 0),
+                )
+                self._replaced_hsl.move_to_end(key)
+                while len(self._replaced_hsl) > 256:
+                    self._replaced_hsl.popitem(last=False)
+                self.logger.log(logging.DEBUG, format_console_event(event))
+                return None
         message = format_console_event(event)
-        self.logger.log(_logging_level(event.level), message)
+        if state is not None and key in self._replaced_hsl:
+            count, age = self._replaced_hsl[key]
+            message += f" replaced_samples={count} max_sample_age={age / 1000.:.1f}s"
+
+        def emit(text):
+            if state is not None:
+                main, separator, detail = text.partition(' replaced_samples=')
+                # Equivalent GREEN replacement churn remains durable detail.
+                # Do not spend another INFO record on unchanged observation ages.
+                for line in split_health_console(main, '[risk]'):
+                    self.logger.log(_logging_level(event.level), line)
+                if separator:
+                    self.logger.log(logging.DEBUG, '[risk] prior observations replaced; count=' + detail)
+            else:
+                if len(text) > 170 and event.level not in ('debug', 'trace'):
+                    prefix = text.split(' ', 1)[0]
+                    for line in split_health_console(text, prefix):
+                        self.logger.log(_logging_level(event.level), line)
+                else:
+                    self.logger.log(_logging_level(event.level), text)
+        if state is not None:
+            key = (event.exchange, event.user, event.bot_id, event.event_type)
+            written = self.admission.write(
+                key,
+                state,
+                message,
+                emit,
+                reminder_seconds=(
+                    300.0
+                    if event.status == "degraded" or key in self._replaced_hsl
+                    else None
+                ),
+            )
+            if written is not None:
+                self._replaced_hsl.pop(key, None)
+            return written
+        if (
+            event.event_type == EventTypes.STATE_REFRESH_TIMING
+            and event.data.get("summary") is True
+        ):
+            self.logger.log(logging.DEBUG, message)
+        elif (
+            event.event_type == EventTypes.HEALTH_SUMMARY
+            and event.reason_code == ReasonCodes.PERIODIC_HEALTH_SUMMARY
+        ):
+            for line in split_health_console(message):
+                emit(line)
+        else:
+            emit(message)
         return message
 
 
@@ -3446,7 +3712,10 @@ class _EventPipelineSinkWriteTiming:
             setattr(self, total_field, int(getattr(self, total_field)) + value_ns)
             setattr(self, max_field, max(int(getattr(self, max_field)), value_ns))
         for source_key, field_name in (
-            ("manifest_checkpoint_count", "monitor_publisher_manifest_checkpoint_count"),
+            (
+                "manifest_checkpoint_count",
+                "monitor_publisher_manifest_checkpoint_count",
+            ),
             ("retention_run_count", "monitor_publisher_retention_run_count"),
             (
                 "retention_inventory_entries_visited",
@@ -3462,8 +3731,7 @@ class _EventPipelineSinkWriteTiming:
             setattr(
                 self,
                 field_name,
-                int(getattr(self, field_name))
-                + max(0, int(timing.get(source_key, 0))),
+                int(getattr(self, field_name)) + max(0, int(timing.get(source_key, 0))),
             )
         for source_key, field_prefix in (
             ("manifest_checkpoint_ns", "monitor_publisher_manifest_checkpoint_ns"),
@@ -4177,13 +4445,17 @@ class LiveEventPipeline:
             except queue.Full:
                 continue
         if not sentinel_queued:
-            logging.warning("[event] live event pipeline close timed out before sentinel")
+            logging.warning(
+                "[event] live event pipeline close timed out before sentinel"
+            )
             return False
         if self._worker is not None:
             self._worker.join(timeout=max(0.0, deadline - time.monotonic()))
             closed = not self._worker.is_alive()
             if not closed:
-                logging.warning("[event] live event pipeline close timed out while draining")
+                logging.warning(
+                    "[event] live event pipeline close timed out while draining"
+                )
             return closed
         return True
 
@@ -4346,6 +4618,10 @@ class LiveEventPipeline:
             return sink.write(event)
         except Exception as exc:
             self._handle_sink_failure(name, exc)
+            if name == "console" and event.event_type == EventTypes.RISK_INPUT_STATUS:
+                # Finite recovery attempts must remain visible even when the
+                # configured sink fails internally and emit() still succeeds.
+                logging.log(_logging_level(event.level), format_console_event(event))
             return None
 
     def _write_sink_in_worker(
@@ -4360,9 +4636,7 @@ class LiveEventPipeline:
             try:
                 return sink.write(event)
             finally:
-                sink_write_timing.record(
-                    name, time.monotonic_ns() - sink_started_ns
-                )
+                sink_write_timing.record(name, time.monotonic_ns() - sink_started_ns)
         except Exception as exc:
             self._handle_sink_failure(name, exc, sink_write_timing=sink_write_timing)
             return None
@@ -4387,10 +4661,14 @@ class LiveEventPipeline:
             return result
         except _MonitorEventPrepareError as exc:
             sink_write_timing.record_monitor_phase_timing(exc.timing)
-            self._handle_sink_failure("monitor", exc.error, sink_write_timing=sink_write_timing)
+            self._handle_sink_failure(
+                "monitor", exc.error, sink_write_timing=sink_write_timing
+            )
             return None
         except Exception as exc:
-            self._handle_sink_failure("monitor", exc, sink_write_timing=sink_write_timing)
+            self._handle_sink_failure(
+                "monitor", exc, sink_write_timing=sink_write_timing
+            )
             return None
         finally:
             sink_write_timing.record("monitor", time.monotonic_ns() - sink_started_ns)
@@ -4502,9 +4780,7 @@ def emit_event(
             raw_event_type = (
                 event.event_type
                 if isinstance(event, LiveEvent)
-                else event.get("event_type")
-                if isinstance(event, Mapping)
-                else None
+                else event.get("event_type") if isinstance(event, Mapping) else None
             )
         except Exception:
             raw_event_type = None

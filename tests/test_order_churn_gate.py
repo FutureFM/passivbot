@@ -322,6 +322,7 @@ def _raw_forager_selection(**overrides) -> dict:
     selection = {
         "pside": "long",
         "slots_to_fill": 1,
+        "ranking_required": True,
         "score_hysteresis_pct": 0.1,
         "selected_symbol_indices": [0],
         "incumbent_symbol_indices": [0],
@@ -333,6 +334,7 @@ def _raw_forager_selection(**overrides) -> dict:
                 "volume_component": 1.0,
                 "ema_readiness_component": 1.0,
                 "volatility_component": 1.0,
+                "unilateralness_component": 0.0,
                 "selected": True,
                 "incumbent": True,
             }
@@ -3257,6 +3259,14 @@ def test_raw_rust_output_rejects_impossible_loss_gate_block(overrides, error):
         (
             {"forager_selections": [_raw_forager_selection(slots_to_fill="1")]},
             "invalid slots_to_fill",
+        ),
+        (
+            {"forager_selections": [_raw_forager_selection(ranking_required=None)]},
+            "invalid ranking_required",
+        ),
+        (
+            {"forager_selections": [_raw_forager_selection(ranking_required=1)]},
+            "invalid ranking_required",
         ),
         (
             {

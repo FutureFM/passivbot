@@ -402,6 +402,8 @@ async def test_backtest_cli_entrypoint_writes_hash_and_fills(
     monkeypatch.setattr(sys, 'argv', ['backtest.py', str(source), '-dp', disable_plotting])
     await backtest.main()
     results = list(output.rglob('config.json'))
+    if suite:  # the suite root also records its own run config
+        results = [p for p in results if p.parent.name in ('one', 'two')]
     assert len(results) == (2 if suite else 1)
     if suite:
         digests = {json.loads(p.read_text())['backtest']['organillo_carton_hash'] for p in results}
@@ -440,6 +442,14 @@ def test_prepared_selection_hash_mismatch_is_rejected(tmp_path):
 @pytest.mark.asyncio
 @pytest.mark.parametrize('suite', [False, True])
 async def test_optimizer_cli_entrypoint_runs_bounded_candidates(tmp_path, monkeypatch, suite):
+    # deap registers fitness classes per process; do not leak this run's objectives.
+    from deap import creator
+    for name in ("FitnessMulti", "Individual"):
+        if hasattr(creator, name):
+            monkeypatch.delattr(creator, name)
+        else:
+            monkeypatch.setattr(creator, name, None, raising=False)
+            monkeypatch.delattr(creator, name)
     import optimize
     import sys
     cfg = config_for(carton(tmp_path))

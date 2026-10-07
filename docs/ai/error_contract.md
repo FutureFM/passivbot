@@ -55,6 +55,12 @@ Account-critical surfaces are required before any exchange action:
 2. balance
 3. open orders
 
+The reduced Rust full-position close API does not need balance to size a close: it
+accepts signed size, book, tick size and execution policy. This numerical API does
+not waive live admission requirements. HSL must derive its current decision from
+fresh account facts, including balance, before each protective write. Malformed
+or incomplete close batches are fatal.
+
 Market snapshots must be fresh for the symbols acted upon. Candles and EMAs are required only for
 order classes whose strategy or risk decision consumes them. Stale flat-symbol candles must not
 block protective management of held symbols.
@@ -66,6 +72,8 @@ backtests, and may scope only that explicit live absence to forager selection, o
 strategy, or unstuck consumers that need it. A structurally required trailing bundle paired with
 `trailing_available=false` is inert transport data and must be rejected before any consuming
 strategy branch can read it.
+CPU backtests may explicitly mark only known, incomplete RMS Forager replay windows
+as described in `features/strategy_runtime.md`; this does not relax other backtest inputs.
 Missing ordinary strategy input produces no ideal orders for the entry or close branch that
 consumes it, so normal Rust-authoritative reconciliation removes any now-stale resting orders from
 that branch. The other strategy branch, independent Rust risk reducers, and panic actions continue
@@ -83,24 +91,47 @@ flat zero-volume rows for active strategy inputs while authoritative overlap rep
 Trailing-extrema reconstruction may use the same projection only for a still-open tail after dense
 post-fill coverage; it must not bridge a missing reset boundary or internal minute, and the
 projected rows must be discarded after that read so delayed authoritative highs and lows replace
-them immediately. Forager ranking quote-volume and log-range inputs retain their narrower
-carry-forward contract.
+them immediately. Forager ranking quote-volume and log-range inputs for current, remote-enabled
+candidates may bridge a later-bounded internal gap when the complete gap length is within
+`live.max_active_candle_tail_gap_minutes`. This is an explicitly approximate ranking-continuity
+policy, not proof that the missing rows were fetched. The rows remain unresolved and retryable,
+are never persisted, and are replaced by delayed authoritative candles. Cache-only candidates
+remain strict across unresolved internal gaps. Existing known-gap and refresh diagnostics expose
+the underlying repair state. A compact per-symbol/metric transition diagnostic additionally marks
+when ranking-input calculation consumes bounded continuity and later resumes from authoritative
+candles; it does not retain per-span contexts or consecutive-use counters.
 
 Protective panic and reduce-only actions may proceed when their own account-critical and
 symbol-scoped requirements are fresh, even if unrelated strategy surfaces are unavailable.
+
+Current HSL fact availability and best-effort historical reconstruction follow
+`features/equity_hard_stop_loss.md`. Fresh current balance, positions and required marks
+remain mandatory. Historical ambiguity is reconciled by the shared Rust evaluator with
+observable approximations; it does not start a separate grace/fallback controller or
+retain a panic commitment. Current nonpositive equity is a loss signal, not missing data.
+Ordinary strategy and unrelated risk consumers retain their own required inputs.
+Malformed configuration and producer output remain fatal at their owning boundary.
 
 ## Forager And Eligibility Inputs
 
 Flat-symbol forager candidates may remain rankable within
 `live.max_forager_candle_staleness_minutes`. Close EMA readiness may use bounded flat-close
-projection. Quote-volume and log-range ranking inputs carry forward their latest known EMA with
-age/source metadata; they do not receive invented zero tails.
+projection. Quote-volume and log-range ranking inputs for current, remote-enabled candidates may
+use flat zero-volume continuity for later-bounded internal gaps within
+`live.max_active_candle_tail_gap_minutes`.
+Cache-only ranking inputs instead carry forward their latest known EMA with age/source metadata;
+they do not receive invented zero tails.
 When the forager setting is unset, its budget-derived acceptable age must not be shorter than
 `live.max_active_candle_tail_gap_minutes`; the refresh budget must not silently reduce the active
 tail grace period. An explicit positive forager cap is an operator override.
 
 Candidates with no prior feature basis, non-finite carried values, or excessive feature age are
 unavailable for new entries. Do not silently rank only the subset that happened to refresh first.
+Ranking-feature absence must remain scoped to forager selection: when the exact remaining eligible
+candidate count fits the remaining slots, Rust may select those candidates without ranking and
+must not let Python turn that unused input absence into symbol-wide non-tradability or a current
+ranking-unavailable alert. Diagnostics may retain the gap as conditional until Rust reports that
+ranking was required for that side.
 
 Approved and ignored coin state is an entry-eligibility input. Stale or unreadable eligibility
 blocks affected initial entries but not protective management. With `auto_gs=true`, removal of a
@@ -114,10 +145,12 @@ planning may use the configured lookback only when the cache proves `history_sco
 refresh or deferral, never a neutral history.
 
 Pending or degraded realized PnL blocks only enabled consumers that require authoritative PnL, such
-as HSL, operational auto-unstuck with positive total exposure, or the realized-loss gate. When
+as operational auto-unstuck with positive total exposure, or the realized-loss gate. When
 every such consumer is disabled, proven fill history may remain ready for structural consumers
 such as fill timestamps; PnL defects remain observable and repairable but do not globally defer
-planning. Enabling a PnL consumer restores the strict requirement without a neutral PnL fallback.
+planning. Enabling a strict PnL consumer restores that requirement. HSL instead uses its
+explicit best-effort historical reconstruction contract; damaged history does not
+justify a neutral signal or indefinite protection deferral.
 
 Corrupt or unavailable fills use bounded repair/retry and explicit degraded decisions. Valid
 manual or external exchange fills without Passivbot client IDs are exchange truth unless they

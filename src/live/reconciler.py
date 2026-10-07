@@ -155,9 +155,12 @@ def _initialize_fresh_entry_trace(
 
 def add_to_recent_order_cancellations(bot, order):
     """Record a recently cancelled order to throttle repeated cancellations."""
+    stamp = _utc_ms()
     bot.recent_order_cancellations.append(
-        {**order, **{"execution_timestamp": _utc_ms()}}
+        {**order, **{"execution_timestamp": stamp}}
     )
+    from live.console_health import observe_order_write
+    observe_order_write(bot, stamp)
 
 
 def order_was_recently_cancelled(bot, order, max_age_ms=15_000) -> float:
@@ -198,7 +201,10 @@ def order_matches_bot_cancellation(bot, order, max_age_ms=180_000) -> bool:
 
 def add_to_recent_order_executions(bot, order):
     """Track newly created orders to limit duplicate submissions."""
-    bot.recent_order_executions.append({**order, **{"execution_timestamp": _utc_ms()}})
+    stamp = _utc_ms()
+    bot.recent_order_executions.append({**order, **{"execution_timestamp": stamp}})
+    from live.console_health import observe_order_write
+    observe_order_write(bot, stamp)
 
 
 def order_matches_recent_execution(bot, order, max_age_ms=180_000) -> bool:
@@ -311,7 +317,9 @@ def extract_order_exchange_id(order: dict) -> str:
     return ""
 
 
-def ema_entry_cancellation_order_key(order: dict) -> Optional[tuple[str, str, str, str]]:
+def ema_entry_cancellation_order_key(
+    order: dict,
+) -> Optional[tuple[str, str, str, str]]:
     """Return a strong identity for an already-proven resting entry.
 
     Degraded-mode cancellation is an exception to manual ownership, so price/qty
@@ -897,6 +905,10 @@ def mark_account_critical_state_dirty(
     level: int = logging.DEBUG,
 ) -> None:
     """Force a coherent account-state refresh before the next execution cycle."""
+    # Separate external account invalidations from intentional order-write confirmations.
+    bot._account_invalidation_generation = (
+        int(getattr(bot, "_account_invalidation_generation", 0) or 0) + 1
+    )
     min_epoch = int(bot._ensure_freshness_ledger().epoch) + 1
     bot._request_authoritative_confirmation(ACCOUNT_SURFACES, min_epoch=min_epoch)
     bot.execution_scheduled = True
@@ -965,7 +977,16 @@ async def calc_orders_to_cancel_and_create(bot):
         prepare_order_churn_evidence(bot, ideal_orders, generation=generation)
     else:
         state.clear_history()
-    return await calc_orders_to_cancel_and_create_from_ideal(bot, ideal_orders)
+    from live import hsl_live
+
+    wave = bot._hsl_planning_wave
+    snapshot = bot._current_planning_snapshot
+    cancels, creates = await calc_orders_to_cancel_and_create_from_ideal(
+        bot, ideal_orders
+    )
+    hsl_live.owner(bot).bind(wave, cancels, creates, ordinary=True)
+    bot._current_planning_snapshot = snapshot
+    return cancels, creates
 
 
 def validate_rust_ideal_orders(ideal_orders: object) -> None:
@@ -1072,13 +1093,9 @@ def _validate_rust_reducer_enablement(
         protective_family in _SUBMITTED_GATED_REDUCER_FAMILIES
         and protective_family not in submitted_reducer_family_enablement[pair]
     ):
-        raise FatalBotException(
-            f"{context} contradicts submitted reducer enablement"
-        )
+        raise FatalBotException(f"{context} contradicts submitted reducer enablement")
     if protective_family == "close_unstuck" and not submitted_auto_unstuck_allowed:
-        raise FatalBotException(
-            f"{context} contradicts submitted auto-unstuck gate"
-        )
+        raise FatalBotException(f"{context} contradicts submitted auto-unstuck gate")
 
 
 def _expected_rust_execution_priority(order_type: str, input_mode: object) -> str:
@@ -1128,10 +1145,7 @@ def _validate_rust_order_family_for_submitted_mode(
             and submitted_position_size == 0.0
             and not submitted_flat_side_eligible
         )
-        or (
-            mode == "graceful_stop"
-            and submitted_position_size == 0.0
-        )
+        or (mode == "graceful_stop" and submitted_position_size == 0.0)
     )
     if invalid:
         raise FatalBotException(
@@ -1194,9 +1208,8 @@ def _validate_rust_flat_entry_batch(
             f"entry_grid_normal_{pside}",
             f"entry_grid_cropped_{pside}",
         }
-        valid = (
-            order_types.count(initial_type) == 1
-            and all(order_type in allowed_types for order_type in order_types)
+        valid = order_types.count(initial_type) == 1 and all(
+            order_type in allowed_types for order_type in order_types
         )
     if not valid:
         raise FatalBotException(
@@ -1286,6 +1299,10 @@ def _validate_rust_panic_limit_price(
 ) -> None:
     """Reject panic-limit prices inconsistent with Rust's submitted-book formula."""
     _qty_step, price_step, _min_qty, _min_cost, _c_mult = exchange
+    _validate_rust_panic_price(price, pside, order_book, price_step, context)
+
+
+def _validate_rust_panic_price(price, pside, order_book, price_step, context):
     bid, ask = order_book
     if pside == "long":
         expected_step_count = max(
@@ -1377,9 +1394,7 @@ def _validate_rust_close_exchange_constraints(
         raise FatalBotException(
             f"{context} quantity is inconsistent with submitted qty_step"
         )
-    minimum_qty_tolerance = _rust_representation_tolerance(
-        qty_abs, effective_min_qty
-    )
+    minimum_qty_tolerance = _rust_representation_tolerance(qty_abs, effective_min_qty)
     if qty_abs + minimum_qty_tolerance < effective_min_qty:
         raise FatalBotException(
             f"{context} quantity is below submitted effective close minimum"
@@ -1409,11 +1424,7 @@ def _expected_rust_panic_execution_type(
     if global_input.get("panic_close_market", False) is True:
         return "market"
     hsl_enabled, panic_close_order_type = symbol_side_hsl_execution
-    return (
-        "market"
-        if hsl_enabled and panic_close_order_type == "market"
-        else "limit"
-    )
+    return "market" if hsl_enabled and panic_close_order_type == "market" else "limit"
 
 
 def _expected_rust_execution_type(
@@ -1436,9 +1447,7 @@ def _expected_rust_execution_type(
     market_price = (order_book[0] + order_book[1]) * 0.5
     if not math.isfinite(market_price) or market_price <= 0.0:
         return "limit"
-    if (qty > 0.0 and price >= market_price) or (
-        qty < 0.0 and price <= market_price
-    ):
+    if (qty > 0.0 and price >= market_price) or (qty < 0.0 and price <= market_price):
         return "market"
     threshold = _validated_rust_finite_number(
         global_input.get("market_order_near_touch_threshold", 0.001),
@@ -1472,6 +1481,23 @@ def _submitted_rust_input_context(
         raise FatalBotException(
             "Rust orchestrator validation missing corresponding symbol inputs"
         )
+    try:
+        adaptive = any(
+            any(s[side]["bot_params"].get("entry_cooldown_weights_minutes", {}).values())
+            or s[side]["bot_params"].get("entry_cooldown_min_duration_minutes", 0) != 0
+            or s[side]["bot_params"].get("entry_cooldown_max_duration_minutes") is not None
+            for s in symbols
+            for side in ("long", "short")
+        )
+        durations = None
+        if adaptive:
+            import passivbot_rust
+
+            durations = json.loads(
+                passivbot_rust.entry_cooldown_durations_json(json.dumps(orchestrator_input))
+            )
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        raise FatalBotException("Rust orchestrator has invalid submitted entry cooldown inputs") from exc
     valid_modes = {"normal", "panic", "graceful_stop", "tp_only", "manual"}
     modes: dict[tuple[int, str], object] = {}
     order_books: dict[int, tuple[float, float]] = {}
@@ -1513,9 +1539,7 @@ def _submitted_rust_input_context(
             or not isinstance(n_positions, int)
             or n_positions < 0
         ):
-            raise FatalBotException(
-                f"global input has invalid {pside} n_positions"
-            )
+            raise FatalBotException(f"global input has invalid {pside} n_positions")
         global_side_enablement[pside] = (
             total_wallet_exposure_limit > 0.0 and n_positions > 0
         )
@@ -1529,9 +1553,7 @@ def _submitted_rust_input_context(
             side_params.get("risk_twel_enforcer_threshold", 0.0),
             f"global input has invalid {pside} TWEL enforcer threshold",
         )
-        global_twel_enforcer_enablement[pside] = (
-            twel_enabled and twel_threshold > 0.0
-        )
+        global_twel_enforcer_enablement[pside] = twel_enabled and twel_threshold > 0.0
     hedge_mode = global_input.get("hedge_mode", True)
     if not isinstance(hedge_mode, bool):
         raise FatalBotException("Rust orchestrator global input has invalid hedge_mode")
@@ -1541,7 +1563,9 @@ def _submitted_rust_input_context(
         "trailing_grid_v7",
         "ema_anchor",
     }:
-        raise FatalBotException("Rust orchestrator global input has invalid strategy_kind")
+        raise FatalBotException(
+            "Rust orchestrator global input has invalid strategy_kind"
+        )
     seen_symbol_idxs: set[int] = set()
     reducer_family_enablement: dict[tuple[int, str], frozenset[str]] = {}
     for input_idx, row in enumerate(symbols):
@@ -1676,6 +1700,11 @@ def _submitted_rust_input_context(
                 bot_params.get("risk_entry_cooldown_minutes", 0.0),
                 f"symbol input {input_idx} has invalid {pside} risk_entry_cooldown_minutes",
             )
+            cooldown_unavailable = (
+                durations is not None and durations[f"{symbol_idx}:{pside}"] is None
+            )
+            if durations is not None and not cooldown_unavailable:
+                cooldown_minutes = durations[f"{symbol_idx}:{pside}"]
             if cooldown_minutes < 0.0:
                 raise FatalBotException(
                     f"Rust orchestrator symbol input {input_idx} has invalid {pside} risk_entry_cooldown_minutes"
@@ -1705,9 +1734,7 @@ def _submitted_rust_input_context(
                     close_retracement_enabled[(symbol_idx, pside)] = (
                         close_retracement_base_pct > 0.0
                     )
-            last_fill_timestamp_ms = side_input.get(
-                "last_increase_fill_timestamp_ms"
-            )
+            last_fill_timestamp_ms = side_input.get("last_increase_fill_timestamp_ms")
             if last_fill_timestamp_ms is not None:
                 last_fill_timestamp_ms = _validated_rust_u64(
                     last_fill_timestamp_ms,
@@ -1728,6 +1755,8 @@ def _submitted_rust_input_context(
                 )
             else:
                 entry_cooldown_active[(symbol_idx, pside)] = False
+            if cooldown_unavailable:
+                entry_cooldown_active[(symbol_idx, pside)] = True
             wallet_exposure_limit = _validated_rust_finite_number(
                 bot_params.get("wallet_exposure_limit"),
                 f"symbol input {input_idx} has invalid {pside} wallet_exposure_limit",
@@ -1765,11 +1794,11 @@ def _submitted_rust_input_context(
                 enabled_families.add("close_auto_reduce_wel")
             if global_twel_enforcer_enablement[pside]:
                 enabled_families.add("close_auto_reduce_twel")
-            if unstuck_enabled and all(value > 0.0 for value in unstuck_values.values()):
+            if unstuck_enabled and all(
+                value > 0.0 for value in unstuck_values.values()
+            ):
                 enabled_families.add("close_unstuck")
-            reducer_family_enablement[(symbol_idx, pside)] = frozenset(
-                enabled_families
-            )
+            reducer_family_enablement[(symbol_idx, pside)] = frozenset(enabled_families)
     if seen_symbol_idxs != expected_symbol_idxs:
         raise FatalBotException(
             "Rust orchestrator symbol inputs do not cover the requested symbols"
@@ -1851,7 +1880,9 @@ def validate_rust_orchestrator_output(
     if not isinstance(out, dict):
         raise FatalBotException("Rust orchestrator output must be a mapping")
     if "orders" not in out:
-        raise FatalBotException("Rust orchestrator output missing required orders field")
+        raise FatalBotException(
+            "Rust orchestrator output missing required orders field"
+        )
     orders = out["orders"]
     if not isinstance(orders, list):
         raise FatalBotException("Rust orchestrator orders must be a list")
@@ -1985,10 +2016,7 @@ def validate_rust_orchestrator_output(
             panic_close_pairs.add(pair)  # exclusivity (quantity need not be full)
         if order_type.startswith("entry_"):
             entry_order_count[pair] = entry_order_count.get(pair, 0) + 1
-            if (
-                submitted_entry_cooldown_positive[pair]
-                and entry_order_count[pair] > 1
-            ):
+            if submitted_entry_cooldown_positive[pair] and entry_order_count[pair] > 1:
                 raise FatalBotException(
                     f"Rust orchestrator {pside} entry batch for symbol_idx {symbol_idx} "
                     "contains more than one entry with positive submitted cooldown"
@@ -2031,9 +2059,7 @@ def validate_rust_orchestrator_output(
             protective_reducer_order_indices[pair] = order_idx
         if order_type.startswith("close_"):
             if order_type == f"close_ema_anchor_{pside}":
-                ema_anchor_close_count[pair] = (
-                    ema_anchor_close_count.get(pair, 0) + 1
-                )
+                ema_anchor_close_count[pair] = ema_anchor_close_count.get(pair, 0) + 1
                 if ema_anchor_close_count[pair] > 1:
                     raise FatalBotException(
                         f"Rust orchestrator {pside} EMA Anchor close batch for symbol_idx "
@@ -2116,8 +2142,8 @@ def validate_rust_orchestrator_output(
         if order_type.startswith("entry_"):
             bid, ask = submitted_order_books[symbol_idx]
             entry_cost_price = (
-                ask if qty > 0.0 else bid
-            ) if execution_type == "market" else price
+                (ask if qty > 0.0 else bid) if execution_type == "market" else price
+            )
             _validate_rust_entry_exchange_constraints(
                 qty,
                 entry_cost_price,
@@ -2197,7 +2223,9 @@ def validate_rust_orchestrator_output(
     if not isinstance(diagnostics, dict):
         raise FatalBotException("Rust orchestrator output missing valid diagnostics")
     if "warnings" not in diagnostics:
-        raise FatalBotException("Rust orchestrator diagnostics missing required warnings")
+        raise FatalBotException(
+            "Rust orchestrator diagnostics missing required warnings"
+        )
     warnings = diagnostics["warnings"]
     if not isinstance(warnings, list):
         raise FatalBotException("Rust orchestrator warnings must be a list")
@@ -2232,9 +2260,7 @@ def validate_rust_orchestrator_output(
             )
         pside = details.get("pside")
         if not isinstance(pside, str) or pside not in {"long", "short"}:
-            raise FatalBotException(
-                f"Rust orchestrator {context} has invalid pside"
-            )
+            raise FatalBotException(f"Rust orchestrator {context} has invalid pside")
         if variant in {
             "disabled_pside_has_position",
             "non_tradable_has_position",
@@ -2274,9 +2300,7 @@ def validate_rust_orchestrator_output(
             "reduce_overweight",
             "reduce_portfolio",
         }:
-            raise FatalBotException(
-                f"Rust orchestrator {context} has invalid policy"
-            )
+            raise FatalBotException(f"Rust orchestrator {context} has invalid policy")
         for field in ("candidate_count", "blocked_order_count"):
             value = details.get(field)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -2316,9 +2340,7 @@ def validate_rust_orchestrator_output(
                     f"Rust orchestrator symbol_state {state_idx} has invalid {pside} state"
                 )
             input_mode = (
-                side_state.get("input_mode")
-                if "input_mode" in side_state
-                else object()
+                side_state.get("input_mode") if "input_mode" in side_state else object()
             )
             if input_mode is not None and (
                 not isinstance(input_mode, str) or input_mode not in valid_modes
@@ -2352,14 +2374,11 @@ def validate_rust_orchestrator_output(
                         f"Rust orchestrator symbol_state {state_idx} has invalid {pside} {field}"
                     )
             submitted_symbol_states[(symbol_idx, pside)] = side_state
-            if (
-                side_state["active"]
-                and (
-                    not submitted_symbol_side_eligibility[(symbol_idx, pside)]
-                    or (
-                        submitted_position_sizes[(symbol_idx, pside)] == 0.0
-                        and not submitted_global_side_enablement[pside]
-                    )
+            if side_state["active"] and (
+                not submitted_symbol_side_eligibility[(symbol_idx, pside)]
+                or (
+                    submitted_position_sizes[(symbol_idx, pside)] == 0.0
+                    and not submitted_global_side_enablement[pside]
                 )
             ):
                 raise FatalBotException(
@@ -2468,7 +2487,10 @@ def validate_rust_orchestrator_output(
                     f"Rust orchestrator symbol_state for symbol_idx {symbol_idx} "
                     "violates submitted one-way position-side exclusion"
                 )
-            if short_allow_initial and submitted_position_sizes[(symbol_idx, "long")] != 0.0:
+            if (
+                short_allow_initial
+                and submitted_position_sizes[(symbol_idx, "long")] != 0.0
+            ):
                 raise FatalBotException(
                     f"Rust orchestrator symbol_state for symbol_idx {symbol_idx} "
                     "violates submitted one-way position-side exclusion"
@@ -2631,9 +2653,7 @@ def validate_rust_orchestrator_output(
             submitted_exchange_constraints[symbol_idx],
             f"Rust orchestrator loss_gate_block {block_idx}",
             minimum_price=(
-                finite_values["price"]
-                if block_execution_type == "limit"
-                else None
+                finite_values["price"] if block_execution_type == "limit" else None
             ),
         )
         qty_tolerance = _rust_representation_tolerance(
@@ -2753,6 +2773,7 @@ def validate_rust_orchestrator_output(
         "volume_component",
         "ema_readiness_component",
         "volatility_component",
+        "unilateralness_component",
     )
     event_finite_fields = (
         "incumbent_score",
@@ -2775,6 +2796,10 @@ def validate_rust_orchestrator_output(
             raise FatalBotException(
                 f"Rust orchestrator {context} has invalid slots_to_fill"
             )
+        if not isinstance(selection.get("ranking_required"), bool):
+            raise FatalBotException(
+                f"Rust orchestrator {context} has invalid ranking_required"
+            )
         validate_diagnostic_finite_fields(selection, ("score_hysteresis_pct",), context)
         for field in ("selected_symbol_indices", "incumbent_symbol_indices"):
             validate_diagnostic_symbol_idx_list(
@@ -2784,10 +2809,7 @@ def validate_rust_orchestrator_output(
         for symbol_idx in selected_symbol_indices:
             pair = (symbol_idx, selection_pside)
             side_state = submitted_symbol_states[pair]
-            if (
-                submitted_position_sizes[pair] != 0.0
-                or not side_state["active"]
-            ):
+            if submitted_position_sizes[pair] != 0.0 or not side_state["active"]:
                 raise FatalBotException(
                     f"Rust orchestrator {context} selected_symbol_indices "
                     "disagree with submitted flat active symbol states"
@@ -2887,6 +2909,70 @@ def _parse_finite_json_float(value: str) -> float:
     return parsed
 
 
+def parse_and_validate_protective_closes(
+    out_json: object, inputs: list[dict]
+) -> list[dict]:
+    """Validate the entire minimal Rust exit batch before consuming any order."""
+    try:
+        orders = json.loads(
+            out_json,
+            object_pairs_hook=_reject_duplicate_json_object_keys,
+            parse_constant=_reject_nonstandard_json_constant,
+            parse_float=_parse_finite_json_float,
+        )
+    except (TypeError, ValueError, RecursionError, OverflowError) as exc:
+        raise FatalBotException(
+            "Rust protective closes returned malformed JSON"
+        ) from exc
+    if not isinstance(orders, list):
+        raise FatalBotException("Rust protective closes must be a list")
+    expected = {
+        (item["symbol_idx"], item["pside"]): item
+        for item in inputs
+        if item["position_size"] != 0.0
+    }
+    seen = set()
+    for order in orders:
+        if not isinstance(order, dict):
+            raise FatalBotException("Rust protective close must be a mapping")
+        idx, pside = order.get("symbol_idx"), order.get("pside")
+        if type(idx) is not int or not isinstance(pside, str):
+            raise FatalBotException("Rust protective close has invalid scope")
+        pair = (idx, pside)
+        if pair not in expected or pair in seen:
+            raise FatalBotException(
+                "Rust protective close has unexpected or duplicate scope"
+            )
+        seen.add(pair)
+        item = expected[pair]
+        qty = _validated_rust_finite_number(order.get("qty"), "protective close qty")
+        price = _validated_rust_finite_number(
+            order.get("price"), "protective close price"
+        )
+        if qty != -item["position_size"] or price <= 0.0:
+            raise FatalBotException(
+                "Rust protective close must close the whole current position"
+            )
+        if (
+            order.get("order_type") != f"close_panic_{pside}"
+            or order.get("execution_type") != item["execution_type"]
+            or order.get("execution_priority") != "risk_critical"
+        ):
+            raise FatalBotException(
+                "Rust protective close disagrees with submitted execution policy"
+            )
+        _validate_rust_panic_price(
+            price,
+            pside,
+            (item["order_book"]["bid"], item["order_book"]["ask"]),
+            item["price_step"],
+            "Rust protective close",
+        )
+    if seen != set(expected):
+        raise FatalBotException("Rust protective closes omitted an exposed scope")
+    return orders
+
+
 def parse_and_validate_rust_orchestrator_output(
     out_json: object,
     idx_to_symbol: dict[int, str],
@@ -2902,9 +2988,7 @@ def parse_and_validate_rust_orchestrator_output(
         )
     except (TypeError, ValueError, RecursionError, OverflowError) as exc:
         raise FatalBotException("Rust orchestrator returned malformed JSON") from exc
-    orders = validate_rust_orchestrator_output(
-        out, idx_to_symbol, orchestrator_input
-    )
+    orders = validate_rust_orchestrator_output(out, idx_to_symbol, orchestrator_input)
     return out, orders
 
 
@@ -2991,12 +3075,12 @@ def _emit_order_churn_evidence_summary(
         )
 
 
-def prepare_order_churn_evidence(
-    bot, ideal_orders: dict, *, generation: int
-) -> None:
+def prepare_order_churn_evidence(bot, ideal_orders: dict, *, generation: int) -> None:
     """Annotate Rust ideals from recent behavior without gating reconciliation."""
     state = bot._order_churn_gate_state
-    activation_count = int(bot.live_value("order_replacement_churn_gate_activation_count"))
+    activation_count = int(
+        bot.live_value("order_replacement_churn_gate_activation_count")
+    )
     reset = False
     if not state.history_started:
         state.history_started = True
@@ -3038,7 +3122,9 @@ def prepare_order_churn_evidence(
             symbols=complete_ideals,
         )
         return
-    window_seconds = float(bot.live_value("order_replacement_churn_gate_window_minutes")) * 60.0
+    window_seconds = (
+        float(bot.live_value("order_replacement_churn_gate_window_minutes")) * 60.0
+    )
     stability_seconds = (
         float(bot.live_value("order_replacement_churn_gate_stability_minutes")) * 60.0
     )
@@ -3051,13 +3137,14 @@ def prepare_order_churn_evidence(
         max_sample_gap_seconds=_order_churn_max_generation_gap_seconds(bot),
     )
     reset = state.history_reset_during_evaluation or reset
-    risk_active_pairs = set(
-        getattr(bot, "_order_churn_risk_active_pairs", ()) or ()
-    )
+    risk_active_pairs = set(getattr(bot, "_order_churn_risk_active_pairs", ()) or ())
     for orders in complete_ideals.values():
         for order in orders:
             decision = decisions.get(id(order), ChurnDecision(False, "unavailable"))
-            pair = (str(order.get("symbol") or ""), str(order.get("position_side") or ""))
+            pair = (
+                str(order.get("symbol") or ""),
+                str(order.get("position_side") or ""),
+            )
             if pair in risk_active_pairs:
                 # Raw-balance risk behavior remains owned by Rust.  Never let
                 # economy-only churn admission delay any order sharing the
@@ -3213,7 +3300,9 @@ async def calc_orders_to_cancel_and_create_from_ideal(
         logging.error(
             "[order] blocking all exchange actions because the account-critical open-orders "
             "snapshot is malformed | symbols=%s | blocked_cancellations=%d | blocked_creations=%d",
-            _pb_attr("Passivbot")._log_symbols(sorted(malformed_actual_symbols), limit=8),
+            _pb_attr("Passivbot")._log_symbols(
+                sorted(malformed_actual_symbols), limit=8
+            ),
             len(blocked_cancellations),
             len(blocked),
         )
@@ -3379,11 +3468,11 @@ def snapshot_actual_orders(
                 if connector_enabled:
                     remaining_qty = extract_order_remaining_qty(order)
                 else:
-                    remaining_qty = (
-                        abs(float(order["qty"])) if "qty" in order else None
-                    )
+                    remaining_qty = abs(float(order["qty"])) if "qty" in order else None
                 if remaining_qty is None or remaining_qty <= 0.0:
-                    raise ValueError("missing or contradictory authoritative remaining quantity")
+                    raise ValueError(
+                        "missing or contradictory authoritative remaining quantity"
+                    )
                 qty = float(remaining_qty)
                 price = float(order["price"])
                 if (
@@ -3421,22 +3510,18 @@ def snapshot_actual_orders(
                     if not isinstance(reduce_only, bool):
                         raise ValueError("missing authoritative close-only semantics")
                 else:
-                    reduce_only = (
-                        position_side == "long" and side == "sell"
-                    ) or (position_side == "short" and side == "buy")
+                    reduce_only = (position_side == "long" and side == "sell") or (
+                        position_side == "short" and side == "buy"
+                    )
                 raw_execution_type = str(
                     order.get("type") or order.get("execution_type") or ""
                 ).lower()
-                execution_type = (
-                    "limit" if raw_execution_type == "limit" else "unknown"
-                )
+                execution_type = "limit" if raw_execution_type == "limit" else "unknown"
                 custom_id = extract_order_custom_id(order)
                 pb_order_type = (
                     str(_pb_attr("custom_id_to_snake")(custom_id)).lower()
                     if custom_id
-                    and _pb_attr("custom_id_has_explicit_passivbot_marker")(
-                        custom_id
-                    )
+                    and _pb_attr("custom_id_has_explicit_passivbot_marker")(custom_id)
                     else "unknown"
                 )
                 if connector_enabled and pb_order_type != "unknown":
@@ -3546,9 +3631,7 @@ def _order_is_panic(order: dict) -> bool:
 
 
 def _order_is_market_panic(order: dict) -> bool:
-    execution_type = str(
-        order.get("type") or order.get("execution_type") or ""
-    ).lower()
+    execution_type = str(order.get("type") or order.get("execution_type") or "").lower()
     return (
         execution_type == "market"
         and _order_is_panic(order)
@@ -3753,7 +3836,9 @@ def apply_order_match_tolerance(
                     "skipped_recreate | %s | tolerance=%.4f%% price_diff=%.4f%% qty_diff=%.4f%%",
                     order.get("symbol", "?"),
                     tolerance * 100.0,
-                    pct_diff(float(order["price"]), float(to_cancel[match_idx]["price"])),
+                    pct_diff(
+                        float(order["price"]), float(to_cancel[match_idx]["price"])
+                    ),
                     pct_diff(float(order["qty"]), float(to_cancel[match_idx]["qty"])),
                 )
             except Exception:
@@ -3805,9 +3890,7 @@ def apply_order_match_tolerance(
             price_diff = pct_diff(
                 float(order["price"]), float(to_cancel[match_idx]["price"])
             )
-            qty_diff = pct_diff(
-                float(order["qty"]), float(to_cancel[match_idx]["qty"])
-            )
+            qty_diff = pct_diff(float(order["qty"]), float(to_cancel[match_idx]["qty"]))
             logging.debug(
                 "skipped_recreate | %s | tolerance=%.4f%% price_diff=%.4f%% qty_diff=%.4f%%",
                 order.get("symbol", "?"),
@@ -3834,8 +3917,7 @@ def apply_mode_filters(
 ) -> tuple[list[dict], list[dict]]:
     """Apply mode-specific cancel/create filtering rules."""
     authorized_ema_entry_cancellation_order_keys = set(
-        getattr(bot, "_orchestrator_ema_entry_cancellation_order_keys", set())
-        or set()
+        getattr(bot, "_orchestrator_ema_entry_cancellation_order_keys", set()) or set()
     )
     for pside in ["long", "short"]:
         mode = bot.PB_modes[pside].get(symbol)

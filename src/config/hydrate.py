@@ -17,12 +17,12 @@ from .scoring import extract_objective_specs
 from .schema import get_template_config
 from .tree_ops import add_missing_keys_recursively, remove_unused_keys_recursively
 
-
 Path = tuple[str, ...]
 
 PARTIALLY_OPEN_CONFIG_PATHS: set[Path] = {
-    ("backtest", "aggregate"),
+    ("backtest", "reducer"),
     ("live", "startup_phase_budgets"),
+    ("optimize", "fixed_runtime_overrides"),
 }
 BACKTEST_INHERITED_LIVE_KEYS: tuple[str, ...] = (
     "fee_pct_fallback",
@@ -40,14 +40,13 @@ TEMPLATE_SYNC_PRESERVE_PATHS: tuple[Path, ...] = (
     ("backtest", "market_settings_sources"),
     *tuple(PARTIALLY_OPEN_CONFIG_PATHS),
 )
-# Risk bounds without template defaults are optional: when present they are tuned, and when
-# absent the bot value stays fixed. Without this, sync would silently drop user bounds.
-_OPTIONAL_RISK_BOUND_KEYS = ("entry_cooldown_factor_per_fill", "entry_cooldown_max_minutes")
+# Divergence risk bounds have no template defaults and are optional: when present they are
+# tuned, and when absent the bot value stays fixed. Without this, sync would drop user bounds.
 _OPTIONAL_OPTIMIZE_BOUND_PATHS: tuple[Path, ...] = tuple(
     (pside, "risk", key)
     for pside in ("long", "short")
     for key in SHARED_OPTIMIZE_LOCAL_TO_FLAT_KEY["risk"]
-    if key.startswith("divergence_") or key in _OPTIONAL_RISK_BOUND_KEYS
+    if key.startswith("divergence_")
 )
 
 
@@ -61,6 +60,7 @@ def reject_backtest_inherited_live_fields(result: dict) -> None:
             f"{joined} {'is' if len(invalid) == 1 else 'are'} not supported; "
             f"set {'the value' if len(invalid) == 1 else 'these values'} under {live_joined} instead"
         )
+
 
 def hydrate_missing_template_fields(
     template: dict,
@@ -78,7 +78,9 @@ def hydrate_missing_template_fields(
     )
 
 
-def seed_missing_compatibility_sections(template: dict, result: dict, *, tracker=None) -> None:
+def seed_missing_compatibility_sections(
+    template: dict, result: dict, *, tracker=None
+) -> None:
     for pside in ("long", "short"):
         if pside not in result["bot"]:
             seeded = deepcopy(template["bot"][pside])
@@ -98,7 +100,9 @@ def seed_missing_compatibility_sections(template: dict, result: dict, *, tracker
             if tracker is not None:
                 tracker.add(["live", key], seeded)
             continue
-        if isinstance(result["live"][key], dict) and set(result["live"][key]).issubset({"long", "short"}):
+        if isinstance(result["live"][key], dict) and set(result["live"][key]).issubset(
+            {"long", "short"}
+        ):
             for pside in ("long", "short"):
                 if pside not in result["live"][key]:
                     result["live"][key][pside] = []
@@ -127,8 +131,26 @@ def sync_with_template(
             if not had_key:
                 tracker.add(["live", "base_config_path"], base_config_path)
             elif existing_base != base_config_path:
-                tracker.update(["live", "base_config_path"], existing_base, base_config_path)
+                tracker.update(
+                    ["live", "base_config_path"], existing_base, base_config_path
+                )
     template_with_extras = deepcopy(template)
+    from .optimize_bounds import preserve_optional_adaptive_bounds, set_flat_optimize_bound
+
+    # Canonicalize legacy leaves before template pruning; a mixed dictionary
+    # may contain both these leaves and explicit nested adaptive dimensions.
+    bounds = result["optimize"]["bounds"]
+    for key in list(bounds):
+        if isinstance(key, str) and key.startswith(("long_", "short_", "hsl_")):
+            set_flat_optimize_bound(bounds, result["live"]["strategy_kind"], key, bounds.pop(key))
+    preserve_optional_adaptive_bounds(template_with_extras, result)
+    # Keep only explicitly supplied HSL portfolio authority and its search bounds.
+    for section in (("bot",), ("optimize", "bounds")):
+        target, source = template_with_extras, result
+        for key in section:
+            target, source = target[key], source[key]
+        if "hsl" in source:
+            target["hsl"] = deepcopy(source["hsl"])
     template_with_extras.setdefault("live", {})["base_config_path"] = ""
     preserved_live_optimize_bounds = [
         ("optimize", "bounds", key)
@@ -146,9 +168,11 @@ def sync_with_template(
         ),
         tracker=tracker,
     )
-    remove_unused_keys_recursively(template["bot"], result["bot"], verbose=verbose, tracker=tracker)
     remove_unused_keys_recursively(
-        template["optimize"]["bounds"],
+        template_with_extras["bot"], result["bot"], verbose=verbose, tracker=tracker
+    )
+    remove_unused_keys_recursively(
+        template_with_extras["optimize"]["bounds"],
         result["optimize"]["bounds"],
         verbose=verbose,
         preserve=_OPTIONAL_OPTIMIZE_BOUND_PATHS,
@@ -162,7 +186,7 @@ def sync_with_template(
     )
 
 
-def _normalize_coin_sources(raw: Any) -> Dict[str, str]:
+def normalize_backtest_coin_sources(raw: Any) -> Dict[str, str]:
     if raw is None:
         return {}
     if not isinstance(raw, dict):
@@ -190,7 +214,9 @@ def _normalize_coin_sources(raw: Any) -> Dict[str, str]:
     return normalized
 
 
-def preserve_coin_sources(result: dict, *, live_sources_input: Optional[Dict[str, Any]] = None) -> None:
+def preserve_coin_sources(
+    result: dict, *, live_sources_input: Optional[Dict[str, Any]] = None
+) -> None:
     sources = result.setdefault("_coins_sources", {})
     live = result.get("live", {})
     for key in ("approved_coins", "ignored_coins"):
@@ -223,7 +249,7 @@ def apply_non_live_adjustments(
             if coin not in result["live"]["ignored_coins"][pside]
         ]
     result["backtest"]["end_date"] = format_end_date(result["backtest"]["end_date"])
-    result["backtest"]["coin_sources"] = _normalize_coin_sources(
+    result["backtest"]["coin_sources"] = normalize_backtest_coin_sources(
         result["backtest"].get("coin_sources", {})
     )
     if result["backtest"].get("filter_by_min_effective_cost") is None:
@@ -231,11 +257,32 @@ def apply_non_live_adjustments(
             result["live"].get("filter_by_min_effective_cost", False)
         )
 
-    result["optimize"]["scoring"] = [spec.to_config() for spec in extract_objective_specs(result)]
+    normalize_optimizer_settings(
+        result,
+        verbose=verbose,
+        tracker=tracker,
+        raw_optimize_limits=raw_optimize_limits,
+        raw_optimize_limits_present=raw_optimize_limits_present,
+    )
+
+
+def normalize_optimizer_settings(
+    result: dict,
+    *,
+    verbose: bool = True,
+    tracker=None,
+    raw_optimize_limits: Any = None,
+    raw_optimize_limits_present: Optional[bool] = None,
+) -> None:
+    """Normalize optimizer policy without resolving dates or coin-list files."""
+    result["optimize"]["scoring"] = [
+        spec.to_config() for spec in extract_objective_specs(result)
+    ]
     backend = str(result["optimize"].get("backend", "pymoo") or "pymoo").strip().lower()
-    if backend not in {"deap", "pymoo"}:
+    if backend not in {"deap", "gpu", "pymoo"}:
         raise ValueError(
-            f"optimize.backend must be one of ['deap', 'pymoo']; got {result['optimize'].get('backend')!r}"
+            "optimize.backend must be one of ['deap', 'gpu', 'pymoo']; "
+            f"got {result['optimize'].get('backend')!r}"
         )
     result["optimize"]["backend"] = backend
     population_size = result["optimize"].get("population_size")
@@ -290,4 +337,5 @@ def apply_non_live_adjustments(
     sort_optimize_bounds_in_place(
         result["optimize"]["bounds"],
         strategy_kind=result.get("live", {}).get("strategy_kind"),
+        portfolio_hsl=result["live"].get("hsl_signal_mode") == "unified",
     )

@@ -20,8 +20,7 @@ from config.shared_bot import (
     get_grouped_bot_value,
 )
 from config.strategy_spec import get_strategy_param_keys
-from risk_limits import WE_EXCESS_ALLOWANCE_MODE_BOUNDED
-
+from json_utils import json_dumps_streamlined
 
 TRAILING_GRID_V7_KIND = "trailing_grid_v7"
 
@@ -110,7 +109,6 @@ COIN_OVERRIDE_SIDE_PASSTHROUGH_KEYS = {
 }
 V7_ABSENT_RISK_DEFAULTS = {
     "risk_entry_cooldown_minutes": 0.0,
-    "risk_we_excess_allowance_mode": WE_EXCESS_ALLOWANCE_MODE_BOUNDED,
 }
 V7_INSERTED_DEFAULT_TOP_LEVEL_PATHS = (
     ("backtest", "candle_interval_minutes"),
@@ -124,7 +122,6 @@ V7_INSERTED_DEFAULT_TOP_LEVEL_PATHS = (
     ("backtest", "taker_fee_override"),
     ("live", "approved_coins"),
     ("live", "forager_score_hysteresis_pct"),
-    ("live", "hsl_position_during_cooldown_policy"),
     ("live", "hsl_signal_mode"),
 )
 V7_INSERTED_DEFAULT_SHARED_FLAT_KEYS = (
@@ -134,7 +131,6 @@ V7_INSERTED_DEFAULT_SHARED_FLAT_KEYS = (
     "risk_twel_enforcer_threshold",
     "risk_wel_enforcer_enabled",
     "risk_wel_enforcer_threshold",
-    "risk_we_excess_allowance_mode",
     "forager_score_weights",
     "forager_volatility_ema_span_1m",
     "forager_volume_drop_pct",
@@ -142,12 +138,10 @@ V7_INSERTED_DEFAULT_SHARED_FLAT_KEYS = (
     "hsl_cooldown_minutes_after_red",
     "hsl_ema_span_minutes",
     "hsl_enabled",
-    "hsl_no_restart_drawdown_threshold",
-    "hsl_orange_tier_mode",
     "hsl_panic_close_order_type",
     "hsl_red_threshold",
     "hsl_restart_after_red_policy",
-    "hsl_tier_ratios",
+    "hsl_scale_budget_with_excess_allowance",
     "unstuck_close_pct",
     "unstuck_ema_dist",
     "unstuck_enabled",
@@ -201,7 +195,9 @@ def _iter_leaf_items(mapping: dict, prefix: tuple[str, ...] = ()):
             yield path, value
 
 
-def _append_warning(report: dict, message: str, *, behavior_change: bool = False) -> None:
+def _append_warning(
+    report: dict, message: str, *, behavior_change: bool = False
+) -> None:
     report.setdefault("warnings", []).append(message)
     if behavior_change:
         report.setdefault("behavior_change_warnings", []).append(message)
@@ -210,8 +206,7 @@ def _append_warning(report: dict, message: str, *, behavior_change: bool = False
 @lru_cache(maxsize=1)
 def _supported_strategy_leaf_paths() -> frozenset[tuple[str, ...]]:
     return frozenset(
-        tuple(key.split("."))
-        for key in get_strategy_param_keys(TRAILING_GRID_V7_KIND)
+        tuple(key.split(".")) for key in get_strategy_param_keys(TRAILING_GRID_V7_KIND)
     )
 
 
@@ -226,7 +221,10 @@ def _canonical_strategy_leaf_path(path: tuple[str, ...]) -> tuple[str, ...] | No
     if flat_key in OBSOLETE_BOUND_KEYS or flat_key in MANUAL_REVIEW_BOUND_KEYS:
         return None
     canonical_flat_key = LEGACY_BOUND_ALIASES.get(flat_key, flat_key)
-    if canonical_flat_key in OBSOLETE_BOUND_KEYS or canonical_flat_key in MANUAL_REVIEW_BOUND_KEYS:
+    if (
+        canonical_flat_key in OBSOLETE_BOUND_KEYS
+        or canonical_flat_key in MANUAL_REVIEW_BOUND_KEYS
+    ):
         return None
     mapped_path = STRATEGY_FIELD_MAP.get(canonical_flat_key)
     if mapped_path is not None and _is_supported_strategy_leaf_path(mapped_path):
@@ -238,9 +236,14 @@ def _path_leaf(path: str) -> str:
     return path.rsplit(".", 1)[-1]
 
 
-def _shared_alias_source_is_authoritative(source_path: str, canonical_flat_key: str) -> bool:
+def _shared_alias_source_is_authoritative(
+    source_path: str, canonical_flat_key: str
+) -> bool:
     source_key = _path_leaf(source_path)
-    return source_key == canonical_flat_key or source_key in AUTHORITATIVE_FORAGER_ALIAS_KEYS
+    return (
+        source_key == canonical_flat_key
+        or source_key in AUTHORITATIVE_FORAGER_ALIAS_KEYS
+    )
 
 
 def _bound_source_key(source_path: str) -> str:
@@ -255,7 +258,10 @@ def _bound_local_key(flat_key: str) -> str:
 
 def _bound_alias_source_is_authoritative(source_path: str, canonical_key: str) -> bool:
     source_key = _bound_source_key(source_path)
-    return source_key == canonical_key or _bound_local_key(source_key) in AUTHORITATIVE_FORAGER_ALIAS_KEYS
+    return (
+        source_key == canonical_key
+        or _bound_local_key(source_key) in AUTHORITATIVE_FORAGER_ALIAS_KEYS
+    )
 
 
 def _is_old_filter_bound_alias(flat_key: str) -> bool:
@@ -292,7 +298,9 @@ def _record_target_value(
     return False
 
 
-def _copy_supported_top_level_sections(source: dict, target: dict, report: dict) -> None:
+def _copy_supported_top_level_sections(
+    source: dict, target: dict, report: dict
+) -> None:
     for section in ("live", "backtest", "optimize", "logging", "monitor"):
         source_section = source.get(section)
         target_section = target.get(section)
@@ -314,7 +322,10 @@ def _migrate_max_warmup_minutes(source: dict, target: dict, report: dict) -> Non
     """Collapse v7's live/backtest warmup caps into v8's shared live field."""
     source_live = source.get("live")
     source_backtest = source.get("backtest")
-    if not isinstance(source_backtest, dict) or "max_warmup_minutes" not in source_backtest:
+    if (
+        not isinstance(source_backtest, dict)
+        or "max_warmup_minutes" not in source_backtest
+    ):
         return
 
     backtest_value = source_backtest["max_warmup_minutes"]
@@ -358,8 +369,7 @@ def _report_unknown_top_level_sections(source: dict, report: dict) -> None:
 
 def migration_report_has_unresolved(report: dict) -> bool:
     return bool(
-        report.get("manual_review_fields")
-        or report.get("dropped_unsupported_fields")
+        report.get("manual_review_fields") or report.get("dropped_unsupported_fields")
     )
 
 
@@ -450,7 +460,9 @@ def _append_inserted_default(report: dict, path: str) -> None:
         inserted.append(path)
 
 
-def _source_side_has_strategy_path(source_side: dict, strategy_path: tuple[str, ...]) -> bool:
+def _source_side_has_strategy_path(
+    source_side: dict, strategy_path: tuple[str, ...]
+) -> bool:
     return any(
         legacy_key in source_side and path == strategy_path
         for legacy_key, path in STRATEGY_FIELD_MAP.items()
@@ -548,7 +560,10 @@ def _source_has_optimize_bound_path(source: dict, target_path: tuple[str, ...]) 
                         return True
             continue
         for leaf_path, _value in _iter_leaf_items(group_bounds):
-            if _nested_bound_target_path(pside, str(group_name), leaf_path) == target_path:
+            if (
+                _nested_bound_target_path(pside, str(group_name), leaf_path)
+                == target_path
+            ):
                 return True
     return False
 
@@ -556,11 +571,6 @@ def _source_has_optimize_bound_path(source: dict, target_path: tuple[str, ...]) 
 def _source_side_has_default_source_value(source_side: dict, flat_key: str) -> bool:
     if _source_side_has_shared_value(source_side, flat_key):
         return True
-    if flat_key == "hsl_tier_ratios":
-        return (
-            "hsl_tier_ratio_yellow" in source_side
-            or "hsl_tier_ratio_orange" in source_side
-        )
     return any(
         legacy_key in source_side
         for legacy_key, canonical_key in LEGACY_SHARED_SIDE_ALIASES.items()
@@ -589,17 +599,16 @@ def _record_inserted_v8_defaults(source: dict, target: dict, report: dict) -> No
                 continue
             if (
                 flat_key in V7_THRESHOLD_DERIVED_ENFORCER_ENABLED_KEYS
-                and _source_side_has_nonpositive_enforcer_threshold(source_side, flat_key)
+                and _source_side_has_nonpositive_enforcer_threshold(
+                    source_side, flat_key
+                )
             ):
                 continue
             if _path_exists({"bot": target_bot}, target_path):
                 _append_inserted_default(report, ".".join(target_path))
 
         target_strategy = (
-            target_bot
-            .get(pside, {})
-            .get("strategy", {})
-            .get(TRAILING_GRID_V7_KIND, {})
+            target_bot.get(pside, {}).get("strategy", {}).get(TRAILING_GRID_V7_KIND, {})
         )
         if isinstance(target_strategy, dict):
             for strategy_path, _value in _iter_leaf_items(target_strategy):
@@ -607,7 +616,15 @@ def _record_inserted_v8_defaults(source: dict, target: dict, report: dict) -> No
                     continue
                 _append_inserted_default(
                     report,
-                    ".".join(("bot", pside, "strategy", TRAILING_GRID_V7_KIND, *strategy_path)),
+                    ".".join(
+                        (
+                            "bot",
+                            pside,
+                            "strategy",
+                            TRAILING_GRID_V7_KIND,
+                            *strategy_path,
+                        )
+                    ),
                 )
 
     target_bounds = target.get("optimize", {}).get("bounds", {})
@@ -640,12 +657,10 @@ def _force_v7_absent_risk_defaults(source: dict, target: dict, report: dict) -> 
         source_side = bot.get(pside, {}) if isinstance(bot, dict) else {}
         if not isinstance(source_side, dict):
             source_side = {}
-        target_risk = target["bot"][pside].setdefault("risk", {})
-        target_bounds_risk = target["optimize"]["bounds"][pside].setdefault("risk", {})
         for flat_key, default_value in V7_ABSENT_RISK_DEFAULTS.items():
             group_name, local_key = FLAT_BOT_KEY_TO_GROUP_PATH[flat_key]
-            if group_name != "risk":
-                continue
+            target_risk = target["bot"][pside].setdefault(group_name, {})
+            target_bounds_risk = target["optimize"]["bounds"][pside].setdefault(group_name, {})
             if _source_side_has_shared_value(source_side, flat_key):
                 value = target_risk.get(local_key)
             else:
@@ -655,13 +670,14 @@ def _force_v7_absent_risk_defaults(source: dict, target: dict, report: dict) -> 
                 if old_value != value:
                     _append_warning(
                         report,
-                        f"bot.{pside}.risk.{local_key} was not a v7 parameter; "
+                        f"bot.{pside}.{group_name}.{local_key} was not a v7 parameter; "
                         f"using {value!r} for v7 behavior instead of the v8 template value "
                         f"{old_value!r}.",
                         behavior_change=True,
                     )
-            if flat_key == "risk_entry_cooldown_minutes" and not _source_has_shared_bound(
-                source, pside, flat_key
+            if (
+                flat_key == "risk_entry_cooldown_minutes"
+                and not _source_has_shared_bound(source, pside, flat_key)
             ):
                 target_bounds_risk[local_key] = [float(value), float(value), 0.1]
 
@@ -688,7 +704,12 @@ def _disable_zero_threshold_controls_for_side(
             "total_exposure_entry_gate_enabled",
         ),
     )
-    for flat_threshold_key, threshold_key, enabled_key, related_gate_key in enforcer_pairs:
+    for (
+        flat_threshold_key,
+        threshold_key,
+        enabled_key,
+        related_gate_key,
+    ) in enforcer_pairs:
         if not _source_side_has_shared_value(source_side, flat_threshold_key):
             continue
         raw_threshold = get_grouped_bot_value(source_side, flat_threshold_key)
@@ -709,7 +730,10 @@ def _disable_zero_threshold_controls_for_side(
                 "disabled enforcers when thresholds are zero or negative.",
                 behavior_change=True,
             )
-        if related_gate_key is not None and target_risk.get(related_gate_key) is not False:
+        if (
+            related_gate_key is not None
+            and target_risk.get(related_gate_key) is not False
+        ):
             target_risk[related_gate_key] = False
             _append_warning(
                 report,
@@ -721,7 +745,9 @@ def _disable_zero_threshold_controls_for_side(
             )
 
 
-def _disable_enforcers_for_zero_v7_thresholds(source: dict, target: dict, report: dict) -> None:
+def _disable_enforcers_for_zero_v7_thresholds(
+    source: dict, target: dict, report: dict
+) -> None:
     bot = source.get("bot", {})
     if not isinstance(bot, dict):
         return
@@ -739,7 +765,9 @@ def _disable_enforcers_for_zero_v7_thresholds(source: dict, target: dict, report
         )
 
 
-def _warn_if_risk_excess_would_be_clamped(risk: dict, *, path: str, report: dict) -> None:
+def _warn_if_risk_excess_would_be_clamped(
+    risk: dict, *, path: str, report: dict
+) -> None:
     try:
         twel = float(risk.get("total_wallet_exposure_limit", 0.0) or 0.0)
         n_positions = int(round(float(risk.get("n_positions", 0.0) or 0.0)))
@@ -753,7 +781,11 @@ def _warn_if_risk_excess_would_be_clamped(risk: dict, *, path: str, report: dict
         return
     if twel <= 0.0 or n_positions <= 0 or excess <= 0.0:
         return
-    base_wel = explicit_wel if explicit_wel is not None and explicit_wel > 0.0 else twel / n_positions
+    base_wel = (
+        explicit_wel
+        if explicit_wel is not None and explicit_wel > 0.0
+        else twel / n_positions
+    )
     raw_allowed_wel = base_wel * (1.0 + excess)
     if raw_allowed_wel <= twel:
         return
@@ -763,10 +795,8 @@ def _warn_if_risk_excess_would_be_clamped(risk: dict, *, path: str, report: dict
         f"{path}.we_excess_allowance_pct={excess:g} would give v7 raw per-position "
         f"WEL {raw_allowed_wel:g}, above side TWEL {twel:g} "
         f"(base WEL = {base_wel:g}). The migrated v8 config keeps "
-        f"{path}.we_excess_allowance_mode='bounded', so the effective excess allowance is "
-        f"capped at {bounded_excess:g}. To intentionally use v7 raw/unclamped behavior, set "
-        f"{path}.we_excess_allowance_mode='legacy_raw' after migration and review the added "
-        f"risk explicitly.",
+        "bounded excess allowance, so the effective allowance is "
+        f"capped at {bounded_excess:g}. Raw/unclamped exposure is no longer supported; review this change and re-backtest before trading.",
         behavior_change=True,
     )
 
@@ -801,7 +831,9 @@ def _warn_if_v7_excess_would_be_clamped(target: dict, report: dict) -> None:
             merged_risk = deepcopy(base_risks.get(pside, {}))
             merged_risk.update(override_risk)
             if "wallet_exposure_limit" in override_side:
-                merged_risk["wallet_exposure_limit"] = override_side["wallet_exposure_limit"]
+                merged_risk["wallet_exposure_limit"] = override_side[
+                    "wallet_exposure_limit"
+                ]
             _warn_if_risk_excess_would_be_clamped(
                 merged_risk,
                 path=f"coin_overrides.{coin}.bot.{pside}.risk",
@@ -847,35 +879,7 @@ def _move_shared_side_fields(
         ):
             continue
         target_side.setdefault(group_name, {})[local_key] = deepcopy(value)
-        report["moved_fields"].append(
-            f"{source_path} -> {target_path}"
-        )
-
-    for legacy_key, local_key in (
-        ("hsl_tier_ratio_yellow", "tier_ratios.yellow"),
-        ("hsl_tier_ratio_orange", "tier_ratios.orange"),
-    ):
-        if legacy_key not in source_side:
-            continue
-        value = source_side[legacy_key]
-        source_path = f"{source_prefix}.{legacy_key}"
-        if _disallow_if_needed("hsl_tier_ratios", source_path):
-            continue
-        target_path = f"{target_prefix}.hsl.{local_key}"
-        path_parts = tuple(local_key.split("."))
-        if not _record_target_value(
-            written_targets,
-            ("hsl", *path_parts),
-            source_path=source_path,
-            target_path=target_path,
-            value=value,
-            report=report,
-        ):
-            continue
-        _set_path(target_side.setdefault("hsl", {}), path_parts, value)
-        report["moved_fields"].append(
-            f"{source_path} -> {target_path}"
-        )
+        report["moved_fields"].append(f"{source_path} -> {target_path}")
 
     if isinstance(source_side.get("forager_score_weights"), dict):
         value = source_side["forager_score_weights"]
@@ -915,9 +919,7 @@ def _move_shared_side_fields(
         ):
             continue
         target_side.setdefault("forager", {})[local_key] = deepcopy(value)
-        report["moved_fields"].append(
-            f"{source_path} -> {target_path}"
-        )
+        report["moved_fields"].append(f"{source_path} -> {target_path}")
 
     for legacy_key, canonical_flat_key in LEGACY_SHARED_SIDE_ALIASES.items():
         if legacy_key not in source_side:
@@ -944,9 +946,7 @@ def _move_shared_side_fields(
         ):
             continue
         target_side.setdefault(group_name, {})[local_key] = deepcopy(value)
-        report["moved_fields"].append(
-            f"{source_path} -> {target_path}"
-        )
+        report["moved_fields"].append(f"{source_path} -> {target_path}")
 
 
 def _move_strategy_side_fields(
@@ -960,7 +960,9 @@ def _move_strategy_side_fields(
 ) -> bool:
     source_prefix = source_prefix or f"bot.{pside}"
     target_prefix = target_prefix or f"bot.{pside}"
-    strategy = target_side.setdefault("strategy", {}).setdefault(TRAILING_GRID_V7_KIND, {})
+    strategy = target_side.setdefault("strategy", {}).setdefault(
+        TRAILING_GRID_V7_KIND, {}
+    )
     moved_any = False
     written_targets: dict[tuple[str, ...], tuple[str, str, Any]] = {}
     for legacy_key, path in STRATEGY_FIELD_MAP.items():
@@ -981,9 +983,7 @@ def _move_strategy_side_fields(
         ):
             continue
         _set_path(strategy, path, value)
-        report["moved_fields"].append(
-            f"{source_path} -> {target_path}"
-        )
+        report["moved_fields"].append(f"{source_path} -> {target_path}")
         moved_any = True
     return moved_any
 
@@ -1034,13 +1034,14 @@ def _move_nested_strategy_bounds(
 ) -> bool:
     moved_any = False
     target_strategy = (
-        target_bounds
-        .setdefault(pside, {})
+        target_bounds.setdefault(pside, {})
         .setdefault("strategy", {})
         .setdefault(TRAILING_GRID_V7_KIND, {})
     )
     for path, value in _iter_leaf_items(legacy_strategy):
-        source_path = f"optimize.bounds.{pside}.strategy.{strategy_name}.{'.'.join(path)}"
+        source_path = (
+            f"optimize.bounds.{pside}.strategy.{strategy_name}.{'.'.join(path)}"
+        )
         canonical_path = _canonical_strategy_leaf_path(path)
         if canonical_path is None:
             report["manual_review_fields"].append(source_path)
@@ -1059,9 +1060,7 @@ def _move_nested_strategy_bounds(
         ):
             continue
         _set_path(target_strategy, canonical_path, value)
-        report["moved_fields"].append(
-            f"{source_path} -> {target_path}"
-        )
+        report["moved_fields"].append(f"{source_path} -> {target_path}")
         moved_any = True
     return moved_any
 
@@ -1079,7 +1078,9 @@ def _move_nested_shared_bounds(
     if supported_local_keys is None or not isinstance(group_bounds, dict):
         if isinstance(group_bounds, dict):
             for path, _value in _iter_leaf_items(group_bounds):
-                report["manual_review_fields"].append(f"{source_prefix}.{'.'.join(path)}")
+                report["manual_review_fields"].append(
+                    f"{source_prefix}.{'.'.join(path)}"
+                )
         else:
             report["manual_review_fields"].append(source_prefix)
         return
@@ -1099,7 +1100,9 @@ def _move_bounds(source: dict, target: dict, report: dict) -> None:
     if not isinstance(bounds, dict):
         return
     target_bounds = target.setdefault("optimize", {}).setdefault("bounds", {})
-    if any(isinstance(key, str) and key.startswith(("long_", "short_")) for key in bounds):
+    if any(
+        isinstance(key, str) and key.startswith(("long_", "short_")) for key in bounds
+    ):
         bound_items: list[tuple[int, int, str, str, Any]] = []
         for index, (key, value) in enumerate(bounds.items()):
             if not isinstance(key, str) or not key.startswith(("long_", "short_")):
@@ -1140,7 +1143,9 @@ def _move_bounds(source: dict, target: dict, report: dict) -> None:
                 report=report,
             ):
                 continue
-            set_flat_optimize_bound(target_bounds, TRAILING_GRID_V7_KIND, canonical_key, value)
+            set_flat_optimize_bound(
+                target_bounds, TRAILING_GRID_V7_KIND, canonical_key, value
+            )
             report["moved_fields"].append(
                 f"optimize.bounds.{key} -> optimize.bounds.{canonical_key}"
             )
@@ -1161,7 +1166,9 @@ def _move_bounds(source: dict, target: dict, report: dict) -> None:
                     continue
                 if isinstance(group_bounds, dict):
                     handled_strategy_names = {"trailing_grid", TRAILING_GRID_V7_KIND}
-                    written_strategy_targets: dict[tuple[str, ...], tuple[str, str, Any]] = {}
+                    written_strategy_targets: dict[
+                        tuple[str, ...], tuple[str, str, Any]
+                    ] = {}
                     for strategy_name in ("trailing_grid", TRAILING_GRID_V7_KIND):
                         legacy_strategy = group_bounds.get(strategy_name)
                         if isinstance(legacy_strategy, dict):
@@ -1186,14 +1193,16 @@ def _move_bounds(source: dict, target: dict, report: dict) -> None:
 
 
 def _known_legacy_side_keys() -> set[str]:
-    return set(STRATEGY_FIELD_MAP) | set(FLAT_BOT_KEY_TO_GROUP_PATH) | {
-        "forager_score_weights",
-        "forager_volatility_ema_span",
-        "forager_volume_ema_span",
-        "hsl_tier_ratio_yellow",
-        "hsl_tier_ratio_orange",
-        *LEGACY_SHARED_SIDE_ALIASES,
-    }
+    return (
+        set(STRATEGY_FIELD_MAP)
+        | set(FLAT_BOT_KEY_TO_GROUP_PATH)
+        | {
+            "forager_score_weights",
+            "forager_volatility_ema_span",
+            "forager_volume_ema_span",
+            *LEGACY_SHARED_SIDE_ALIASES,
+        }
+    )
 
 
 def _report_source_strategy_subtree(
@@ -1250,7 +1259,9 @@ def _report_coin_override_leftovers(
             continue
         for key in sorted(side):
             if key not in known_side_keys:
-                report["manual_review_fields"].append(f"coin_overrides.{coin}.bot.{pside}.{key}")
+                report["manual_review_fields"].append(
+                    f"coin_overrides.{coin}.bot.{pside}.{key}"
+                )
 
 
 def _migrate_coin_overrides(source: dict, target: dict, report: dict) -> None:
@@ -1283,7 +1294,9 @@ def _migrate_coin_overrides(source: dict, target: dict, report: dict) -> None:
             else:
                 report["manual_review_fields"].append(f"coin_overrides.{coin}.live")
         if "override_config_path" in override:
-            migrated_override["override_config_path"] = deepcopy(override["override_config_path"])
+            migrated_override["override_config_path"] = deepcopy(
+                override["override_config_path"]
+            )
         bot = override.get("bot")
         if isinstance(bot, dict):
             migrated_bot = {}
@@ -1313,7 +1326,9 @@ def _migrate_coin_overrides(source: dict, target: dict, report: dict) -> None:
                 for key in COIN_OVERRIDE_SIDE_PASSTHROUGH_KEYS:
                     if key in side:
                         migrated_side[key] = deepcopy(side[key])
-                        report["moved_fields"].append(f"{prefix}.{key} -> {prefix}.{key}")
+                        report["moved_fields"].append(
+                            f"{prefix}.{key} -> {prefix}.{key}"
+                        )
                 if migrated_side:
                     migrated_bot[pside] = migrated_side
             if migrated_bot:
@@ -1325,10 +1340,16 @@ def _migrate_coin_overrides(source: dict, target: dict, report: dict) -> None:
         target["coin_overrides"] = result
 
 
-def migrate_v7_trailing_grid_config(source: dict, *, source_path: str | None = None) -> tuple[dict, dict]:
+def migrate_v7_trailing_grid_config(
+    source: dict, *, source_path: str | None = None
+) -> tuple[dict, dict]:
     if not isinstance(source, dict):
         raise TypeError(f"source config must be a dict; got {type(source).__name__}")
 
+    source = deepcopy(source)
+    from .excess_allowance import retire_excess_allowance_mode
+
+    retire_excess_allowance_mode(source, path=source_path or "input")
     target = get_template_config()
     target["config_version"] = CONFIG_SCHEMA_VERSION
     target.setdefault("live", {})["strategy_kind"] = TRAILING_GRID_V7_KIND
@@ -1366,7 +1387,10 @@ def migrate_v7_trailing_grid_config(source: dict, *, source_path: str | None = N
             continue
         target_side = target["bot"][pside]
         _move_shared_side_fields(source_side, target_side, pside, report)
-        moved_strategy = _move_strategy_side_fields(source_side, target_side, pside, report) or moved_strategy
+        moved_strategy = (
+            _move_strategy_side_fields(source_side, target_side, pside, report)
+            or moved_strategy
+        )
         _report_source_strategy_subtree(source_side, pside=pside, report=report)
         known = _known_legacy_side_keys() | {"strategy"}
         for key in sorted(source_side):
@@ -1385,6 +1409,13 @@ def migrate_v7_trailing_grid_config(source: dict, *, source_path: str | None = N
     _migrate_coin_overrides(source, target, report)
     _force_v7_absent_risk_defaults(source, target, report)
     _disable_enforcers_for_zero_v7_thresholds(source, target, report)
+    from .unstuck_ema import migrate_unstuck_ema_spans
+
+    for side in ("long", "short"):
+        for key in ("ema_span_0", "ema_span_1"):
+            target["bot"][side]["unstuck"].pop(key, None)
+            target["optimize"]["bounds"][side]["unstuck"].pop(key, None)
+    migrate_unstuck_ema_spans(target, base_config_path=source_path or "", verbose=False)
     _record_inserted_v8_defaults(source, target, report)
     _warn_if_v7_excess_would_be_clamped(target, report)
     report["canonical_validation"] = _validate_migrated_config(target)
@@ -1398,12 +1429,13 @@ def migrate_v7_trailing_grid_file(
     allow_manual_review_output: bool = False,
 ) -> tuple[dict, dict]:
     from config.parse import load_raw_config
-    import json
 
     input_path = Path(input_path)
     output_path = Path(output_path)
     source = load_raw_config(input_path)
-    migrated, report = migrate_v7_trailing_grid_config(source, source_path=str(input_path))
+    migrated, report = migrate_v7_trailing_grid_config(
+        source, source_path=str(input_path)
+    )
     invalid_output = migration_report_has_invalid_output(report)
     unresolved = migration_report_has_unresolved(report)
     report["manual_review_required"] = unresolved
@@ -1418,11 +1450,9 @@ def migrate_v7_trailing_grid_file(
         report["status"] = "manual_review_required"
         return migrated, report
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(migrated, indent=4, sort_keys=True) + "\n", encoding="utf-8")
-    report["output_written"] = True
-    report["status"] = (
-        "unsafe_manual_review_output_written"
-        if unresolved
-        else "ok"
+    output_path.write_text(
+        json_dumps_streamlined(migrated, indent=4, sort_keys=True) + "\n", encoding="utf-8"
     )
+    report["output_written"] = True
+    report["status"] = "unsafe_manual_review_output_written" if unresolved else "ok"
     return migrated, report

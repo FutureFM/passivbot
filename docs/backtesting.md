@@ -38,6 +38,65 @@ the run, but they do not mirror those raw daily files into `caches/ohlcvs/`.
 
 For `.npz` files, the archive must contain a `candles` key with a structured NumPy array having fields `ts` (int64 timestamp), `o` (open), `h` (high), `l` (low), `c` (close), `bv` (base volume). Timestamps should be in milliseconds. For `.npy` files, the array should have columns `[timestamp, open, high, low, close, volume]`.
 
+## BTC benchmark source
+
+Combined backtests and optimizations try BTC price history from the configured
+`backtest.exchanges` in order, except that Binance futures (`binance` /
+`binanceusdm`) keeps first priority when configured. Duplicate venues are tried
+once. When Binance is not configured, it is the final fallback after the configured
+venues. The selected venue is logged and retained as `btc_source_exchange` in
+preparation metadata. Candidates must cover both boundaries of the requested BTC
+range; shorter histories are skipped instead of extending their first or last price
+across unavailable history. Prepared caches from the previous source policy are
+rebuilt automatically.
+
+This priority applies in both online and offline modes, including explicit
+`backtest.ohlcv_source_dir` inputs. Online preparation may fetch missing data for
+the current candidate before trying the next venue; it does not search every
+venue's cache before downloading. Offline preparation uses local inputs only and
+fails if no candidate supplies the required benchmark. Changing the selected BTC
+source can change BTC-denominated metrics and simulations using BTC collateral.
+
+## Offline preparation
+
+Set `backtest.offline: true`, or pass `--offline y`, for backtests and optimization
+(including suites and GPU optimization):
+
+```bash
+passivbot backtest path/to/config.json --offline y
+passivbot optimize path/to/config.json --offline y
+```
+
+Offline preparation never refreshes market metadata, listing timestamps, exchange
+archives, or candles. Valid cached metadata is accepted regardless of age; its age
+and fingerprint are logged. Online remains the default; live trading is unaffected.
+
+Prepare the requested date range on a connected machine, then copy these caches:
+
+- `caches/ohlcvs/`, including its coverage catalog and candle chunks
+- `caches/<exchange>/markets.json` and `first_timestamps.json` for each data or
+  market-settings exchange
+- `caches/first_ohlcv_timestamps_unified*`, including the resolver version and
+  exchange-specific symbol provenance files
+- Any configured `backtest.ohlcv_source_dir` legacy shards
+
+Include the optimizer's maximum warmup range and BTC benchmark candles. Combined
+runs also need inputs for candidate exchanges used in source selection and volume
+normalization. Copy a consistent cache snapshot while no downloader is writing it;
+SQLite catalog paths must refer to the copied chunks on the receiving machine.
+
+Missing or incompatible metadata, incomplete candles, or unconfirmed range edges
+fail with an input/range diagnostic. Refresh those inputs on the connected machine
+and copy them again. Offline mode does not replace missing prices or silently shorten
+a requested range. Existing confirmed listing boundaries and supported internal-gap
+rules still apply. Use a fixed end date for reproducible runs.
+
+Older prepared HLCV caches are verified from raw caches once. Subsequent runs can
+reuse the verified prepared dataset. Its manifest retains metadata and consumed-range
+fingerprints under `preparation.offline_snapshot`. An explicit `--hlcvs-data-dir`
+override must refer to such a verified dataset. `--force-refetch-gaps` conflicts with
+offline mode.
+
 ## Usage
 
 ```shell
@@ -53,7 +112,37 @@ See [Config Workflow](config_workflow.md) for the recommended way to copy and cu
 
 ## Backtest Results
 
-Standalone runs write metrics and plots to `backtests/{exchange}/timestamp/`. Suite runs collect everything under `backtests/suite_runs/<timestamp>/<scenario_label>/` and add a top-level `suite_summary.json`.
+Standalone runs write metrics and plots to `backtests/{exchange}/<session>/`. Suite runs
+collect results under `backtests/suite_runs/<session>/` with a top-level `suite_summary.json`.
+Session names use this date-sortable UTC format (the suite component appears only for suites):
+
+```text
+<timestamp>_<coins>_<source>_<days>days_[suite-<N>sc_]setup-<12 hex>_run-<8 hex>
+2026-10-06T14_50_56Z_XMR_combined_1737days_suite-12sc_setup-a71c093be642_run-99449e93
+```
+
+Single coins always appear by name. Sets of up to six coins are sorted and joined when their
+label fits in 80 characters; larger sets use `<N>_coins`. A suite's coin label covers all
+actually evaluated scenarios, and its day count is their overall date envelope, including gaps.
+Unsafe or long coin/scenario labels are converted to bounded filesystem components with a
+hash suffix; original identifiers remain in configuration and metadata.
+
+`setup-` fingerprints canonical effective execution inputs, resolved dates, loaded market data,
+market settings and verified evaluator implementation. `run-` distinguishes individual executions;
+full identifiers and setup inputs are saved in `session.json`. Equivalent fingerprints indicate
+equivalent recorded setup inputs, not a guarantee of identical results across environments.
+Directory creation is exclusive and retries a run-ID collision.
+
+A scenario producing one result writes directly to `<session>/<scenario>/config.json`,
+`analysis.json`, `dataset.json` and the other usual artifacts. A scenario producing multiple
+independent results uses `<session>/<scenario>/<exchange>/config.json`. There is no inner
+timestamp directory. `suite_summary.json` has `layout_version: 2`, actual scenario `started_at`,
+`completed_at` and elapsed seconds, and an `artifacts` map of exact paths relative to the suite
+root. Use that map to discover results instead of reconstructing filenames.
+
+This layout changes newly generated paths. Existing results are not renamed; there is no
+legacy writer option. Scenario `output_path` is now relative to the suite root. Embedding callers
+may supply an explicit empty `suite_output_root`; nonempty roots are rejected to prevent mixing runs.
 
 With plotting enabled, `pnl_by_coin.png` overlays one cumulative realized net PnL
 curve per traded coin. Each curve combines long and short fills and includes signed
@@ -80,6 +169,13 @@ The workspace includes `config`, `analysis`, `fills`, `balance_and_equity`, `hlc
 `plot_fills_for_coin`.
 
 ## HLCV Data Contract
+
+Direct or prepared backtest inputs must contain finite high, low, and close prices throughout
+each symbol's declared valid window. Internal all-NaN gaps are rejected before simulation;
+missing prices never turn a held position's unrealized PnL into zero. Missing rows before a
+symbol's listing or after its declared end remain permitted while it is flat. A position still
+held when its valuation candle becomes unavailable rejects the run. These checks also apply to
+GPU preparation and do not replace the normal data materializer's gap repair policy.
 
 Without `backtest.ohlcv_source_dir`, backtest and optimize data preparation follows one
 deterministic order:
@@ -167,7 +263,7 @@ Suite mode evaluates multiple scenario slices in one invocation. Configuration u
 "backtest": {
   "suite_enabled": true,
   "scenarios": [...],
-  "aggregate": {"default": "mean"},
+  "reducer": {"default": "mean"},
   "exchanges": ["binance", "bybit"],
   ...
 }
@@ -179,7 +275,7 @@ want multi-scenario evaluation.
 
 Each scenario may override:
 
-- `label`: directory name inside `backtests/suite_runs/<timestamp>/`
+- `label`: directory name inside `backtests/suite_runs/<session>/`
 - `coins`/`ignored_coins`
 - `start_date`/`end_date`
 - `exchanges`: restricts which exchanges' data the scenario can see
@@ -190,7 +286,7 @@ Top-level suite keys (directly under `backtest`):
 
 - `suite_enabled`: master toggle for suite mode (overridable via `--suite [y/n]`)
 - `scenarios`: list of scenario dictionaries
-- `aggregate`: how to combine per-scenario metrics (default: `{"default": "mean"}`)
+- `reducer`: how to combine per-scenario metrics (default: `{"default": "mean"}`)
 
 During a suite run Passivbot prepares master OHLCV datasets only for the scenario
 windows that consume them. The combined dataset uses the union of combined scenarios;
@@ -198,10 +294,10 @@ single-exchange datasets use the union of scenarios restricted to that exchange.
 are written to:
 
 ```
-backtests/suite_runs/<timestamp>/<scenario_label>/
+backtests/suite_runs/<session>/<scenario_label>/
 ```
 
-Every suite also receives a `suite_summary.json` containing per-scenario metrics and the aggregated statistics defined in `backtest.aggregate`.
+Every suite also receives a `suite_summary.json` containing per-scenario metrics and the aggregated statistics defined in `backtest.reducer`.
 Each scenario's entry exposes `metrics.stats[metric] = {mean,min,max,std}` so you can inspect exchange-combined performance without digging through `analysis.json` files.
 
 See [Suite Examples](suite_examples.md) for practical configurations including exchange
@@ -211,8 +307,8 @@ comparisons, date range scenarios, and parameter sensitivity testing.
 
 The data strategy is determined implicitly by the number of exchanges configured:
 
-- **Single exchange** (1 exchange in `backtest.exchanges`): Data is fetched from that exchange only. Scenario labels include the exchange suffix (e.g., `base/binance`).
-- **Combined exchanges** (>1 exchanges): Data is combined from all listed exchanges, selecting the best feed per coin based on coverage and quality. Scenario labels do not include an exchange suffix.
+- **Single exchange** (1 exchange in `backtest.exchanges`): Data is sourced from that exchange only. A single-result scenario writes directly into its scenario directory.
+- **Combined exchanges** (>1 exchanges): Data is combined from all listed exchanges, selecting the best feed per coin based on coverage and quality. Exchange-restricted scenarios can produce independent exchange results; the summary artifact map records their exact locations.
 
 Per-scenario `exchanges` overrides can narrow down which exchanges a scenario sees and can also require extra exchanges that are not listed in the top-level base config. Passivbot expands the prepared dataset set to include every scenario-required exchange before running the suite.
 
@@ -223,7 +319,7 @@ To compare performance across exchanges, define one scenario per exchange using 
 ```json
 "backtest": {
   "suite_enabled": true,
-  "aggregate": {"default": "mean"},
+  "reducer": {"default": "mean"},
   "exchanges": ["binance", "bybit", "gateio"],
   "scenarios": [
     {"label": "binance_only", "exchanges": ["binance"]},
@@ -262,6 +358,9 @@ Experimental or narrower-coverage sources:
 
 - **kucoin** - KuCoin Futures archive/CCXT data path. Use `kucoin` in configs and cache paths; Passivbot converts to CCXT's `kucoinfutures` ID internally. Treat KuCoin backtest data as experimental until your intended coins/date windows pass a real data smoke.
 - **hyperliquid** - Supported for live and metadata paths; broader historical backtest coverage depends on the available candle source for the requested market universe.
+- **lighter** - Lighter USDC perpetuals through bounded CCXT candle requests, with one-way positions
+  and base-asset quantities. Use `backtest.exchanges = ["lighter"]`; coverage depends on the
+  exchange history available for each market and date range. See the [Lighter guide](exchanges/lighter.md).
 
 The canonical default template currently uses `binance` and `bybit`. Add `bitget` and/or `gateio`
 explicitly in `backtest.exchanges` when you want them included.
@@ -269,3 +368,20 @@ explicitly in `backtest.exchanges` when you want them included.
 ## Exchange Name Conventions
 
 Cache paths and output directories use standard exchange names (e.g., `binance`, `bybit`, `gateio`, `kucoin`). CCXT-specific IDs such as `binanceusdm`, `bybitusdt`, and `kucoinfutures` are only used internally when communicating with exchange APIs. Always use the short names in your configuration files and external OHLCV source directories.
+
+## Materialized scratch cache locks
+
+Backtests and optimizers serialize scratch allocation and pruning with the persistent
+`.materialized.op.flock` file in their materialized cache directory. Do not delete this file:
+processes holding an older inode would otherwise stop excluding new owners. The operating system
+releases ownership when a worker exits, including after an abnormal exit.
+
+When upgrading from the previous `.materialized.op.lock` directory protocol, stop all older
+backtest and optimizer workers before starting the updated version against the same cache.
+Concurrent workers using different lock protocols are unsupported. A legacy lock with a confirmed
+dead local PID does not block the updated version. An active, foreign, missing, or malformed owner
+record is preserved and produces an actionable error. Missing metadata may belong to a worker
+paused while creating its lock, so an age limit cannot safely establish that ownership has ended.
+After confirming that every older worker has stopped, remove only the legacy
+`.materialized.op.lock` directory named in the error and retry. Keep the new `.materialized.op.flock`
+file and existing active run directories intact.

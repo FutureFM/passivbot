@@ -30,8 +30,8 @@ pub struct ForagerHysteresisState {
 mod core {
     use crate::closes::{calc_wel_auto_reduce_long, calc_wel_auto_reduce_short};
     use crate::coin_selection::{
-        select_forager_candidates_with_diagnostics, ForagerCandidate, ForagerPositionSide,
-        ForagerSelectionConfig, ForagerSelectionError, ForagerSelectionResult,
+        forager_scoring_positions, select_forager_candidates_with_diagnostics, ForagerCandidate,
+        ForagerPositionSide, ForagerSelectionConfig, ForagerSelectionError, ForagerSelectionResult,
     };
     use crate::constants::{LONG, SHORT};
     use crate::entries::{
@@ -205,6 +205,7 @@ mod core {
         pub volume_component: f64,
         pub ema_readiness_component: f64,
         pub volatility_component: f64,
+        pub unilateralness_component: f64,
         pub selected: bool,
         pub incumbent: bool,
     }
@@ -225,6 +226,7 @@ mod core {
     pub struct ForagerSelectionDiagnostic {
         pub pside: PositionSide,
         pub slots_to_fill: usize,
+        pub ranking_required: bool,
         pub score_hysteresis_pct: f64,
         pub selected_symbol_indices: Vec<usize>,
         pub incumbent_symbol_indices: Vec<usize>,
@@ -251,17 +253,21 @@ mod core {
             symbol_idx: usize,
             details: String,
         },
+        InvalidNextCandle {
+            symbol_idx: usize,
+            details: String,
+        },
         InvalidStrategyParams {
             symbol_idx: usize,
             details: String,
+        },
+        UnilateralnessUnavailable {
+            symbol_idx: usize,
         },
         MissingEma {
             symbol_idx: usize,
         },
         MissingTrailing {
-            symbol_idx: usize,
-        },
-        MissingEntryFillHistory {
             symbol_idx: usize,
         },
     }
@@ -315,6 +321,8 @@ mod core {
         pub close: EmaBySpan,
         pub log_range: EmaBySpan,
         pub volume: EmaBySpan,
+        #[serde(default)]
+        pub signed_unilateralness: EmaBySpan,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -406,8 +414,6 @@ mod core {
         pub trailing_available: bool,
         #[serde(default)]
         pub last_increase_fill_timestamp_ms: Option<u64>,
-        #[serde(default)]
-        pub entry_fill_count: Option<u32>,
         /// Exchange/fill-proven clock and unfinished reduction; None is unavailable.
         #[serde(default)]
         pub time_stop: Option<TimeStopState>,
@@ -424,9 +430,22 @@ mod core {
     #[derive(Debug, Clone, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
     pub struct NextCandle {
+        /// Simulation-only distance beyond the limit required for a fill.
+        #[serde(default)]
+        pub limit_order_fill_buffer_pct: f64,
         pub low: f64,
         pub high: f64,
         pub tradable: bool,
+    }
+
+    /// Explicit live transport unavailability, scoped to the span and consumer.
+    #[derive(Debug, Default, Clone, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct UnilateralnessUnavailable {
+        #[serde(default)]
+        pub current: Vec<f64>,
+        #[serde(default)]
+        pub forager: Vec<f64>,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -444,6 +463,13 @@ mod core {
         /// callers that do not explicitly establish live data unavailability.
         #[serde(default)]
         pub allow_missing_strategy_inputs: bool,
+        /// CPU backtest RMS replay windows still warming from known listing
+        /// history. Only missing RMS inputs at these spans may be deferred;
+        /// unrelated inputs and non-finite scores remain strict.
+        #[serde(default)]
+        pub unilateralness_warmup_spans: Vec<f64>,
+        #[serde(default)]
+        pub unilateralness_unavailable: UnilateralnessUnavailable,
         /// Backtest-only hint: next candle range for "peek fill" decisions.
         /// `None` => unknown (live mode), default to full-grid expansion.
         pub next_candle: Option<NextCandle>,
@@ -549,41 +575,11 @@ mod core {
         Ok(())
     }
 
-    fn cooldown_delay_ms(cooldown_minutes: f64) -> u64 {
-        if !cooldown_minutes.is_finite() || cooldown_minutes <= 0.0 {
-            0
-        } else {
-            (cooldown_minutes * 60_000.0).ceil() as u64
-        }
-    }
-
     fn order_increases_position(pside: PositionSide, qty: f64) -> bool {
         match pside {
             PositionSide::Long => qty > 0.0,
             PositionSide::Short => qty < 0.0,
         }
-    }
-
-    fn add_order_cooldown_active(
-        now_timestamp_ms: u64,
-        last_increase_fill_timestamp_ms: Option<u64>,
-        cooldown_minutes: f64,
-    ) -> bool {
-        if !cooldown_minutes.is_finite() || cooldown_minutes <= 0.0 {
-            return false;
-        }
-        let Some(last_fill_ts) = last_increase_fill_timestamp_ms else {
-            return false;
-        };
-        let until_ms = last_fill_ts.saturating_add(cooldown_delay_ms(cooldown_minutes));
-        now_timestamp_ms < until_ms
-    }
-
-    fn allow_full_entry_ladder_simultaneously(
-        cooldown_minutes: f64,
-        entry_retracement_enabled: bool,
-    ) -> bool {
-        !entry_retracement_enabled && cooldown_minutes.is_finite() && cooldown_minutes == 0.0
     }
 
     fn keep_only_first_add_order(orders: &mut Vec<IdealOrder>, pside: PositionSide) {
@@ -609,15 +605,12 @@ mod core {
         cooldown_minutes: f64,
         entry_retracement_enabled: bool,
     ) {
-        if add_order_cooldown_active(
-            now_timestamp_ms,
-            last_increase_fill_timestamp_ms,
-            cooldown_minutes,
-        ) {
+        let cooldown = crate::entry_cooldown::EntryCooldown::new(cooldown_minutes);
+        if cooldown.is_active(now_timestamp_ms, last_increase_fill_timestamp_ms) {
             orders.retain(|order| !order_increases_position(pside, order.qty));
             return;
         }
-        if !allow_full_entry_ladder_simultaneously(cooldown_minutes, entry_retracement_enabled) {
+        if !cooldown.allows_full_entry_ladder(entry_retracement_enabled) {
             keep_only_first_add_order(orders, pside);
         }
     }
@@ -983,6 +976,25 @@ mod core {
         strategy_params: &crate::strategies::StrategyParams,
     ) -> Result<EMABands, OrchestratorError> {
         let (ema_span_0, ema_span_1) = strategy_ema_spans(strategy_params);
+        derive_ema_bands_for_spans(symbol_idx, emas, ema_span_0, ema_span_1)
+    }
+
+    fn derive_ema_bands_for_spans(
+        symbol_idx: usize,
+        emas: &EmaBundle,
+        ema_span_0: f64,
+        ema_span_1: f64,
+    ) -> Result<EMABands, OrchestratorError> {
+        if !ema_span_0.is_finite()
+            || ema_span_0 <= 0.0
+            || !ema_span_1.is_finite()
+            || ema_span_1 <= 0.0
+        {
+            return Err(OrchestratorError::NonFiniteInput {
+                field: "ema_spans",
+                symbol_idx: Some(symbol_idx),
+            });
+        }
         let ema0 = ema_lookup(&emas.m1.close, ema_span_0)
             .ok_or(OrchestratorError::MissingEma { symbol_idx })?;
         let ema1 = ema_lookup(&emas.m1.close, ema_span_1)
@@ -1087,6 +1099,7 @@ mod core {
             .push(ForagerSelectionDiagnostic {
                 pside,
                 slots_to_fill: cfg.slots_to_fill,
+                ranking_required: cfg.require_forager,
                 score_hysteresis_pct: cfg.score_hysteresis_pct,
                 selected_symbol_indices: result.selected_indices.clone(),
                 incumbent_symbol_indices,
@@ -1101,6 +1114,7 @@ mod core {
                         volume_component: item.volume_component,
                         ema_readiness_component: item.ema_readiness_component,
                         volatility_component: item.volatility_component,
+                        unilateralness_component: item.unilateralness_component,
                         selected: item.selected,
                         incumbent: item.incumbent,
                     })
@@ -2258,6 +2272,7 @@ mod core {
             enabled: false,
             volume_score: 0.0,
             volatility_score: 0.0,
+            unilateralness_score: 0.0,
             bid: 0.0,
             ask: 0.0,
             ema_lower: 0.0,
@@ -2266,7 +2281,7 @@ mod core {
         }
     }
 
-    fn build_forager_candidates_into(
+    fn collect_enabled_forager_candidate_indices_into(
         symbols: &[SymbolInput],
         pside: PositionSide,
         strategy_kind: StrategyKind,
@@ -2275,6 +2290,69 @@ mod core {
         balance: f64,
         runtime_budgets: &[RuntimeBudgetState],
         active_flags: Option<&[bool]>,
+        derived_cache: &mut [CachedSideDerived],
+        out: &mut Vec<usize>,
+        diagnostics: &mut OrchestratorDiagnostics,
+    ) -> Result<(), OrchestratorError> {
+        out.clear();
+        out.reserve(symbols.len());
+        for s in symbols {
+            let side = match pside {
+                PositionSide::Long => &s.long,
+                PositionSide::Short => &s.short,
+            };
+            let strategy_params = cached_strategy_params_for_symbol_side(
+                derived_cache,
+                s.symbol_idx,
+                strategy_kind,
+                match pside {
+                    PositionSide::Long => StrategySide::Long,
+                    PositionSide::Short => StrategySide::Short,
+                },
+                side,
+            )?;
+            let already_active = active_flags
+                .and_then(|flags| flags.get(s.symbol_idx))
+                .copied()
+                .unwrap_or(false);
+            let can_open_initial =
+                should_generate_entries(effective_mode(side.mode, false), false, true);
+            let min_cost_ok = effective_min_cost_is_low_enough(
+                balance,
+                filter_enabled,
+                s.effective_min_cost,
+                &side.bot_params,
+                &runtime_budgets[s.symbol_idx],
+                strategy_initial_qty_pct(&strategy_params),
+            );
+            let eligible_without_min_cost = symbol_side_eligible(s, pside)
+                && !already_active
+                && one_way_allows_initial_slot(symbols, s.symbol_idx, pside, hedge_mode)
+                && can_open_initial;
+            if eligible_without_min_cost && min_cost_ok {
+                out.push(s.symbol_idx);
+            } else if eligible_without_min_cost {
+                maybe_record_min_effective_cost_block(
+                    diagnostics,
+                    s.symbol_idx,
+                    pside,
+                    balance,
+                    s.effective_min_cost,
+                    filter_enabled,
+                    &side.bot_params,
+                    &runtime_budgets[s.symbol_idx],
+                    strategy_initial_qty_pct(&strategy_params),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn build_forager_candidates_into(
+        symbols: &[SymbolInput],
+        candidate_indices: &[usize],
+        pside: PositionSide,
+        strategy_kind: StrategyKind,
         cfg: &ForagerSelectionConfig,
         derived_cache: &mut [CachedSideDerived],
         out: &mut Vec<ForagerCandidate>,
@@ -2287,12 +2365,14 @@ mod core {
                     field: "forager_score_weights",
                     symbol_idx: None,
                 })?;
-        let volume_required = cfg.volume_drop_pct > 0.0 || normalized_weights.volume != 0.0;
-        let volatility_required = normalized_weights.volatility != 0.0;
-        let ema_readiness_required = normalized_weights.ema_readiness != 0.0;
+        let volume_required =
+            cfg.require_forager && (cfg.volume_drop_pct > 0.0 || normalized_weights.volume != 0.0);
+        let volatility_required = cfg.require_forager && normalized_weights.volatility != 0.0;
+        let ema_readiness_required = cfg.require_forager && normalized_weights.ema_readiness != 0.0;
         out.clear();
-        out.reserve(symbols.len());
-        for s in symbols {
+        out.reserve(candidate_indices.len());
+        for &symbol_idx in candidate_indices {
+            let s = &symbols[symbol_idx];
             let forager_m1 = s.forager_m1.as_ref().unwrap_or(&s.emas.m1);
             let side = match pside {
                 PositionSide::Long => &s.long,
@@ -2308,50 +2388,6 @@ mod core {
                 },
                 side,
             )?;
-            // For selection of coins to occupy available slots for initial entries:
-            // - We rank across all coins (including those with positions), matching legacy.
-            // - We exclude modes which categorically block initial entries when `psize == 0.0`.
-            let mode_no_pos = effective_mode(side.mode, false);
-            let can_open_initial = should_generate_entries(mode_no_pos, false, true);
-            let already_active = active_flags
-                .and_then(|flags| flags.get(s.symbol_idx))
-                .copied()
-                .unwrap_or(false);
-            let min_cost_ok = effective_min_cost_is_low_enough(
-                balance,
-                filter_enabled,
-                s.effective_min_cost,
-                &side.bot_params,
-                &runtime_budgets[s.symbol_idx],
-                strategy_initial_qty_pct(&strategy_params),
-            );
-            let enabled = symbol_side_eligible(s, pside)
-                && !already_active
-                && one_way_allows_initial_slot(symbols, s.symbol_idx, pside, hedge_mode)
-                && can_open_initial
-                && min_cost_ok;
-            if !enabled {
-                if symbol_side_eligible(s, pside)
-                    && !already_active
-                    && one_way_allows_initial_slot(symbols, s.symbol_idx, pside, hedge_mode)
-                    && can_open_initial
-                    && !min_cost_ok
-                {
-                    maybe_record_min_effective_cost_block(
-                        diagnostics,
-                        s.symbol_idx,
-                        pside,
-                        balance,
-                        s.effective_min_cost,
-                        filter_enabled,
-                        &side.bot_params,
-                        &runtime_budgets[s.symbol_idx],
-                        strategy_initial_qty_pct(&strategy_params),
-                    );
-                }
-                out.push(unavailable_forager_candidate(s.symbol_idx));
-                continue;
-            }
             let volume_score = if volume_required {
                 let value = match ema_lookup(
                     &forager_m1.volume,
@@ -2442,15 +2478,44 @@ mod core {
             };
             out.push(ForagerCandidate {
                 index: s.symbol_idx,
-                enabled,
+                enabled: true,
                 volume_score,
                 volatility_score,
+                // Filled below only if this candidate survives volume pruning.
+                unilateralness_score: 0.0,
                 bid,
                 ask,
                 ema_lower,
                 ema_upper,
                 entry_initial_ema_dist,
             });
+        }
+        if cfg.require_forager && normalized_weights.unilateralness > 0.0 {
+            let scoring_positions =
+                forager_scoring_positions(out, cfg).map_err(map_forager_selection_error)?;
+            let mut ranking_unavailable = false;
+            for pos in scoring_positions {
+                let s = &symbols[out[pos].index];
+                let side = symbol_side_input(s, pside);
+                match signed_unilateralness(s, &side.bot_params, true) {
+                    Ok(value) => out[pos].unilateralness_score = value.abs(),
+                    Err(err) => {
+                        handle_strategy_input_error(
+                            err,
+                            s,
+                            pside,
+                            StrategyInputScope::ForagerSelection,
+                            diagnostics,
+                        )?;
+                        ranking_unavailable = true;
+                    }
+                }
+            }
+            if ranking_unavailable {
+                // Never rank a ready subset of the retained scoring set.
+                // Keep scanning above so malformed supplied scores stay fatal.
+                out.clear();
+            }
         }
         Ok(())
     }
@@ -2600,6 +2665,65 @@ mod core {
         Ok(Some(order))
     }
 
+    /// Minimal contract for a committed full-position protective exit. No account
+    /// balance, historical equity, entry strategy, or position cost basis is consumed.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct ProtectiveCloseInput {
+        pub symbol_idx: usize,
+        pub pside: PositionSide,
+        pub position_size: f64,
+        pub order_book: OrderBook,
+        pub price_step: f64,
+        pub execution_type: ExecutionType,
+    }
+
+    pub fn compute_protective_closes(
+        inputs: &[ProtectiveCloseInput],
+    ) -> Result<Vec<ExecutableOrder>, &'static str> {
+        let mut seen = HashSet::new();
+        let mut orders = Vec::new();
+        for input in inputs {
+            if !seen.insert((input.symbol_idx, input.pside)) {
+                return Err("duplicate protective close scope");
+            }
+            if !input.position_size.is_finite()
+                || (input.pside == PositionSide::Long && input.position_size < 0.0)
+                || (input.pside == PositionSide::Short && input.position_size > 0.0)
+                || !input.price_step.is_finite()
+                || input.price_step <= 0.0
+                || !input.order_book.bid.is_finite()
+                || input.order_book.bid <= 0.0
+                || !input.order_book.ask.is_finite()
+                || input.order_book.ask < input.order_book.bid
+            {
+                return Err("invalid protective close input");
+            }
+            if input.position_size == 0.0 {
+                continue;
+            }
+            let order = panic_close_order(
+                input.symbol_idx,
+                input.pside,
+                input.position_size,
+                &input.order_book,
+                input.price_step,
+            )
+            .ok_or("invalid protective close result")?;
+            orders.push(ExecutableOrder {
+                symbol_idx: order.symbol_idx,
+                pside: order.pside,
+                qty: order.qty,
+                price: order.price,
+                order_type: order.order_type,
+                execution_type: input.execution_type,
+                execution_priority: ExecutionPriority::RiskCritical,
+                time_stop_target_size: None,
+            });
+        }
+        Ok(orders)
+    }
+
     fn calc_panic_close(
         symbol_idx: usize,
         pside: PositionSide,
@@ -2607,22 +2731,31 @@ mod core {
         ob: &OrderBook,
         exchange: &ExchangeParams,
     ) -> Option<IdealOrder> {
-        if pos.size == 0.0 {
+        panic_close_order(symbol_idx, pside, pos.size, ob, exchange.price_step)
+    }
+
+    fn panic_close_order(
+        symbol_idx: usize,
+        pside: PositionSide,
+        position_size: f64,
+        ob: &OrderBook,
+        price_step: f64,
+    ) -> Option<IdealOrder> {
+        if position_size == 0.0 {
             return None;
         }
         let qty = match pside {
-            PositionSide::Long => -pos.size.abs(),
-            PositionSide::Short => pos.size.abs(),
+            PositionSide::Long => -position_size.abs(),
+            PositionSide::Short => position_size.abs(),
         };
         let price = match pside {
             PositionSide::Long => {
-                let touch = tolerant_round_dn_preserve_step(ob.ask, exchange.price_step);
-                tolerant_round_dn_preserve_step(touch - exchange.price_step, exchange.price_step)
-                    .max(exchange.price_step)
+                let touch = tolerant_round_dn_preserve_step(ob.ask, price_step);
+                tolerant_round_dn_preserve_step(touch - price_step, price_step).max(price_step)
             }
             PositionSide::Short => {
-                let touch = tolerant_round_up_preserve_step(ob.bid, exchange.price_step);
-                tolerant_round_up_preserve_step(touch + exchange.price_step, exchange.price_step)
+                let touch = tolerant_round_up_preserve_step(ob.bid, price_step);
+                tolerant_round_up_preserve_step(touch + price_step, price_step)
             }
         };
         if !(price.is_finite() && price > 0.0 && qty.is_finite() && qty != 0.0) {
@@ -2669,10 +2802,10 @@ mod core {
     ) -> Result<(), OrchestratorError> {
         let explicitly_unavailable = match &err {
             OrchestratorError::MissingEma { .. } => symbol.allow_missing_strategy_inputs,
+            OrchestratorError::UnilateralnessUnavailable { .. } => true,
             OrchestratorError::MissingTrailing { .. } => {
                 !symbol_side_input(symbol, pside).trailing_available
             }
-            OrchestratorError::MissingEntryFillHistory { .. } => true,
             _ => false,
         };
         if explicitly_unavailable {
@@ -2837,49 +2970,161 @@ mod core {
         })
     }
 
-    fn effective_entry_cooldown_minutes(
+    /// Divergence extends the adaptive cooldown of a held position by its severity-scaled
+    /// multiplier. The result is capped by the configured ceiling (or 24 hours) but never
+    /// shortened below the adaptive duration; flat positions keep the unmodified cooldown.
+    fn divergence_scaled_cooldown(
+        minutes: f64,
         side: &SymbolSideInput,
         symbol_idx: usize,
         divergence_multiplier: f64,
     ) -> Result<f64, OrchestratorError> {
-        let bp = &side.bot_params;
-        let base = bp.risk_entry_cooldown_minutes;
-        let factor = bp.risk_entry_cooldown_factor_per_fill;
-        let max_minutes = bp.risk_entry_cooldown_max_minutes;
-        if !base.is_finite()
-            || base < 0.0
-            || !factor.is_finite()
-            || factor <= 0.0
-            || !max_minutes.is_finite()
-            || max_minutes <= 0.0
-            || max_minutes > 1440.0
-            || !divergence_multiplier.is_finite()
-            || divergence_multiplier < 1.0
-        {
+        if !divergence_multiplier.is_finite() || divergence_multiplier < 1.0 {
             return Err(OrchestratorError::NonFiniteInput {
-                field: "entry_cooldown",
+                field: "divergence_delay_multiplier",
                 symbol_idx: Some(symbol_idx),
             });
         }
-        if base == 0.0 {
-            return Ok(0.0);
+        if side.position.size == 0.0 || minutes == 0.0 || divergence_multiplier == 1.0 {
+            return Ok(minutes);
         }
-        let exponent = if side.position.size == 0.0 || factor == 1.0 {
-            0
+        let ceiling = side
+            .bot_params
+            .entry_cooldown_max_duration_minutes
+            .unwrap_or(1440.0)
+            .max(minutes);
+        Ok((minutes * divergence_multiplier).min(ceiling))
+    }
+
+    fn signed_unilateralness(
+        symbol: &SymbolInput,
+        bp: &BotParams,
+        forager: bool,
+    ) -> Result<f64, OrchestratorError> {
+        let bundle = if forager {
+            symbol.forager_m1.as_ref().unwrap_or(&symbol.emas.m1)
         } else {
-            let count = side
-                .entry_fill_count
-                .filter(|count| *count > 0)
-                .ok_or(OrchestratorError::MissingEntryFillHistory { symbol_idx })?;
-            count - 1
+            &symbol.emas.m1
         };
-        let scaled = base * factor.powf(exponent as f64);
-        let divergence = if side.position.size == 0.0 {
-            1.0
+        let value = ema_lookup(&bundle.signed_unilateralness, bp.unilateralness_ema_span_1m)
+            .ok_or_else(|| {
+                let unavailable = if forager {
+                    &symbol.unilateralness_unavailable.forager
+                } else {
+                    &symbol.unilateralness_unavailable.current
+                };
+                if symbol
+                    .unilateralness_warmup_spans
+                    .contains(&bp.unilateralness_ema_span_1m)
+                    || unavailable.contains(&bp.unilateralness_ema_span_1m)
+                {
+                    OrchestratorError::UnilateralnessUnavailable {
+                        symbol_idx: symbol.symbol_idx,
+                    }
+                } else {
+                    OrchestratorError::MissingEma {
+                        symbol_idx: symbol.symbol_idx,
+                    }
+                }
+            })?;
+        if !value.is_finite() || value.abs() > 1.0 {
+            return Err(OrchestratorError::NonFiniteInput {
+                symbol_idx: Some(symbol.symbol_idx),
+                field: "signed_unilateralness",
+            });
+        }
+        Ok(value)
+    }
+
+    fn effective_cooldown(
+        symbol: &SymbolInput,
+        pside: PositionSide,
+        balance: f64,
+        runtime_budget: RuntimeBudgetState,
+    ) -> Result<f64, OrchestratorError> {
+        let side = symbol_side_input(symbol, pside);
+        let bp = &side.bot_params;
+        crate::entry_cooldown::validate(bp).map_err(|_| OrchestratorError::NonFiniteInput {
+            symbol_idx: Some(symbol.symbol_idx),
+            field: "entry_cooldown",
+        })?;
+        if let Some(minutes) = crate::entry_cooldown::constant_duration(bp) {
+            return Ok(minutes);
+        }
+        // A held position with no remaining allocation is beyond any finite ratio.
+        // Saturate the bounded duration without dividing by zero.
+        if bp.entry_cooldown_weights_minutes.exposure_ratio > 0.0
+            && side.position.size != 0.0
+            && runtime_budget.effective_wallet_exposure_limit == 0.0
+        {
+            return Ok(bp
+                .entry_cooldown_max_duration_minutes
+                .expect("validated modifier ceiling"));
+        }
+        let exposure = if bp.entry_cooldown_weights_minutes.exposure_ratio > 0.0 {
+            let limit = runtime_budget.effective_wallet_exposure_limit;
+            Some(if side.position.size == 0.0 {
+                0.0
+            } else if limit > 0.0 {
+                calc_wallet_exposure(
+                    symbol.exchange.c_mult,
+                    balance,
+                    side.position.size.abs(),
+                    side.position.price,
+                ) / limit
+            } else {
+                return Err(OrchestratorError::NonFiniteInput {
+                    symbol_idx: Some(symbol.symbol_idx),
+                    field: "entry_cooldown_exposure_limit",
+                });
+            })
         } else {
-            divergence_multiplier
+            None
         };
-        Ok((scaled * divergence).min(max_minutes))
+        let adverse = if bp.entry_cooldown_weights_minutes.adverse_directionality > 0.0 {
+            let signed = signed_unilateralness(symbol, bp, false)?;
+            Some(
+                (if pside == PositionSide::Long {
+                    -signed
+                } else {
+                    signed
+                })
+                .max(0.0),
+            )
+        } else {
+            None
+        };
+        crate::entry_cooldown::effective_duration(bp, exposure, adverse).map_err(|_| {
+            OrchestratorError::NonFiniteInput {
+                symbol_idx: Some(symbol.symbol_idx),
+                field: "entry_cooldown",
+            }
+        })
+    }
+
+    pub fn entry_cooldown_durations_json(raw: &str) -> Result<String, String> {
+        let input: OrchestratorInput = serde_json::from_str(raw).map_err(|e| e.to_string())?;
+        let mut result = std::collections::BTreeMap::new();
+        for symbol in &input.symbols {
+            for (name, pside) in [("long", PositionSide::Long), ("short", PositionSide::Short)] {
+                let side = symbol_side_input(symbol, pside);
+                let value = match effective_cooldown(
+                    symbol,
+                    pside,
+                    input.balance,
+                    resolve_runtime_budget(side, side.bot_params.n_positions),
+                ) {
+                    Ok(value) => Some(value),
+                    Err(
+                        OrchestratorError::MissingEma { .. }
+                        | OrchestratorError::UnilateralnessUnavailable { .. },
+                    ) => None,
+                    Err(err) => return Err(format!("{err:?}")),
+                };
+                result.insert(format!("{}:{name}", symbol.symbol_idx), value);
+            }
+        }
+        serde_json::to_string(&result).map_err(|e| e.to_string())
     }
 
     fn generate_strategy_ideal_orders(
@@ -2951,6 +3196,16 @@ mod core {
             volatility_ema_1m,
             volatility_ema_1h,
         };
+        let cooldown_minutes = if wants_entries {
+            divergence_scaled_cooldown(
+                effective_cooldown(symbol, pside, input.balance, runtime_budget)?,
+                side,
+                symbol.symbol_idx,
+                divergence_delay_multiplier,
+            )?
+        } else {
+            0.0
+        };
         let generated = generate_strategy_orders(
             strategy_kind_for_symbol_side(&input.global),
             strategy_side,
@@ -2969,6 +3224,7 @@ mod core {
                 position: &side.position,
                 trailing: &side.trailing,
                 next_candle: symbol.next_candle.as_ref().map(|candle| NextStepHint {
+                    limit_order_fill_buffer_pct: candle.limit_order_fill_buffer_pct,
                     low: candle.low,
                     high: candle.high,
                     tradable: candle.tradable,
@@ -2989,17 +3245,12 @@ mod core {
         );
         let mut entries = Vec::new();
         append_strategy_orders_as_ideal(&mut entries, generated.entries, symbol.symbol_idx, pside);
-        let cooldown = if wants_entries {
-            effective_entry_cooldown_minutes(side, symbol.symbol_idx, divergence_delay_multiplier)?
-        } else {
-            0.0
-        };
         apply_add_order_gates(
             &mut entries,
             pside,
             input.timestamp_ms,
             side.last_increase_fill_timestamp_ms,
-            cooldown,
+            cooldown_minutes,
             strategy_requires_sequential_entry_staging(&strategy_params),
         );
         let mut closes = Vec::new();
@@ -3019,20 +3270,23 @@ mod core {
         diagnostics: &mut OrchestratorDiagnostics,
     ) -> Result<(Vec<IdealOrder>, Vec<IdealOrder>, bool), OrchestratorError> {
         let side = symbol_side_input(symbol, pside);
-        let missing_entry_fill_history = side.position.size != 0.0
-            && side.bot_params.risk_entry_cooldown_minutes > 0.0
-            && side.bot_params.risk_entry_cooldown_factor_per_fill != 1.0
-            && !matches!(side.entry_fill_count, Some(count) if count > 0);
-        let requests = if (symbol.allow_missing_strategy_inputs
-            || !side.trailing_available
-            || missing_entry_fill_history)
-            && wants_entries
-            && wants_closes
-        {
-            [(true, false), (false, true)]
-        } else {
-            [(wants_entries, wants_closes), (false, false)]
-        };
+        let rms_warming = crate::entry_cooldown::uses_adverse_rms(&side.bot_params)
+            && (symbol
+                .unilateralness_warmup_spans
+                .contains(&side.bot_params.unilateralness_ema_span_1m)
+                || symbol
+                    .unilateralness_unavailable
+                    .current
+                    .contains(&side.bot_params.unilateralness_ema_span_1m));
+        let requests =
+            if (symbol.allow_missing_strategy_inputs || !side.trailing_available || rms_warming)
+                && wants_entries
+                && wants_closes
+            {
+                [(true, false), (false, true)]
+            } else {
+                [(wants_entries, wants_closes), (false, false)]
+            };
         let mut entries = Vec::new();
         let mut closes = Vec::new();
         let mut close_inputs_unavailable = false;
@@ -3098,6 +3352,7 @@ mod core {
         per_short: Vec<Option<PerSymbolOrders>>,
         forced_long: Vec<usize>,
         forced_short: Vec<usize>,
+        eligible_forager_indices: Vec<usize>,
         features: Vec<ForagerCandidate>,
         gate_positions_long: Vec<GateEntriesPosition>,
         gate_positions_short: Vec<GateEntriesPosition>,
@@ -3439,6 +3694,14 @@ mod core {
         // - symbols must be indexed by `symbol_idx` for O(1) access in hot loops
         let n_symbols = input.symbols.len();
         for (pos, s) in input.symbols.iter().enumerate() {
+            if let Some(candle) = &s.next_candle {
+                crate::limit_fills::validate_buffer(candle.limit_order_fill_buffer_pct).map_err(
+                    |details| OrchestratorError::InvalidNextCandle {
+                        symbol_idx: s.symbol_idx,
+                        details: details.to_string(),
+                    },
+                )?;
+            }
             if !(s.order_book.bid.is_finite()
                 && s.order_book.ask.is_finite()
                 && s.order_book.bid > 0.0
@@ -3604,8 +3867,23 @@ mod core {
                 }
             }
             if actives_long_count < enp_long {
+                let slots_to_fill = enp_long.saturating_sub(actives_long_count);
+                collect_enabled_forager_candidate_indices_into(
+                    &input.symbols,
+                    PositionSide::Long,
+                    input.global.strategy_kind,
+                    input.global.hedge_mode,
+                    input.global.filter_by_min_effective_cost,
+                    input.balance,
+                    &workspace.runtime_budget_long,
+                    Some(actives_long),
+                    &mut workspace.derived_long,
+                    &mut workspace.eligible_forager_indices,
+                    &mut diagnostics,
+                )?;
+                let remaining_candidate_count = workspace.eligible_forager_indices.len();
                 let cfg = ForagerSelectionConfig {
-                    slots_to_fill: enp_long.saturating_sub(actives_long_count),
+                    slots_to_fill,
                     volume_drop_pct: input.global.global_bot_params.long.forager_volume_drop_pct,
                     weights: input
                         .global
@@ -3613,7 +3891,7 @@ mod core {
                         .long
                         .forager_score_weights
                         .clone(),
-                    require_forager: true,
+                    require_forager: remaining_candidate_count > slots_to_fill,
                     position_side: ForagerPositionSide::Long,
                     score_hysteresis_pct: input
                         .forager_hysteresis
@@ -3628,13 +3906,9 @@ mod core {
                 };
                 build_forager_candidates_into(
                     &input.symbols,
+                    &workspace.eligible_forager_indices,
                     PositionSide::Long,
                     input.global.strategy_kind,
-                    input.global.hedge_mode,
-                    input.global.filter_by_min_effective_cost,
-                    input.balance,
-                    &workspace.runtime_budget_long,
-                    Some(actives_long),
                     &cfg,
                     &mut workspace.derived_long,
                     &mut workspace.features,
@@ -3690,8 +3964,23 @@ mod core {
                 }
             }
             if actives_short_count < enp_short {
+                let slots_to_fill = enp_short.saturating_sub(actives_short_count);
+                collect_enabled_forager_candidate_indices_into(
+                    &input.symbols,
+                    PositionSide::Short,
+                    input.global.strategy_kind,
+                    input.global.hedge_mode,
+                    input.global.filter_by_min_effective_cost,
+                    input.balance,
+                    &workspace.runtime_budget_short,
+                    Some(actives_short),
+                    &mut workspace.derived_short,
+                    &mut workspace.eligible_forager_indices,
+                    &mut diagnostics,
+                )?;
+                let remaining_candidate_count = workspace.eligible_forager_indices.len();
                 let cfg = ForagerSelectionConfig {
-                    slots_to_fill: enp_short.saturating_sub(actives_short_count),
+                    slots_to_fill,
                     volume_drop_pct: input.global.global_bot_params.short.forager_volume_drop_pct,
                     weights: input
                         .global
@@ -3699,7 +3988,7 @@ mod core {
                         .short
                         .forager_score_weights
                         .clone(),
-                    require_forager: true,
+                    require_forager: remaining_candidate_count > slots_to_fill,
                     position_side: ForagerPositionSide::Short,
                     score_hysteresis_pct: input
                         .forager_hysteresis
@@ -3714,13 +4003,9 @@ mod core {
                 };
                 build_forager_candidates_into(
                     &input.symbols,
+                    &workspace.eligible_forager_indices,
                     PositionSide::Short,
                     input.global.strategy_kind,
-                    input.global.hedge_mode,
-                    input.global.filter_by_min_effective_cost,
-                    input.balance,
-                    &workspace.runtime_budget_short,
-                    Some(actives_short),
                     &cfg,
                     &mut workspace.derived_short,
                     &mut workspace.features,
@@ -4138,23 +4423,17 @@ mod core {
             let enabled = bot.unstuck_enabled
                 && bot.unstuck_loss_allowance_pct > 0.0
                 && bot.unstuck_close_pct > 0.0
-                && bot.unstuck_threshold > 0.0;
+                && bot.unstuck_threshold > 0.0
+                && bot.total_wallet_exposure_limit > 0.0;
             if !enabled {
                 continue;
             }
             let ema_bands = if bot.unstuck_ema_gating_enabled {
-                let strategy_params = cached_strategy_params_for_symbol_side(
-                    &mut workspace.derived_long,
-                    s.symbol_idx,
-                    input.global.strategy_kind,
-                    StrategySide::Long,
-                    &sym.long,
-                )?;
-                match cached_ema_bands(
-                    &mut workspace.derived_long,
+                match derive_ema_bands_for_spans(
                     s.symbol_idx,
                     &sym.emas,
-                    &strategy_params,
+                    bot.unstuck_ema_span_0,
+                    bot.unstuck_ema_span_1,
                 ) {
                     Ok(value) => value,
                     Err(err) => {
@@ -4207,23 +4486,17 @@ mod core {
             let enabled = bot.unstuck_enabled
                 && bot.unstuck_loss_allowance_pct > 0.0
                 && bot.unstuck_close_pct > 0.0
-                && bot.unstuck_threshold > 0.0;
+                && bot.unstuck_threshold > 0.0
+                && bot.total_wallet_exposure_limit > 0.0;
             if !enabled {
                 continue;
             }
             let ema_bands = if bot.unstuck_ema_gating_enabled {
-                let strategy_params = cached_strategy_params_for_symbol_side(
-                    &mut workspace.derived_short,
-                    s.symbol_idx,
-                    input.global.strategy_kind,
-                    StrategySide::Short,
-                    &sym.short,
-                )?;
-                match cached_ema_bands(
-                    &mut workspace.derived_short,
+                match derive_ema_bands_for_spans(
                     s.symbol_idx,
                     &sym.emas,
-                    &strategy_params,
+                    bot.unstuck_ema_span_0,
+                    bot.unstuck_ema_span_1,
                 ) {
                     Ok(value) => value,
                     Err(err) => {
@@ -4854,11 +5127,11 @@ mod core {
             bot_params: &BotParams,
         ) -> crate::strategies::TrailingMartingaleParams {
             crate::strategies::TrailingMartingaleParams {
-                ema_span_0: bot_params.ema_span_0,
-                ema_span_1: bot_params.ema_span_1,
                 volatility_ema_span_1h: bot_params.entry_volatility_ema_span_1h,
                 volatility_ema_span_1m: bot_params.entry_volatility_ema_span_1m,
                 entry: crate::strategies::TrailingMartingaleEntryParams {
+                    ema_span_0: bot_params.ema_span_0,
+                    ema_span_1: bot_params.ema_span_1,
                     double_down_factor: bot_params.entry_grid_double_down_factor,
                     ema_gate_mode: crate::strategies::EmaGateMode::Initial,
                     initial_ema_dist: bot_params.entry_initial_ema_dist,
@@ -4924,6 +5197,8 @@ mod core {
                 },
                 tradable: true,
                 allow_missing_strategy_inputs: false,
+                unilateralness_warmup_spans: Vec::new(),
+                unilateralness_unavailable: Default::default(),
                 next_candle: None,
                 effective_min_cost: 0.0,
                 emas,
@@ -4937,7 +5212,6 @@ mod core {
                     strategy_params: None,
                     parsed_strategy_params: None,
                     last_increase_fill_timestamp_ms: None,
-                    entry_fill_count: Some(0),
                     time_stop: None,
                     runtime_budget: None,
                 },
@@ -4950,7 +5224,6 @@ mod core {
                     strategy_params: None,
                     parsed_strategy_params: None,
                     last_increase_fill_timestamp_ms: None,
-                    entry_fill_count: Some(0),
                     time_stop: None,
                     runtime_budget: None,
                 },
@@ -5316,6 +5589,82 @@ mod core {
         }
 
         #[test]
+        fn minimal_protective_close_matches_canonical_panic_and_preserves_dust() {
+            for pside in [PositionSide::Long, PositionSide::Short] {
+                for size in [0.0, 0.000003, 1.0] {
+                    for execution_type in [ExecutionType::Limit, ExecutionType::Market] {
+                        let signed_size = if pside == PositionSide::Long {
+                            size
+                        } else {
+                            -size
+                        };
+                        let input = ProtectiveCloseInput {
+                            symbol_idx: 7,
+                            pside,
+                            position_size: signed_size,
+                            order_book: OrderBook {
+                                bid: 99.97,
+                                ask: 100.03,
+                            },
+                            price_step: 0.1,
+                            execution_type,
+                        };
+                        let orders = compute_protective_closes(&[input.clone()]).unwrap();
+                        if size == 0.0 {
+                            assert!(orders.is_empty());
+                            continue;
+                        }
+                        let old = calc_panic_close(
+                            7,
+                            pside,
+                            &Position {
+                                size: signed_size,
+                                price: 123.0,
+                            },
+                            &input.order_book,
+                            &ExchangeParams {
+                                price_step: 0.1,
+                                ..Default::default()
+                            },
+                        )
+                        .unwrap();
+                        assert_eq!(orders.len(), 1);
+                        assert_eq!(orders[0].qty, old.qty);
+                        assert_eq!(orders[0].price, old.price);
+                        assert_eq!(orders[0].order_type, old.order_type);
+                        assert_eq!(orders[0].execution_type, execution_type);
+                        assert_eq!(
+                            orders[0].execution_priority,
+                            ExecutionPriority::RiskCritical
+                        );
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn minimal_protective_close_rejects_whole_invalid_batch() {
+            let good = ProtectiveCloseInput {
+                symbol_idx: 0,
+                pside: PositionSide::Long,
+                position_size: 1.0,
+                order_book: OrderBook {
+                    bid: 99.0,
+                    ask: 100.0,
+                },
+                price_step: 0.1,
+                execution_type: ExecutionType::Market,
+            };
+            assert!(compute_protective_closes(&[good.clone(), good.clone()]).is_err());
+            for bad in [f64::NAN, f64::INFINITY, -1.0] {
+                let mut input = good.clone();
+                input.symbol_idx = 1;
+                input.position_size = bad;
+                assert!(compute_protective_closes(&[good.clone(), input]).is_err());
+            }
+        }
+
+        #[test]
         fn panic_close_quantizes_off_tick_book_prices() {
             let exchange = ExchangeParams {
                 qty_step: 0.001,
@@ -5613,6 +5962,50 @@ mod core {
             assert!((block.effective_limit - 1.5).abs() < 1e-12);
             assert!((block.projected_initial_cost - 1.4732627616).abs() < 1e-9);
             assert!((block.effective_min_cost - 10.1).abs() < 1e-12);
+        }
+
+        #[test]
+        fn single_eligible_coin_skips_forager_feature_requirements() {
+            let mut symbol = make_basic_symbol(0);
+            symbol.forager_m1 = Some(EmaTimeframeBundle::default());
+
+            let mut global = make_basic_global();
+            global.global_bot_params.long.n_positions = 1;
+            global.global_bot_params.long.total_wallet_exposure_limit = 1.0;
+            global.global_bot_params.long.forager_volume_drop_pct = 0.5;
+            global.global_bot_params.long.forager_score_weights =
+                crate::types::ForagerScoreWeights {
+                    unilateralness: 0.0,
+                    volume: 1.0,
+                    ema_readiness: 1.0,
+                    volatility: 1.0,
+                };
+            global.global_bot_params.short.n_positions = 0;
+            global.global_bot_params.short.total_wallet_exposure_limit = 0.0;
+
+            let input = OrchestratorInput {
+                timestamp_ms: 0,
+                balance: 1_000.0,
+                balance_raw: 1_000.0,
+                global,
+                symbols: vec![symbol],
+                peek_hints: None,
+                forager_hysteresis: None,
+            };
+
+            let out = compute_ideal_orders_for_test(&input).unwrap();
+            assert!(out.orders.iter().any(|order| {
+                order.symbol_idx == 0 && order.pside == PositionSide::Long && order.qty > 0.0
+            }));
+            let selection = out
+                .diagnostics
+                .forager_selections
+                .iter()
+                .find(|selection| selection.pside == PositionSide::Long)
+                .unwrap();
+            assert_eq!(selection.selected_symbol_indices, vec![0]);
+            assert!(!selection.ranking_required);
+            assert!(selection.top_scores.is_empty());
         }
 
         #[test]
@@ -5991,6 +6384,7 @@ mod core {
                 price: 100.0,
             };
             sym.next_candle = Some(NextCandle {
+                limit_order_fill_buffer_pct: 0.0,
                 low: 1e9,
                 high: 1e9,
                 tradable: true,
@@ -6027,6 +6421,21 @@ mod core {
                 forager_hysteresis: None,
             };
 
+            // Typed Rust callers must reject invalid hints too, including non-finite
+            // values that JSON cannot represent.
+            for buffer in [-0.001, 1.0, 2.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                let mut invalid = input.clone();
+                invalid.symbols[0]
+                    .next_candle
+                    .as_mut()
+                    .unwrap()
+                    .limit_order_fill_buffer_pct = buffer;
+                assert!(matches!(
+                    compute_ideal_orders_for_test(&invalid),
+                    Err(OrchestratorError::InvalidNextCandle { symbol_idx: 0, .. })
+                ));
+            }
+
             let out = compute_ideal_orders_for_test(&input).unwrap();
             let n_entries_no_fill = out
                 .orders
@@ -6037,6 +6446,7 @@ mod core {
 
             let mut sym_fill = sym;
             sym_fill.next_candle = Some(NextCandle {
+                limit_order_fill_buffer_pct: 0.0,
                 low: 0.0,
                 high: 0.0,
                 tradable: true,
@@ -7135,6 +7545,65 @@ mod core {
                 "qty {}",
                 entries[0].qty
             );
+        }
+
+        #[test]
+        fn twel_gating_equal_distance_retains_higher_symbol_first() {
+            let balance = 1000.0;
+            let total_wel = 0.0105; // $10.50: room for one $10 entry, not two
+            let exchange = ExchangeParams {
+                qty_step: 0.1,
+                price_step: 0.1,
+                min_qty: 0.0,
+                min_cost: 0.0,
+                c_mult: 1.0,
+                ..Default::default()
+            };
+            let symbols = (0..2)
+                .map(|idx| {
+                    let mut symbol = make_basic_symbol(idx);
+                    symbol.order_book = OrderBook {
+                        bid: 20.0,
+                        ask: 20.0,
+                    };
+                    symbol.exchange = exchange.clone();
+                    symbol
+                })
+                .collect::<Vec<_>>();
+            let positions: Vec<GateEntriesPosition> = Vec::new();
+            let mut entries = (0..2)
+                .map(|symbol_idx| IdealOrder {
+                    symbol_idx,
+                    pside: PositionSide::Long,
+                    qty: 1.0,
+                    price: 10.0,
+                    order_type: OrderType::EntryGridNormalLong,
+                })
+                .collect::<Vec<_>>();
+            let mut current_positions = Vec::new();
+            let mut scratch = Vec::new();
+            let mut keep = Vec::new();
+            let mut qty_by_order_idx = Vec::new();
+            let mut out = Vec::new();
+
+            gate_entries_by_twel_deterministic(
+                PositionSide::Long,
+                balance,
+                total_wel,
+                &make_basic_global(),
+                &positions,
+                &mut entries,
+                &symbols,
+                &mut current_positions,
+                &mut scratch,
+                &mut keep,
+                &mut qty_by_order_idx,
+                &mut out,
+            );
+
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].symbol_idx, 1);
+            assert!((entries[0].qty - 1.0).abs() < 1e-12);
         }
 
         #[test]
@@ -8830,67 +9299,38 @@ mod core {
         }
 
         #[test]
-        fn cooldown_factor_tracks_each_entry_fill_and_caps_total_delay() {
+        fn divergence_scales_held_cooldown_up_to_ceiling() {
             let mut side = make_basic_symbol(0).long;
+            // Flat positions keep the adaptive duration.
+            assert_eq!(
+                divergence_scaled_cooldown(10.0, &side, 0, 4.0).unwrap(),
+                10.0
+            );
             side.position = Position {
                 size: 1.0,
                 price: 100.0,
             };
-            side.bot_params.risk_entry_cooldown_minutes = 10.0;
-            side.bot_params.risk_entry_cooldown_factor_per_fill = 2.0;
-            side.entry_fill_count = Some(1);
             assert_eq!(
-                effective_entry_cooldown_minutes(&side, 0, 1.0).unwrap(),
-                10.0
+                divergence_scaled_cooldown(10.0, &side, 0, 4.0).unwrap(),
+                40.0
             );
-            side.entry_fill_count = Some(2);
+            assert_eq!(divergence_scaled_cooldown(0.0, &side, 0, 4.0).unwrap(), 0.0);
+            // Without an explicit ceiling the extension stops at 24 hours.
             assert_eq!(
-                effective_entry_cooldown_minutes(&side, 0, 1.0).unwrap(),
-                20.0
-            );
-            side.entry_fill_count = Some(3);
-            assert_eq!(
-                effective_entry_cooldown_minutes(&side, 0, 2.0).unwrap(),
-                80.0
-            );
-            side.entry_fill_count = Some(30);
-            assert_eq!(
-                effective_entry_cooldown_minutes(&side, 0, 4.0).unwrap(),
+                divergence_scaled_cooldown(600.0, &side, 0, 4.0).unwrap(),
                 1440.0
             );
-            side.bot_params.risk_entry_cooldown_factor_per_fill = 0.5;
-            side.entry_fill_count = Some(3);
+            side.bot_params.entry_cooldown_max_duration_minutes = Some(30.0);
             assert_eq!(
-                effective_entry_cooldown_minutes(&side, 0, 1.0).unwrap(),
-                2.5
+                divergence_scaled_cooldown(10.0, &side, 0, 4.0).unwrap(),
+                30.0
             );
-            side.bot_params.risk_entry_cooldown_factor_per_fill = 1.0;
+            // The ceiling never shortens the adaptive duration itself.
             assert_eq!(
-                effective_entry_cooldown_minutes(&side, 0, 1.0).unwrap(),
-                10.0
+                divergence_scaled_cooldown(45.0, &side, 0, 4.0).unwrap(),
+                45.0
             );
-            side.position = Position::default();
-            side.entry_fill_count = Some(0);
-            assert_eq!(
-                effective_entry_cooldown_minutes(&side, 0, 4.0).unwrap(),
-                10.0
-            );
-        }
-
-        #[test]
-        fn adaptive_cooldown_requires_proven_entry_fills() {
-            let mut side = make_basic_symbol(0).long;
-            side.position = Position {
-                size: 1.0,
-                price: 100.0,
-            };
-            side.bot_params.risk_entry_cooldown_minutes = 10.0;
-            side.bot_params.risk_entry_cooldown_factor_per_fill = 2.0;
-            side.entry_fill_count = None;
-            assert!(matches!(
-                effective_entry_cooldown_minutes(&side, 0, 1.0),
-                Err(OrchestratorError::MissingEntryFillHistory { symbol_idx: 0 })
-            ));
+            assert!(divergence_scaled_cooldown(10.0, &side, 0, 0.5).is_err());
         }
     }
 }

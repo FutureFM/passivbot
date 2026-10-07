@@ -92,3 +92,23 @@ def test_extended_horizons_allow_up_to_six_required_timeframes():
     risk["divergence_min_timeframes"] = 7
     with pytest.raises(ValueError, match="divergence_min_timeframes must be 1..6"):
         validate_config(config)
+
+
+@pytest.mark.parametrize(
+    "enabled,multiplier,ceiling,expected",
+    [(False, 30.0, None, 10.0), (True, 1.0, None, 10.0), (True, 30.0, None, 1440.0), (True, 30.0, 120.0, 120.0)],
+)
+def test_live_cooldown_lookback_covers_divergence_extension(enabled, multiplier, ceiling, expected):
+    from types import SimpleNamespace
+    from passivbot import Passivbot
+
+    values = {
+        "risk_entry_cooldown_minutes": 10.0,
+        "entry_cooldown_min_duration_minutes": 0.0,
+        "entry_cooldown_max_duration_minutes": ceiling,
+        "entry_cooldown_weights_minutes": {"exposure_ratio": 0.0, "adverse_directionality": 0.0},
+        "divergence_filter_enabled": enabled,
+        "divergence_delay_multiplier": multiplier,
+    }
+    bot = SimpleNamespace(bp=lambda pside, key, symbol=None: values[key])
+    assert Passivbot._entry_cooldown_horizon(bot, "long") == expected

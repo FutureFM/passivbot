@@ -19,19 +19,15 @@ internal compatibility surfaces: ignore them when adding current config fields, 
 production or live support from their presence. The only supported pre-V8 strategy migration path
 is the explicit `passivbot tool migrate-config-v7` workflow for normalized V7 trailing-grid input.
 
-With `entry_cooldown_minutes = 0.0`, `trailing_grid_v7` preserves v7's simultaneous grid-entry
+With an effective entry cooldown of zero, `trailing_grid_v7` preserves v7's simultaneous grid-entry
 ladder even when a later trailing leg uses retracement. Its recursive generator stops expansion
 before stacking retracement-dependent trailing orders. Positive entry cooldowns still stage at
 most one position-adding order and apply their configured post-fill delay.
-`risk.entry_cooldown_factor_per_fill` scales that delay by the number of
-position-increasing fills in the current open position: the first fill uses the
-base, later fills multiply by `factor^(count - 1)`, and flattening resets the
-count. Divergence multiplies the result for held positions; the final delay is
-capped at `risk.entry_cooldown_max_minutes`, at most 1440. Live reconstructs
-the count from normalized exchange fills after restart. An unproven episode
-defers only affected entries while a scoped history repair runs; closes remain
-independent. Optimizer bounds for the factor and cap are optional; without them the
-configured values stay fixed.
+Divergence protection multiplies the adaptive `entry_cooldown` duration of a held
+position by its severity-scaled delay multiplier, capped by
+`entry_cooldown.max_duration_minutes` (or 1440 when unset) but never below the adaptive
+duration itself. Flat positions keep the unmodified duration. Live fill lookbacks for the
+last increasing fill cover that extended ceiling.
 
 Removed v7 trailing-grid concepts:
 
@@ -72,6 +68,23 @@ Optimizer selector contract:
   `optimize.bounds` are clamped into bounds with aggregated source/key logging. Without
   `--fine_tune_params`, `--start` remains seed-only.
 
+Seed evaluation contract:
+
+- Shared ingestion normalizes, clamps, quantizes, and deduplicates starting configs before each
+  backend applies its seed policy. GPU preparation and proxy setup use the bounds-clamped
+  input seed after fixed runtime and optimizer overrides. Bounds may change its enabled
+  sides relative to the input bot values; enabledness must remain fixed across the search.
+- CPU optimization exact-Rust evaluates every deduplicated seed before population trimming.
+- GPU `seed_bootstrap.mode=auto` exact-evaluates small pools and full-history proxy-screens pools
+  larger than `max_exact`. Screened pools exact-Rust validate a capped, constraint-aware diverse
+  proxy set; only that subset enters the authoritative exact archive.
+- Seed-bootstrap exact evaluations are recorded separately from the GPU evolutionary
+  `optimize.iters` budget. Exact fitness seeds the archive and vector-only initial sampling; exact
+  and proxy fitness must never share an NSGA objective matrix.
+- An incomplete bootstrap checkpoint owns its normalized seed plan. Resume does not depend on the
+  original seed files, including for anchored fine-tuning, and must recover any exact seed result
+  already flushed to durable history.
+
 Timeframe-specific EMA spans use explicit horizon suffixes in canonical config names. Use `_1m`
 for 1-minute candle inputs and `_1h` for 1-hour candle inputs, for example
 `volatility_ema_span_1m`, `volatility_ema_span_1h`, `forager_volume_ema_span_1m`, and
@@ -106,6 +119,13 @@ passes completed-candle forager metrics separately from strategy EMA maps so a
 shared span cannot leak a projected strategy value into coin ranking.
 
 ## Trailing Martingale Semantics
+
+Trailing-martingale price spans belong to `entry.ema_span_0/1`. Schema v8.4.0 migrates
+old strategy-root leaves before hydration and before file/inline override merges; explicit
+new leaves win with warnings on conflicting values. Public optimizer bounds share the nested
+paths; internal optimizer keys and Metal columns retain `ema_span_0/1`. Entry subtree selectors
+include the horizons. EMA-anchor and trailing-grid-v7 paths are unchanged. Volatility horizons
+remain shared by entries and closes.
 
 Entries and closes use threshold/retracement fields.
 
@@ -148,8 +168,52 @@ wallet-exposure modifier.
 Auto-unstuck has its own EMA trigger toggle:
 `bot.<side>.unstuck.ema_gating_enabled`. It defaults to `true`. When false, auto-unstuck skips the
 EMA trigger/readiness check but still requires `unstuck.enabled`, loss allowance, exposure
-threshold, close sizing, and valid market/exchange inputs. The toggle does not add independent
-unstuck EMA spans.
+threshold, close sizing, and valid market/exchange inputs.
+
+`bot.<side>.unstuck.ema_span_0` and `ema_span_1` independently define the unstuck price EMA
+band, using the same base candle stream and unrounded geometric-mean third span as the strategy
+band. Long eligibility uses the upper band; short eligibility uses the lower band. Strategy EMA
+changes must not change the unstuck band. Missing required unstuck EMAs follow the existing scoped
+input-unavailable contract; disabled gating does not require them or extend warmup. Live loading
+requests unstuck-only spans for held sides separately, preserving usable strategy spans when an
+unstuck horizon is unavailable. Live warmup uses that same held/static eligibility and does not
+expand flat forager candidates to an unused unstuck horizon. Monitor bands are independently
+available for each consumer.
+
+Schema v8.3.0 materializes missing unstuck spans from the effective active strategy before default
+hydration, including coin overrides and external-file/inline precedence. Explicit unstuck spans
+win. New optimizer bounds copy fixed legacy bounds, or freeze at the migrated starting values for
+varying legacy ranges unless supplied; a warning explains that independent genes cannot preserve
+the old coupled search. New defaults expose tunable spans.
+Apple MPS models a separate price EMA band for unstuck in all directional and multicoin kernels.
+It uses the same seeded recurrence, floating horizons and candle-interval scaling as exact Rust.
+Coin overrides win over candidate globals, and temporal replay persists the independent band.
+
+The opt-in optimizer override `couple_unstuck_ema_spans` derives each side/coin's unstuck pair
+from its effective strategy, after mirroring and fixed/scenario overrides. It removes redundant
+unstuck span genes and materializes explicit runtime spans in saved candidates and scenarios.
+GPU packing preserves the dependency on candidate strategy genes while retaining strategy coin
+pins. This is optimizer configuration finalization, not a live/backtest coupling mode.
+
+## Backtest Limit Fill Buffer
+
+`backtest.limit_order_fill_buffer_pct` is a simulation-only ratio, defaulting to `0.0`.
+Limit buys require `low < price * (1 - buffer)` and limit sells require
+`high > price * (1 + buffer)`. Equality never fills. The buffer changes eligibility only:
+filled limit orders retain the original order price and maker fees. Market execution bypasses it.
+The actual fill and next-candle ladder-expansion hint share the same Rust predicate; raw candles
+used for indicators, trailing extrema, equity, and risk remain unchanged. Live inputs do not
+forward this setting. CPU and GPU optimization treat it as fixed evaluation policy. GPU screening
+encodes buffered strict crossings as immutable integer tick boundaries during data preparation; kernels retain
+the same fill comparisons and original candle/touch inputs. Prepared-data cache keys and
+checkpoint execution identity include the buffer.
+Thresholds above all representable order ticks saturate at the maximum tick: this preserves
+all-sell/no-buy eligibility without rejecting large valid buffers. Executable price range checks
+remain unchanged.
+The native backtest payload loader accepts an absent buffer as `0.0` for payloads from before
+this setting existed; explicit invalid values still fail. Canonical Python loading always supplies
+the field. Orchestrator next-candle hints likewise default absence to zero and reject non-finite
+values or ratios outside `[0, 1)` before order construction.
 
 ## Live/Backtest Market Slippage Boundary
 
@@ -221,3 +285,70 @@ behavior patches.
 - `tests/test_orchestrator_json_api.py`
 - `tests/test_orchestrator_integration.py`
 - `tests/test_auto_unstuck_allowance.py`
+
+## Adaptive entry timing and unilateralness
+
+Rust owns signed RMS directionality, its use as a lower-is-better Forager component,
+and additive cooldown minutes. The shared side-level float span lives under
+`forager.unilateralness_ema_span_1m`. Both runtimes use the same last
+`ceil(20 * span) + 1` completed one-minute closes with zero-seeded exponential weights.
+Live replays the window. CPU uses rolling aggregate stacks with amortized constant
+work per candle, agreeing with replay within floating-point roundoff; all-flat windows
+are exactly zero. No RAM-only indicator state is needed for restart. Missing history is absent,
+never a neutral score. CPU candle intervals other than one minute are rejected
+when an RMS consumer is enabled. Dormant weights on a statically disabled side do
+not request RMS history, allocate CPU trackers, or restrict candle intervals. Optimizer
+dataset preflight checks finalized per-coin eligibility and overrides across reachable
+boundary configs. Entry-ineligible sides do not restrict intervals or RMS activation.
+
+Canonical loading and cleaning expose missing unilateralness weight/span and
+adaptive cooldown weight/minimum-duration optimizer bounds as fixed ranges at
+the side's configured values (using normalized Forager weights). A missing maximum
+duration bound is hydrated only for a finite ceiling; null remains unbounded.
+Explicit bounds retain their authority. Visibility must not open a search range or
+change optimizer candidate normalization or warmup for unchanged configurations.
+
+Forager may carry a complete cached observation only within the existing candidate
+age budget, without feeding invented flat returns. Cooldown requires a current
+completed window. Their values remain separate in the input envelope. Missing
+RMS is scoped to the consuming entry or ranking branch; closes remain independent.
+Live `unilateralness_unavailable` carries separate `current` and `forager` span
+lists. RMS transport failures must not set the generic missing-strategy-input
+permission. A valid cached ranking value does not satisfy current cooldown input.
+CPU history requests include RMS only for reachable consumers; scoring alone needs no
+history when a known eligible side universe fits fixed slots with dynamic WEL disabled,
+or has at most one coin. Shared trade activation does not wait for RMS.
+Per-coin `warmup_minutes_source` distinguishes producer-stamped `history` from
+`activation` budgets. Only known history metadata may be replaced by a candidate's
+non-RMS activation budget; optimizer activation stamps and untyped external budgets
+remain authoritative. Rust's zero global warmup retains its automatic non-RMS
+fallback. Python sends the minimum positive budget when it explicitly computes a
+zero activation budget for an adverse-RMS consumer.
+The backtest marks exact spans still warming from known listing history in
+`unilateralness_warmup_spans`. A missing score at a marked span defers only required
+ranking or the side/order branch consuming adverse cooldown. If any compared
+candidate lacks required RMS, defer the whole ranking decision, not just that
+candidate; never select from a history-ready subset. Closes and unrelated
+entries remain independent. Once enough closes exist the marker is removed.
+Unmarked missing inputs, unrelated required inputs and invalid scores remain fatal.
+The Python output validator evaluates the submitted cooldown inputs through the
+same pure Rust policy, rather than trusting a producer-echoed duration.
+
+Cooldown uses nonnegative additive weights for existing exposure ratio (without a
+unit cap) and adverse signed RMS. Apply floor/ceiling once after composition.
+A validated policy whose base/floor already reaches its ceiling is constant and
+requires no modifier inputs. Inactive adverse modifiers impose no RMS history or
+interval requirement; optimizer bounds must account for nonconstant corners.
+Enabled weights require a finite ceiling; structural fill coverage, pair activation
+and restart anchors use that horizon even at base zero. Live approval gates initial
+entries, not DCA on held graceful-stop positions. Keep held-side cooldown history and
+adverse inputs conservatively; effective trading modes remain Rust's decision.
+Current effective duration,
+not base alone, governs elapsed-time gating and entry-ladder staging. At effective
+zero retain existing strategy rules. Partial fills remain ordinary increasing fills.
+All new weights default to zero. Metal/CUDA screening supports these settings for
+EMA Anchor and Trailing Martingale, including directional and fused portfolios.
+GPU RMS uses a finite exponential recurrence, reads the expiring return from immutable
+candles, and periodically rebuilds to bound float32 subtraction error. Replay checkpoints
+preserve each candidate/coin/side accumulator; exact Rust validation remains authoritative.
+The GPU parameter-layout revision invalidates older optimizer checkpoints.

@@ -28,7 +28,9 @@ if sys.platform.startswith("win"):
 from rust_utils import check_and_maybe_compile, verify_loaded_runtime_extension
 
 _rust_parser = argparse.ArgumentParser(add_help=False)
-_rust_parser.add_argument("--skip-rust-compile", action="store_true", help="Skip Rust build check.")
+_rust_parser.add_argument(
+    "--skip-rust-compile", action="store_true", help="Skip Rust build check."
+)
 _rust_parser.add_argument(
     "--force-rust-compile", action="store_true", help="Force rebuild of Rust extension."
 )
@@ -53,6 +55,7 @@ except Exception as exc:
 sys.argv = [sys.argv[0]] + _rust_remaining
 
 import passivbot_rust as pbr
+
 verify_loaded_runtime_extension()
 from backtest import (
     prepare_hlcvs_mss,
@@ -72,7 +75,13 @@ from cli_utils import (
     get_cli_prog,
     help_all_requested,
 )
-from config import compile_runtime_config, load_input_config, load_prepared_config, prepare_config
+from config import (
+    compile_runtime_config,
+    load_input_config,
+    load_prepared_config,
+    prepare_config,
+)
+from config.overrides import parse_overrides
 from config.access import get_optional_config_value, require_config_value
 from config.limits import normalize_limit_entries, parse_limit_cli_entries
 from config.param_paths import resolve_bound_selectors, require_existing_config_path
@@ -92,6 +101,7 @@ from config.scoring import (
     resolve_objective_basis,
     to_engine_value,
 )
+from config.reducers import REDUCER_ALIASES, canonicalize_reducer_mapping
 from config.parse import load_raw_config as load_hjson_config
 from config.schema import get_template_config
 from warmup_utils import compute_backtest_warmup_minutes
@@ -100,6 +110,7 @@ from config_utils import (
     add_config_arguments,
     project_template_config_for_cli,
     update_config_with_args,
+    effective_config_payload,
     recursive_config_update,
     merge_negative_cli_values,
     clean_config,
@@ -112,13 +123,27 @@ from pure_funcs import (
     str2bool,
 )
 from opt_utils import deep_updated
-from utils import date_to_ts, ts_to_date, utc_ms, make_get_filepath, format_approved_ignored_coins
+from utils import (
+    date_to_ts,
+    ts_to_date,
+    utc_ms,
+    make_get_filepath,
+    format_approved_ignored_coins,
+)
 from logging_setup import configure_logging, resolve_log_level
 from materialized_cache import release_materialized_payload
 from copy import deepcopy
+from dataclasses import replace
 import gc
 import numpy as np
-from uuid import uuid4
+from session_artifacts import (
+    create_session_dir,
+    date_span,
+    effective_setup_config,
+    snapshot_starting_configs,
+    iter_starting_snapshot,
+    resolve_optimizer_seed,
+)
 import logging
 import traceback
 import json
@@ -153,7 +178,13 @@ except ImportError:  # pragma: no cover - allow import in minimal test envs
 import math
 import fcntl
 from optimizer_overrides import optimizer_overrides, validate_optimizer_overrides
-from opt_utils import make_json_serializable, generate_incremental_diff, round_floats, quantize_floats
+from opt_utils import (
+    deep_updated,
+    generate_incremental_diff,
+    make_json_serializable,
+    quantize_floats,
+    round_floats,
+)
 from limit_utils import expand_limit_checks, compute_limit_violation
 from pareto_store import ParetoStore
 import msgpack
@@ -174,18 +205,30 @@ from suite_runner import (
     extract_suite_config,
     filter_scenarios_by_label,
     load_suite_override_config,
-    aggregate_metrics,
+    reduce_metrics,
     build_scenarios,
     build_suite_metrics_payload,
 )
-from metrics_schema import MetricAggregationError, build_scenario_metrics, flatten_metric_stats
+from metrics_schema import (
+    MetricAggregationError,
+    build_scenario_metrics,
+    flatten_metric_stats,
+)
 from optimization.bounds import (
     Bound,
     enforce_bounds,
     round_to_sig_digits,
 )
-from optimization.fine_tune_anchors import ANCHOR_GENE_KEY, ANCHOR_PLAN_KEY, get_anchor_plan
-from optimization.backend_shared import cancel_pending_async_results, stream_async_results
+from optimization.fine_tune_anchors import (
+    ANCHOR_GENE_KEY,
+    ANCHOR_PLAN_KEY,
+    get_anchor_plan,
+)
+from optimization.interrupts import OptimizerInterruptLatch
+from optimization.backend_shared import (
+    cancel_pending_async_results,
+    stream_async_results,
+)
 from optimization.backends import get_backend_runner
 from optimization.random_seed import seed_rngs
 from optimization.starting_config_selection import select_starting_config_artifacts
@@ -194,12 +237,29 @@ from optimization.config_adapter import (
     get_optimization_key_paths,
     resolve_optimization_bound_path,
 )
-from optimization.evaluation_payload import apply_evaluation_payload, build_evaluation_payload
+from optimization.evaluation_payload import (
+    apply_evaluation_payload,
+    build_evaluation_payload,
+)
+from optimization.prepared_dataset_identity import (
+    PREPARED_DATASET_KEY,
+    build_prepared_dataset_identity,
+)
+from optimization.evaluation_contract import (
+    CONTRACT_KEY,
+    CONTRACT_VERSION,
+    CONTRACT_CACHE_KEY,
+    build_evaluation_contract,
+    has_unresolved_override_files,
+    recorded_evaluation_contract,
+)
 from optimization.warmup import (
     build_optimizer_data_config,
     build_optimizer_vector_config,
     compute_optimizer_per_coin_warmup_minutes,
     stamp_warmup_metadata,
+    validate_optimizer_effective_configs,
+    validate_optimizer_dataset_intervals,
 )
 from optimization.shape import OptimizationShape, build_optimization_shape
 from config.strategy import normalize_strategy_kind, sync_canonical_strategy_config
@@ -269,13 +329,27 @@ def _normalize_optional_bool_flag(argv: list[str], flag: str) -> list[str]:
     return result
 
 
-def _maybe_aggregate_backtest_data(hlcvs, timestamps, btc_usd_prices, mss, config):
-    candle_interval = int(config.get("backtest", {}).get("candle_interval_minutes", 1) or 1)
+def _maybe_aggregate_backtest_data(
+    hlcvs,
+    timestamps,
+    btc_usd_prices,
+    mss,
+    config,
+    *,
+    preserve_internal_nan_gaps: bool = False,
+):
+    candle_interval = int(
+        config.get("backtest", {}).get("candle_interval_minutes", 1) or 1
+    )
     if candle_interval <= 1:
         return hlcvs, timestamps, btc_usd_prices
     n_before = hlcvs.shape[0]
     hlcvs, timestamps, btc_usd_prices, offset_bars = align_and_aggregate_hlcvs(
-        hlcvs, timestamps, btc_usd_prices, candle_interval
+        hlcvs,
+        timestamps,
+        btc_usd_prices,
+        candle_interval,
+        preserve_internal_nan_gaps=preserve_internal_nan_gaps,
     )
     logging.debug(
         "[optimize] aggregated %dm candles: %d bars -> %d bars (trimmed %d for alignment)",
@@ -310,10 +384,13 @@ def _stamp_optimizer_warmup(config: dict, mss: dict, coins: list[str]) -> None:
     individual, running it through ``individual_to_config``, and recomputing
     warmup from the resulting config.
 
+    RMS history is loaded separately. Its activation delay is candidate-specific
+    and enforced by Rust, so it must not enter this shared metadata.
+
     Must be called *after* ``prepare_hlcvs_mss`` and *before* the Evaluator
     reads ``mss``.
     """
-    warmup_map = compute_optimizer_per_coin_warmup_minutes(config)
+    warmup_map = compute_optimizer_per_coin_warmup_minutes(config, for_trade_activation=True)
     stamped = stamp_warmup_metadata(mss, coins, warmup_map)
     if stamped:
         summary = ", ".join(
@@ -345,9 +422,13 @@ def _propagate_optimizer_dataset_override(
         return
     side_membership = meta.get("effective_side_membership")
     if not isinstance(side_membership, dict):
-        raise ValueError("HLCV dataset override metadata missing effective_side_membership")
+        raise ValueError(
+            "HLCV dataset override metadata missing effective_side_membership"
+        )
     missing_sides = [
-        pside for pside in ("long", "short") if not isinstance(side_membership.get(pside), list)
+        pside
+        for pside in ("long", "short")
+        if not isinstance(side_membership.get(pside), list)
     ]
     if missing_sides:
         raise ValueError(
@@ -360,7 +441,9 @@ def _propagate_optimizer_dataset_override(
         effective_start_ts = int(meta["effective_requested_start_ts"])
         effective_end_ts = int(meta["effective_end_ts"])
     except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError("HLCV dataset override metadata missing effective date range") from exc
+        raise ValueError(
+            "HLCV dataset override metadata missing effective date range"
+        ) from exc
 
     config.setdefault("live", {})["approved_coins"] = deepcopy(side_membership)
     backtest = config.setdefault("backtest", {})
@@ -381,20 +464,32 @@ def _register_exchange_data(
     btc_usd_specs: dict,
     timestamps_dict: dict,
     array_manager: SharedArrayManager,
+    preserve_internal_nan_gaps: bool = False,
 ) -> tuple[list[str], dict]:
     """
     Register one exchange's prepared data into the optimizer's shared-memory
     pools and preserve any dataset replay policy on the evaluator config.
     """
-    coins, hlcvs, mss, _results_path, cache_dir, btc_usd_prices, timestamps = prepare_result
+    coins, hlcvs, mss, _results_path, cache_dir, btc_usd_prices, timestamps = (
+        prepare_result
+    )
     _propagate_optimizer_dataset_override(config, exchange, coins, cache_dir, mss)
+    config["backtest"]["coins"][exchange] = coins
+    validate_optimizer_dataset_intervals(config, mss, exchange)
     prepared_hlcvs = hlcvs
     hlcvs, timestamps, btc_usd_prices = _maybe_aggregate_backtest_data(
-        hlcvs, timestamps, btc_usd_prices, mss, config
+        hlcvs,
+        timestamps,
+        btc_usd_prices,
+        mss,
+        config,
+        preserve_internal_nan_gaps=preserve_internal_nan_gaps,
     )
     _stamp_optimizer_warmup(config, mss, coins)
     timestamps_dict[exchange] = (
-        None if timestamps is None else np.array(timestamps, dtype=np.int64, copy=True, order="C")
+        None
+        if timestamps is None
+        else np.array(timestamps, dtype=np.int64, copy=True, order="C")
     )
     config["backtest"]["coins"][exchange] = coins
     msss[exchange] = mss
@@ -424,6 +519,7 @@ class ResultRecorder:
         pareto_max_size: int = 1000,
         bounds: Optional[Sequence[Bound]] = None,
         starting_iters: int = 0,
+        previous_data: dict | None = None,
     ):
         self.scoring_specs = extract_objective_specs(scoring_keys)
         self.scoring_keys = [spec.metric for spec in self.scoring_specs]
@@ -445,18 +541,21 @@ class ResultRecorder:
             filename = os.path.join(results_dir, "all_results.bin")
             self.results_file = open(filename, "ab")
             self.packer = msgpack.Packer(use_bin_type=True)
-        self.prev_data = None
-        self.counter = 0
+        self.prev_data = previous_data
 
     def record(self, data: dict) -> None:
         if self.write_all and self.results_file:
             if self.compress:
-                if self.prev_data is None or self.counter % 100 == 0:
+                # The on-disk format is an overlay stream: readers apply every
+                # object to the preceding result.  A plain "full" object at a
+                # periodic boundary therefore cannot clear keys that existed
+                # only in the previous result.  Emit a diff after the first
+                # record so deletion markers remain explicit at every boundary.
+                if self.prev_data is None:
                     output_data = make_json_serializable(data)
                 else:
                     diff = generate_incremental_diff(self.prev_data, data)
                     output_data = make_json_serializable(diff)
-                self.counter += 1
                 self.prev_data = data
             else:
                 output_data = data
@@ -479,11 +578,13 @@ class ResultRecorder:
                     if isinstance(violation, (int, float))
                     else ""
                 )
-                logging.info(
+                logging.debug(
                     "Pareto update | eval=%d | front=%d | objectives=%s%s",
                     self.store.n_iters,
                     len(self.store._front),
-                    _format_objectives(objectives_block, scoring_keys=self.scoring_keys),
+                    _format_objectives(
+                        objectives_block, scoring_keys=self.scoring_keys
+                    ),
                     violation_str,
                 )
 
@@ -550,7 +651,9 @@ def _optimizer_can_skip_btc_analysis(
         return False
     if btc_collateral_cap > 0.0:
         return False
-    if any(_metric_uses_btc_denominated_analysis(spec.metric) for spec in scoring_specs):
+    if any(
+        _metric_uses_btc_denominated_analysis(spec.metric) for spec in scoring_specs
+    ):
         return False
     for check in limit_checks or []:
         if _metric_uses_btc_denominated_analysis(check.get("metric")):
@@ -603,7 +706,9 @@ def _is_recoverable_backtest_candidate_error(exc: BaseException) -> bool:
     name = exc.__class__.__name__
     message = str(exc)
     if name == "PanicException":
-        return any(pattern in message for pattern in _RECOVERABLE_BACKTEST_PANIC_PATTERNS)
+        return any(
+            pattern in message for pattern in _RECOVERABLE_BACKTEST_PANIC_PATTERNS
+        )
     if isinstance(exc, ValueError):
         return "hard-stop evaluation failed" in message and any(
             pattern in message
@@ -645,7 +750,10 @@ def _close_evaluator_for_pool(evaluator_for_pool) -> bool:
 
 
 def _suite_config_implies_suite_mode(args) -> bool:
-    return bool(getattr(args, "suite_config", None)) and getattr(args, "suite", None) is None
+    return (
+        bool(getattr(args, "suite_config", None))
+        and getattr(args, "suite", None) is None
+    )
 
 
 def _build_invalid_candidate_metrics(
@@ -660,6 +768,7 @@ def _build_invalid_candidate_metrics(
     objectives = tuple(to_engine_value(spec, 0.0) for spec in specs)
     metrics_payload = {
         "objectives": raw_objectives,
+        "unpenalized_objectives": objectives,
         "constraint_violation": INVALID_BACKTEST_CANDIDATE_PENALTY,
         "error": error,
     }
@@ -693,9 +802,16 @@ def _clear_candidate_metrics(individual) -> None:
 def _record_individual_result(individual, evaluator_config, overrides_list, recorder):
     metrics = getattr(individual, "evaluation_metrics", {}) or {}
     suite_metrics = metrics.pop("suite_metrics", None)
-    config = individual_to_config(individual, optimizer_overrides, overrides_list, evaluator_config)
+    config = individual_to_config(
+        individual, optimizer_overrides, overrides_list, evaluator_config
+    )
     anchor_meta = config.get("_optimizer_anchor")
     entry = clean_config(strip_config_metadata(config))
+    # Prepared dataset membership is result provenance, not user configuration.
+    # Cleaning strips it, but single-run resume compares the exact membership.
+    if "coins" in config.get("backtest", {}):
+        entry["backtest"]["coins"] = deepcopy(config["backtest"]["coins"])
+    entry[CONTRACT_KEY] = recorded_evaluation_contract(evaluator_config)
     if anchor_meta is not None:
         entry["optimizer_anchor"] = anchor_meta
     entry = optimizer_overrides(overrides_list, entry, None)
@@ -715,14 +831,19 @@ def _record_individual_result(individual, evaluator_config, overrides_list, reco
 
 
 def _resume_config_mismatches(entry: dict, config: dict) -> list[str]:
-    old_bt = entry.get("backtest") or {}
-    new_bt = config.get("backtest") or {}
-    old_opt = entry.get("optimize") or {}
-    new_opt = config.get("optimize") or {}
+    old_bt = deepcopy(entry.get("backtest") or {})
+    new_bt = deepcopy(config.get("backtest") or {})
+    for section, path in ((old_bt, "resume.backtest"), (new_bt, "config.backtest")):
+        if any(alias in section for alias in REDUCER_ALIASES):
+            canonicalize_reducer_mapping(section, path=path)
+
+    # Released configurations without this setting used strict crossing at zero.
+    old_bt.setdefault("limit_order_fill_buffer_pct", 0.0)
+    new_bt.setdefault("limit_order_fill_buffer_pct", 0.0)
+    old_opt = _canonicalize_resume_optimize(entry.get("optimize") or {})
+    new_opt = _canonicalize_resume_optimize(config.get("optimize") or {})
     old_bot = entry.get("bot", entry) or {}
     new_bot = config.get("bot", config) or {}
-    old_live = entry.get("live") or {}
-    new_live = config.get("live") or {}
 
     mismatches = []
     is_suite_result = entry.get("suite_metrics") is not None
@@ -730,66 +851,75 @@ def _resume_config_mismatches(entry: dict, config: dict) -> list[str]:
         for key in ("organillo_mode", "organillo_carton_hash"):
             if old_bt.get(key) != new_bt.get(key):
                 mismatches.append(f"backtest.{key}")
-    old_bt_compare = _resume_subset(
-        old_bt,
-        {
-            "aggregate",
-            "balance_sample_divider",
-            "btc_collateral_cap",
-            "btc_collateral_ltv_cap",
-            "candle_interval_minutes",
-            "coins",
-            "dynamic_wel_by_tradability",
-            "end_date",
-            "exchanges",
-            "filter_by_min_effective_cost",
-            "liquidation_threshold",
-            "maker_fee_override",
-            "market_order_slippage_pct",
-            "scenarios",
-            "start_date",
-            "starting_balance",
-            "suite_enabled",
-            "taker_fee_override",
-            "volume_normalization",
-        },
-    )
-    new_bt_compare = _resume_subset(new_bt, old_bt_compare.keys())
+    backtest_keys = {
+        "reducer",
+        "balance_sample_divider",
+        "btc_collateral_cap",
+        "btc_collateral_ltv_cap",
+        "candle_interval_minutes",
+        "coins",
+        "coin_sources",
+        "dynamic_wel_by_tradability",
+        "end_date",
+        "exchanges",
+        "filter_by_min_effective_cost",
+        "gap_tolerance_ohlcvs_minutes",
+        "hlcvs_data_override_mode",
+        "liquidation_threshold",
+        "maker_fee_override",
+        "market_order_slippage_pct",
+        "limit_order_fill_buffer_pct",
+        "market_settings",
+        "market_settings_sources",
+        "ohlcv_source_dir",
+        "hlcvs_data_dir",
+        "scenarios",
+        "start_date",
+        "starting_balance",
+        "suite_enabled",
+        "taker_fee_override",
+        "volume_normalization",
+    }
+    old_bt_compare = _resume_subset(old_bt, backtest_keys)
+    new_bt_compare = _resume_subset(new_bt, backtest_keys)
     if is_suite_result:
         # Suite result entries omit top-level backtest.coins because the
         # scenario list is the source of truth for per-scenario coins.
         if old_bt_compare.get("coins") is None:
             new_bt_compare.pop("coins", None)
-    _append_resume_section_mismatches(mismatches, "backtest", old_bt_compare, new_bt_compare)
-
-    old_opt_compare = _resume_subset(
-        old_opt,
-        {
-            "backend",
-            "bounds",
-            "compress_results_file",
-            "crossover_eta",
-            "crossover_probability",
-            "enable_overrides",
-            "fixed_params",
-            "fixed_runtime_overrides",
-            "limits",
-            "mutation_eta",
-            "mutation_indpb",
-            "mutation_probability",
-            "offspring_multiplier",
-            "objective_scenario",
-            "population_size",
-            "pymoo",
-            "round_to_n_significant_digits",
-            "scoring",
-        },
+    _append_resume_section_mismatches(
+        mismatches, "backtest", old_bt_compare, new_bt_compare
     )
+
+    optimize_keys = {
+        "backend",
+        "bounds",
+        "compress_results_file",
+        "crossover_eta",
+        "crossover_probability",
+        "enable_overrides",
+        "fixed_params",
+        "fixed_runtime_overrides",
+        "limits",
+        "mutation_eta",
+        "mutation_indpb",
+        "mutation_probability",
+        "offspring_multiplier",
+        "objective_scenario",
+        "population_size",
+        "gpu",
+        "pymoo",
+        "round_to_n_significant_digits",
+        "scoring",
+    }
+    old_opt_compare = _resume_subset(old_opt, optimize_keys)
     # Objective source changes invalidate checkpoint fitness, including resumes
     # from artifacts written before objective_scenario existed.
     old_opt_compare.setdefault("objective_scenario", None)
-    new_opt_compare = _resume_subset(new_opt, old_opt_compare.keys())
-    _append_resume_section_mismatches(mismatches, "optimize", old_opt_compare, new_opt_compare)
+    new_opt_compare = _resume_subset(new_opt, optimize_keys)
+    _append_resume_section_mismatches(
+        mismatches, "optimize", old_opt_compare, new_opt_compare
+    )
 
     for side in ["long", "short"]:
         old_en = old_bot.get(side, {}).get("enabled", True)
@@ -797,10 +927,60 @@ def _resume_config_mismatches(entry: dict, config: dict) -> list[str]:
         if old_en != new_en:
             mismatches.append(f"  - {side}.enabled: '{old_en}' -> '{new_en}'")
 
-    for key in ["approved_coins", "ignored_coins"]:
-        if old_live.get(key) != new_live.get(key):
-            mismatches.append(f"  - live.{key}: changed")
+    stored_contract = entry.get(CONTRACT_KEY)
+    if stored_contract is not None and (
+        not isinstance(stored_contract, dict)
+        or stored_contract.get("version") != CONTRACT_VERSION
+    ):
+        mismatches.append(
+            "  - optimizer_evaluation_contract: unsupported or malformed snapshot"
+        )
+        return mismatches
+    if stored_contract is None and has_unresolved_override_files(entry):
+        mismatches.append(
+            "  - optimizer_evaluation_contract: legacy results reference unresolved coin "
+            "override files and lack historical policy evidence; start a fresh run"
+        )
+        return mismatches
+    if stored_contract is None or not stored_contract.get("implementation"):
+        mismatches.append(
+            "  - optimizer_evaluation_contract: historical evaluator implementation "
+            "cannot be proven; start a fresh run to record its identity"
+        )
+    if stored_contract is None and (
+        entry.get("optimizer_anchor") is not None or get_anchor_plan(config)
+    ):
+        mismatches.append(
+            "  - optimizer_evaluation_contract: legacy anchored results lack fixed-anchor "
+            "policy evidence; start a fresh run to record a verifiable evaluation contract"
+        )
+    if stored_contract is not None:
+        new_contract = config.get(CONTRACT_CACHE_KEY) or build_evaluation_contract(
+            config
+        )
+        _append_resume_section_mismatches(
+            mismatches, "evaluation", stored_contract, new_contract
+        )
+
     return mismatches
+
+
+def _canonicalize_resume_optimize(section: dict) -> dict:
+    normalized = deepcopy(section)
+    if normalized.get("backend") == "gpu" and isinstance(normalized.get("gpu"), dict):
+        from optimization.backends.gpu_backend import GPU_DEFAULTS
+
+        # These additive options preserve the legacy gates when omitted. Do not
+        # normalize other policy differences or erase explicit non-default values.
+        for key in ("drift_rank_halt", "drift_objective_tolerance"):
+            normalized["gpu"].setdefault(key, GPU_DEFAULTS[key])
+    if "scoring" in normalized:
+        normalized["scoring"] = [
+            spec.to_config() for spec in extract_objective_specs(normalized["scoring"])
+        ]
+    if "limits" in normalized:
+        normalized["limits"] = normalize_limit_entries(normalized["limits"])
+    return normalized
 
 
 def _resume_subset(section: dict, keys) -> dict:
@@ -815,7 +995,9 @@ def _append_resume_section_mismatches(
         old_value = old_section.get(key)
         new_value = new_section.get(key)
         if old_value != new_value:
-            mismatches.append(f"  - {section_name}.{key}: '{old_value}' -> '{new_value}'")
+            mismatches.append(
+                f"  - {section_name}.{key}: '{old_value}' -> '{new_value}'"
+            )
 
 
 def _resolve_resume_results_dir(resume_path: str) -> str:
@@ -835,18 +1017,114 @@ def _require_resume_checkpoint(results_dir: str) -> str:
         with open(checkpoint_path, "rb") as f:
             f.read(1)
     except OSError as exc:
-        raise ValueError(f"Cannot resume: checkpoint is not readable: {checkpoint_path}") from exc
+        raise ValueError(
+            f"Cannot resume: checkpoint is not readable: {checkpoint_path}"
+        ) from exc
     return checkpoint_path
 
 
-def _validate_resume_results(results_dir: str, config: dict) -> int:
+def _restore_gpu_resume_anchor_plan(config: dict, checkpoint_path: str) -> bool:
+    """Restore checkpoint-owned fine-tune anchors before building optimizer shape."""
+
+    if config.get("optimize", {}).get("backend") != "gpu":
+        return False
+    try:
+        import pickle
+
+        with open(checkpoint_path, "rb") as file:
+            checkpoint = pickle.load(file)
+    except Exception as exc:
+        raise ValueError(
+            f"Cannot resume: failed to read checkpoint: {checkpoint_path}"
+        ) from exc
+    anchor_plan = checkpoint.get("anchor_plan")
+    if anchor_plan is None:
+        return False
+    if not isinstance(anchor_plan, dict) or not anchor_plan.get("anchors"):
+        raise ValueError("Cannot resume: GPU checkpoint has an invalid anchor plan")
+    checkpoint_strategy = normalize_strategy_kind(anchor_plan.get("strategy_kind"))
+    config_strategy = normalize_strategy_kind(
+        config.get("live", {}).get("strategy_kind")
+    )
+    if checkpoint_strategy != config_strategy:
+        raise ValueError(
+            "Cannot resume: GPU checkpoint anchor strategy does not match config"
+        )
+    config[ANCHOR_PLAN_KEY] = deepcopy(anchor_plan)
+    logging.info(
+        "Restored %d checkpoint-owned fine-tune anchors",
+        len(anchor_plan["anchors"]),
+    )
+    return True
+
+
+def _should_apply_fine_tune_bounds(
+    *, restored_resume_anchor_plan: bool, installing_anchor_plan: bool
+) -> bool:
+    """Keep a checkpoint-owned optimizer shape stable across GPU resume."""
+
+    return not restored_resume_anchor_plan and not installing_anchor_plan
+
+
+def _gpu_checkpoint_allows_empty_results(
+    checkpoint_path: str | None,
+    config: dict,
+) -> bool:
+    """Permit the durable pre-result checkpoint of a GPU seed bootstrap."""
+
+    if config.get("optimize", {}).get("backend") != "gpu" or checkpoint_path is None:
+        return False
+    try:
+        import pickle
+
+        with open(checkpoint_path, "rb") as file:
+            checkpoint = pickle.load(file)
+    except Exception:
+        return False
+    plan = checkpoint.get("seed_bootstrap_plan")
+    allowed = bool(
+        not checkpoint.get("seed_bootstrap_complete", True)
+        and int(checkpoint.get("seed_exact_done", -1)) == 0
+        and int(checkpoint.get("exact_done", -1)) == 0
+        and isinstance(checkpoint.get("seed_bootstrap_contract"), dict)
+        and isinstance(plan, dict)
+        and plan.get("starting_vectors")
+        and plan.get("effective_mode") in {"exact", "screened"}
+    )
+
+    if allowed and checkpoint.get(CONTRACT_KEY) != build_evaluation_contract(config):
+        raise ValueError(
+            "GPU checkpoint historical evaluation contract cannot be proven or changed; "
+            "start a fresh run"
+        )
+    return allowed
+
+
+def _validate_resume_results(
+    results_dir: str,
+    config: dict,
+    *,
+    checkpoint_path: str | None = None,
+    resume_state: dict | None = None,
+) -> int:
     results_filename = os.path.join(results_dir, "all_results.bin")
     if not os.path.isfile(results_filename):
-        raise ValueError(f"Cannot resume: all_results.bin not found: {results_filename}")
+        raise ValueError(
+            f"Cannot resume: all_results.bin not found: {results_filename}"
+        )
     if os.path.getsize(results_filename) <= 0:
+        if _gpu_checkpoint_allows_empty_results(checkpoint_path, config):
+            if resume_state is not None:
+                resume_state["previous_data"] = None
+            logging.info(
+                "Resuming GPU seed bootstrap before its first durable exact result"
+            )
+            return 0
         raise ValueError(f"Cannot resume: all_results.bin is empty: {results_filename}")
 
+    config = {**config, CONTRACT_CACHE_KEY: build_evaluation_contract(config)}
     previous_evals = 0
+    previous_data = {}
     try:
         with open(results_filename, "rb") as f:
             for entry in _iter_strict_msgpack_objects(
@@ -863,26 +1141,36 @@ def _validate_resume_results(results_dir: str, config: dict) -> int:
                         f"Cannot resume: all_results.bin entry {previous_evals} is not a result object: "
                         f"{results_filename}"
                     )
-                if previous_evals == 1:
-                    mismatches = _resume_config_mismatches(entry, config)
-                    if mismatches:
-                        mismatch_str = "\n".join(mismatches)
-                        raise ValueError(
-                            f"\n\nERROR: Cannot resume because critical parameters have changed!\n"
-                            f"Mismatches detected:\n{mismatch_str}\n\n"
-                            f"Resuming with a changed configuration would corrupt optimization scores.\n"
-                            f"Please restore the original config or start a fresh run.\n"
-                        )
+                previous_data = deep_updated(previous_data, entry)
+                mismatches = _resume_config_mismatches(previous_data, config)
+                if mismatches:
+                    mismatch_str = "\n".join(mismatches)
+                    raise ValueError(
+                        f"\n\nERROR: Cannot resume because critical parameters have changed!\n"
+                        f"Mismatches detected at result {previous_evals}:\n{mismatch_str}\n\n"
+                        f"Resuming with a changed configuration would corrupt optimization scores.\n"
+                        f"Please restore the original config or start a fresh run.\n"
+                    )
     except msgpack.exceptions.UnpackException as exc:
-        raise ValueError(f"Cannot resume: failed to read all_results.bin: {results_filename}") from exc
+        raise ValueError(
+            f"Cannot resume: failed to read all_results.bin: {results_filename}"
+        ) from exc
     except ValueError:
         raise
     except Exception as exc:
-        raise ValueError(f"Cannot resume: failed to read all_results.bin: {results_filename}") from exc
+        raise ValueError(
+            f"Cannot resume: failed to read all_results.bin: {results_filename}"
+        ) from exc
 
     if previous_evals <= 0:
-        raise ValueError(f"Cannot resume: all_results.bin contains no entries: {results_filename}")
-    logging.info("Resuming with %d previous evaluations from all_results.bin", previous_evals)
+        raise ValueError(
+            f"Cannot resume: all_results.bin contains no entries: {results_filename}"
+        )
+    if resume_state is not None:
+        resume_state["previous_data"] = previous_data
+    logging.info(
+        "Resuming with %d previous evaluations from all_results.bin", previous_evals
+    )
     return previous_evals
 
 
@@ -903,7 +1191,9 @@ def _iter_strict_msgpack_objects(file_obj, filename: str, file_size: int):
                 f"Cannot resume: all_results.bin contains invalid msgpack marker: {filename}"
             ) from exc
         except Exception as exc:
-            raise ValueError(f"Cannot resume: failed to decode all_results.bin: {filename}") from exc
+            raise ValueError(
+                f"Cannot resume: failed to decode all_results.bin: {filename}"
+            ) from exc
         last_successful_offset = unpacker.tell()
         yield entry
 
@@ -931,6 +1221,7 @@ def ea_mu_plus_lambda_stream(
     max_pending_evals=None,
 ):
     import pickle
+
     if logbook is None:
         logbook = tools.Logbook()
         logbook.header = "gen", "evals", "min", "max"
@@ -980,7 +1271,9 @@ def ea_mu_plus_lambda_stream(
                 if bool(metrics.get("liquidated")):
                     liquidation_total += 1
                 _set_candidate_metrics(ind, metrics)
-                _record_individual_result(ind, evaluator_config, overrides_list, recorder)
+                _record_individual_result(
+                    ind, evaluator_config, overrides_list, recorder
+                )
             else:
                 _clear_candidate_metrics(ind)
             completed["count"] += 1
@@ -992,13 +1285,19 @@ def ea_mu_plus_lambda_stream(
                 logging.info("Terminating worker pool immediately due to interrupt...")
                 pool.terminate()
                 pool_state["terminated"] = True
+
         stream_async_results(
             enumerate(individuals),
-            submit=lambda item: (pool.apply_async(toolbox.evaluate, (item[1],)), item[0]),
+            submit=lambda item: (
+                pool.apply_async(toolbox.evaluate, (item[1],)),
+                item[0],
+            ),
             poll_interval_seconds=0.1,
             on_result=_on_result,
             on_interrupt=_on_interrupt,
             max_pending=max_pending_evals,
+            progress_label="Optimizer population",
+            progress_total=len(individuals),
         )
 
         total_evals += completed["count"]
@@ -1050,11 +1349,15 @@ def ea_mu_plus_lambda_stream(
         dup_prev_reused = dup_reuse
         liquidation_prev_total = liquidation_total
         if verbose and record:
-            logging.debug("Logbook: %s", " ".join(f"{k}={v}" for k, v in record.items()))
+            logging.debug(
+                "Logbook: %s", " ".join(f"{k}={v}" for k, v in record.items())
+            )
 
     invalid_ind = [ind for ind in population if not ind.fitness.valid]
     if invalid_ind:
-        logging.info("Evaluating initial population (%d candidates)...", len(invalid_ind))
+        logging.info(
+            "Evaluating initial population (%d candidates)...", len(invalid_ind)
+        )
     nevals = evaluate_and_record(invalid_ind)
 
     if halloffame is not None:
@@ -1100,7 +1403,9 @@ def ea_mu_plus_lambda_stream(
                     pickle.dump(chk, f, protocol=pickle.HIGHEST_PROTOCOL)
                 os.replace(tmp_path, checkpoint_path)
             except Exception as exc:
-                raise RuntimeError(f"Failed to save checkpoint: {checkpoint_path}") from exc
+                raise RuntimeError(
+                    f"Failed to save checkpoint: {checkpoint_path}"
+                ) from exc
 
     logging.info(
         "Optimization summary | generations=%d | total_evals=%d | front=%d | duration=%.1fs",
@@ -1128,15 +1433,25 @@ def _format_bound_for_log(bound: Bound) -> str:
 def _clamp_seed_value(value, bound: Bound, sig_digits: int | None):
     if bound.is_stepped:
         return bound.quantize(float(value))
-    rounded = float(value) if sig_digits is None else round_to_sig_digits(float(value), sig_digits)
-    return bound.high if rounded > bound.high else bound.low if rounded < bound.low else rounded
+    rounded = (
+        float(value)
+        if sig_digits is None
+        else round_to_sig_digits(float(value), sig_digits)
+    )
+    return (
+        bound.high
+        if rounded > bound.high
+        else bound.low if rounded < bound.low else rounded
+    )
 
 
 def _format_clamp_samples(counter: Counter, *, limit: int = 3) -> str:
     parts = []
     for value, count in counter.most_common(limit):
         parts.append(f"{value} ({count}x)" if count > 1 else str(value))
-    remaining = sum(counter.values()) - sum(count for _value, count in counter.most_common(limit))
+    remaining = sum(counter.values()) - sum(
+        count for _value, count in counter.most_common(limit)
+    )
     if remaining > 0:
         parts.append(f"+{remaining} more")
     return ", ".join(parts)
@@ -1194,16 +1509,29 @@ def _record_seed_bounds_adjustment(
 def _flush_seed_bounds_adjustments(collector: dict | None) -> None:
     if not collector:
         return
+    contexts = sorted({key[0] for key in collector})
+    for context in contexts:
+        buckets = [(key, bucket) for key, bucket in sorted(collector.items()) if key[0] == context]
+        keys = list(dict.fromkeys(key[1] for key, _ in buckets))
+        samples = ",".join(key[:32] for key in keys[:3])
+        if len(keys) > 3:
+            samples += f",+{len(keys) - 3} more"
+        logging.warning(
+            "optimizer %s clamped to bounds | adjustments=%d keys=%d samples=%s | details at DEBUG",
+            context, sum(bucket["count"] for _, bucket in buckets), len(keys), samples,
+        )
     for (context, bound_key, path_repr, bounds_repr, adjusted), bucket in sorted(collector.items()):
         count = int(bucket["count"])
         source_examples = ", ".join(bucket["sources"])
         source_count = len(bucket["source_set"])
         if source_count > len(bucket["sources"]):
-            source_examples = f"{source_examples}, +{source_count - len(bucket['sources'])} more"
+            source_examples = (
+                f"{source_examples}, +{source_count - len(bucket['sources'])} more"
+            )
         values = _format_clamp_samples(bucket["values"])
         plural = "values" if count != 1 else "value"
         source_label = "sources" if source_count != 1 else "source"
-        logging.warning(
+        logging.debug(
             "optimizer %s %s clamped to optimize bounds | count=%d | key=%s | path=%s | "
             "values=%s | bounds=%s | clamped=%s | %s=%s",
             context,
@@ -1219,7 +1547,9 @@ def _flush_seed_bounds_adjustments(collector: dict | None) -> None:
         )
 
 
-def individual_to_config(individual, optimizer_overrides, overrides_list, template, key_paths=None):
+def individual_to_config(
+    individual, optimizer_overrides, overrides_list, template, key_paths=None
+):
     """
     assume individual is already bound enforced (or will be after)
     """
@@ -1259,11 +1589,19 @@ def config_to_individual(
             target = target[part]
         values.append(target)
     enforced = enforce_bounds(
-        values,
+        [
+            # An unbounded fixed ceiling projects to the highest allowed search
+            # ceiling when importing a seed into a finite optimizer dimension.
+            bound.high
+            if value is None and tuple(path[-2:]) == ("entry_cooldown", "max_duration_minutes")
+            else value
+            for value, bound, (_, path) in zip(values, bounds, key_paths, strict=True)
+        ],
         bounds,
         sig_digits,
     )
     if clamp_context:
+        adjustments = clamp_collector if clamp_collector is not None else {}
         for original, adjusted, bound, key_path in zip(values, enforced, bounds, key_paths):
             bound_key, path = key_path
             if path == (ANCHOR_GENE_KEY,) or path == [ANCHOR_GENE_KEY]:
@@ -1276,19 +1614,23 @@ def config_to_individual(
                 adjusted=adjusted,
                 bound=bound,
                 context=clamp_context,
-                collector=clamp_collector,
+                collector=adjustments,
             )
+        if clamp_collector is None:
+            _flush_seed_bounds_adjustments(adjustments)
     return enforced
 
 
 def _optimizer_anchor_id(config: dict) -> int | None:
     anchor_meta = config.get("_optimizer_anchor")
     if not isinstance(anchor_meta, dict):
+        anchor_meta = config.get("optimizer_anchor")
+    if not isinstance(anchor_meta, dict):
         return None
-    try:
-        return int(anchor_meta["id"])
-    except (KeyError, TypeError, ValueError):
+    anchor_id = anchor_meta.get("id")
+    if isinstance(anchor_id, bool) or not isinstance(anchor_id, int):
         return None
+    return anchor_id
 
 
 def _canonicalize_optimizer_individual(
@@ -1368,7 +1710,9 @@ class Evaluator:
                 )
                 btc_spec = self.btc_usd_specs.get(exchange)
                 if btc_spec is not None:
-                    self.shared_btc_np[exchange] = self.shared_array_manager.view(btc_spec)
+                    self.shared_btc_np[exchange] = self.shared_array_manager.view(
+                        btc_spec
+                    )
 
         self.historical_selections = {} if historical_selections is None else historical_selections
         if historical_selections is None and config["backtest"].get("organillo_mode", False):
@@ -1383,7 +1727,9 @@ class Evaluator:
         logging.debug("Evaluator initialization complete.")
         logging.info("Evaluator ready | exchanges=%d", len(self.exchanges))
         self.seen_hashes = seen_hashes if seen_hashes is not None else {}
-        self.duplicate_counter = duplicate_counter if duplicate_counter is not None else {"count": 0}
+        self.duplicate_counter = (
+            duplicate_counter if duplicate_counter is not None else {"count": 0}
+        )
         self.optimization_shape = build_optimization_shape(self.config)
         self.bounds = list(self.optimization_shape.bounds)
         self.key_paths = list(self.optimization_shape.key_paths)
@@ -1515,6 +1861,16 @@ class Evaluator:
             self.key_paths,
             overrides_list,
         )
+        from config.hsl import validate_optimizer_metrics
+
+        validate_optimizer_metrics(
+            config,
+            [
+                *(spec.metric for spec in self.scoring_specs),
+                *(check["metric"] for check in self.limit_checks),
+            ],
+            markets_by_exchange=self.msss,
+        )
         individual_hash = calc_hash(individual)
         if self.use_duplicate_guard:
             if individual_hash in self.seen_hashes:
@@ -1593,10 +1949,12 @@ class Evaluator:
                     exchange,
                     error,
                 )
-                objectives, total_penalty, metrics_payload = _build_invalid_candidate_metrics(
-                    self.config["optimize"]["scoring"],
-                    error,
-                    include_stats=True,
+                objectives, total_penalty, metrics_payload = (
+                    _build_invalid_candidate_metrics(
+                        self.config["optimize"]["scoring"],
+                        error,
+                        include_stats=True,
+                    )
                 )
                 _set_candidate_metrics(individual, metrics_payload)
                 actual_hash = calc_hash(individual)
@@ -1627,10 +1985,12 @@ class Evaluator:
                 individual_hash[:12],
                 error,
             )
-            objectives, total_penalty, metrics_payload = _build_invalid_candidate_metrics(
-                self.config["optimize"]["scoring"],
-                error,
-                include_stats=True,
+            objectives, total_penalty, metrics_payload = (
+                _build_invalid_candidate_metrics(
+                    self.config["optimize"]["scoring"],
+                    error,
+                    include_stats=True,
+                )
             )
             metrics_payload["liquidated"] = liquidated
             _set_candidate_metrics(individual, metrics_payload)
@@ -1644,8 +2004,12 @@ class Evaluator:
                 individual,
             )
         metrics_payload = {
-            "stats": aggregate_stats,
+            **scenario_metrics,
             "objectives": raw_objectives,
+            "unpenalized_objectives": tuple(
+                to_engine_value(spec, raw_objectives[spec.metric])
+                for spec in self.scoring_specs
+            ),
             "constraint_violation": total_penalty,
             "liquidated": liquidated,
         }
@@ -1653,16 +2017,18 @@ class Evaluator:
         actual_hash = calc_hash(individual)
         if self.use_duplicate_guard:
             self.seen_hashes[actual_hash] = (tuple(objectives), total_penalty)
-        return build_evaluation_payload(objectives, total_penalty, metrics_payload, individual)
+        return build_evaluation_payload(
+            objectives, total_penalty, metrics_payload, individual
+        )
 
-    def build_limit_checks(self, aggregate_cfg: Dict[str, Any] | None = None):
+    def build_limit_checks(self, reducer_cfg: Dict[str, Any] | None = None):
         limits = self.config["optimize"].get("limits", [])
         self.limit_checks = expand_limit_checks(
             limits,
             self.scoring_weights,
             penalty_weight=1e6,
             objective_index_map=objective_index_map(self.scoring_specs),
-            aggregate_cfg=aggregate_cfg,
+            reducer_cfg=reducer_cfg,
         )
 
     def calc_fitness(
@@ -1675,7 +2041,9 @@ class Evaluator:
         return_raw_objectives: bool = False,
     ):
         limit_metrics = analyses_combined if limit_metrics is None else limit_metrics
-        if objective_values is not None and len(objective_values) != len(self.scoring_specs):
+        if objective_values is not None and len(objective_values) != len(
+            self.scoring_specs
+        ):
             raise ValueError(
                 "optimizer objective value count does not match optimize.scoring: "
                 f"{len(objective_values)} != {len(self.scoring_specs)}"
@@ -1703,7 +2071,7 @@ class Evaluator:
                 basis = (
                     f"scenario {scenario!r}"
                     if scenario is not None
-                    else f"suite stat {check['stat']!r}"
+                    else f"suite reducer {check['reducer']!r}"
                 )
                 raise ValueError(
                     "missing optimizer limit metric "
@@ -1783,11 +2151,11 @@ class SuiteEvaluator:
         self,
         base_evaluator: Evaluator,
         scenario_contexts: List[ScenarioEvalContext],
-        aggregate_cfg: Dict[str, Any],
+        reducer_cfg: Dict[str, Any],
     ) -> None:
         self.base = base_evaluator
         self.contexts = scenario_contexts
-        self.aggregate_cfg = aggregate_cfg
+        self.reducer_cfg = reducer_cfg
         objective_scenario = self.base.config["optimize"].get("objective_scenario")
         self.objective_scenario = (
             str(objective_scenario).strip() if objective_scenario is not None else None
@@ -1799,7 +2167,7 @@ class SuiteEvaluator:
             resolve_objective_basis(
                 spec,
                 default_scenario=self.objective_scenario,
-                aggregate_cfg=self.aggregate_cfg,
+                reducer_cfg=self.reducer_cfg,
             )
             for spec in self.base.scoring_specs
         ]
@@ -1810,7 +2178,7 @@ class SuiteEvaluator:
                     f"{basis.scenario!r}, which is not present in backtest.scenarios; "
                     f"available labels: {', '.join(labels)}"
                 )
-        self.base.build_limit_checks(self.aggregate_cfg)
+        self.base.build_limit_checks(self.reducer_cfg)
         for check in self.base.limit_checks:
             scenario = check.get("scenario")
             if scenario is not None and scenario not in labels:
@@ -1823,7 +2191,9 @@ class SuiteEvaluator:
         self._master_attachments: Dict[str, Dict[str, Any]] = {"hlcvs": {}, "btc": {}}
         self._master_arrays: Dict[str, Dict[str, np.ndarray]] = {"hlcvs": {}, "btc": {}}
 
-    def _ensure_master_attachment(self, spec, cache_key: str, array_type: str) -> np.ndarray:
+    def _ensure_master_attachment(
+        self, spec, cache_key: str, array_type: str
+    ) -> np.ndarray:
         """Attach to master SharedMemory if not already attached."""
         if cache_key not in self._master_arrays[array_type]:
             attachment = attach_shared_array(spec)
@@ -1842,10 +2212,14 @@ class SuiteEvaluator:
         Coin subsetting is passed through as active indices for Rust.
         """
         master_spec = ctx.master_hlcvs_specs[exchange]
-        master_array = self._ensure_master_attachment(master_spec, master_spec.name, "hlcvs")
+        master_array = self._ensure_master_attachment(
+            master_spec, master_spec.name, "hlcvs"
+        )
 
         time_slice = ctx.time_slice.get(exchange) if ctx.time_slice else None
-        coin_indices = ctx.coin_slice_indices.get(exchange) if ctx.coin_slice_indices else None
+        coin_indices = (
+            ctx.coin_slice_indices.get(exchange) if ctx.coin_slice_indices else None
+        )
 
         # Time slicing creates a VIEW (no copy, O(1) memory)
         if time_slice is not None:
@@ -1856,9 +2230,13 @@ class SuiteEvaluator:
 
         # BTC slice (time-only slicing creates a view)
         btc_view = None
-        master_btc_spec = ctx.master_btc_specs.get(exchange) if ctx.master_btc_specs else None
+        master_btc_spec = (
+            ctx.master_btc_specs.get(exchange) if ctx.master_btc_specs else None
+        )
         if master_btc_spec is not None:
-            master_btc = self._ensure_master_attachment(master_btc_spec, master_btc_spec.name, "btc")
+            master_btc = self._ensure_master_attachment(
+                master_btc_spec, master_btc_spec.name, "btc"
+            )
             if time_slice is not None:
                 start_idx, end_idx = time_slice
                 btc_view = master_btc[start_idx:end_idx]
@@ -1876,7 +2254,9 @@ class SuiteEvaluator:
             and ctx.master_hlcvs_specs[exchange] is not None
         )
 
-    def _ensure_context_attachment(self, ctx: ScenarioEvalContext, exchange: str) -> None:
+    def _ensure_context_attachment(
+        self, ctx: ScenarioEvalContext, exchange: str
+    ) -> None:
         """Attach to SharedMemory for non-lazy-slicing contexts only."""
         # Skip if using lazy slicing - slices are computed on-demand in evaluate()
         if self._uses_lazy_slicing(ctx, exchange):
@@ -1894,7 +2274,23 @@ class SuiteEvaluator:
                 ctx.attachments["btc"][exchange] = attachment
                 ctx.shared_btc_np[exchange] = attachment.array
 
-    def _build_scenario_candidate_config(self, config: Dict[str, Any], ctx: ScenarioEvalContext):
+    def get_prepared_context_data(
+        self, ctx: ScenarioEvalContext, exchange: str
+    ) -> tuple[np.ndarray, np.ndarray | None, list[int] | None]:
+        """Return the exact prepared arrays and active coin indices for a scenario."""
+
+        if self._uses_lazy_slicing(ctx, exchange):
+            return self._get_lazy_slice_data(ctx, exchange)
+        self._ensure_context_attachment(ctx, exchange)
+        return (
+            ctx.shared_hlcvs_np[exchange],
+            ctx.shared_btc_np.get(exchange),
+            ctx.coin_indices.get(exchange),
+        )
+
+    def build_scenario_candidate_config(
+        self, config: Dict[str, Any], ctx: ScenarioEvalContext
+    ):
         scenario_config = dict(config)
         scenario_backtest = ctx.config.get("backtest", {})
         backtest_cfg = dict(config.get("backtest", {}))
@@ -1917,13 +2313,127 @@ class SuiteEvaluator:
         if ctx.overrides:
             scenario_config = deepcopy(scenario_config)
             _apply_config_overrides(scenario_config, ctx.overrides)
+        from optimizer_overrides import (
+            apply_coupled_unstuck_ema_spans,
+            unstuck_ema_spans_coupled,
+        )
+
+        if unstuck_ema_spans_coupled(scenario_config):
+            scenario_config = apply_coupled_unstuck_ema_spans(deepcopy(scenario_config))
+        from config.hsl import validate_optimizer_metrics
+
+        validate_optimizer_metrics(
+            scenario_config,
+            [
+                *(
+                    spec.metric
+                    for spec, basis in zip(
+                        self.base.scoring_specs, self.objective_bases
+                    )
+                    if basis.scenario is None or basis.scenario == ctx.label
+                ),
+                *(
+                    check["metric"]
+                    for check in self.base.limit_checks
+                    if check.get("scenario") is None or check["scenario"] == ctx.label
+                ),
+            ],
+            markets_by_exchange=ctx.msss,
+        )
         return scenario_config
+
+    def _build_scenario_candidate_config(
+        self, config: Dict[str, Any], ctx: ScenarioEvalContext
+    ):
+        """Compatibility wrapper for callers predating the public suite helper."""
+
+        return self.build_scenario_candidate_config(config, ctx)
+
+    def score_scenario_results(
+        self, scenario_results: List[ScenarioResult]
+    ) -> Dict[str, Any]:
+        """Apply the canonical suite reducers, objectives, and limits to scenario stats."""
+
+        reduce_started = time.perf_counter()
+        reduced_summary = reduce_metrics(scenario_results, self.reducer_cfg)
+        reduce_metrics_ms = (time.perf_counter() - reduce_started) * 1000.0
+        fitness_started = time.perf_counter()
+        suite_payload = build_suite_metrics_payload(scenario_results, reduced_summary)
+        reduced_stats = reduced_summary.get("stats", {})
+
+        reduced_stats_flat = flatten_metric_stats(reduced_stats)
+        flat_stats = dict(reduced_stats_flat)
+        # Override _mean with correctly aggregated values so calc_fitness
+        # and limit defaults respect the reducer config (e.g. "max" instead of "mean").
+        aggregated_values = reduced_summary.get("aggregated", {})
+        for metric, agg_value in aggregated_values.items():
+            flat_stats[f"{metric}_mean"] = agg_value
+        required_scenario_labels = {
+            basis.scenario
+            for basis in self.objective_bases
+            if basis.scenario is not None
+        }
+        required_scenario_labels.update(
+            check["scenario"]
+            for check in self.base.limit_checks
+            if check.get("scenario") is not None
+        )
+        scenario_stats_by_label = {
+            result.scenario.label: flatten_metric_stats(result.metrics.get("stats", {}))
+            for result in scenario_results
+            if result.scenario.label in required_scenario_labels
+        }
+        objective_values: List[float] = []
+        for spec, basis in zip(self.base.scoring_specs, self.objective_bases):
+            if basis.scenario is not None:
+                source_stats = scenario_stats_by_label[basis.scenario]
+                reducer = "mean"
+            else:
+                source_stats = reduced_stats_flat
+                reducer = basis.reducer or "mean"
+            value = resolve_metric_value(source_stats, f"{spec.metric}_{reducer}")
+            if value is None and spec.metric.endswith(("_usd", "_btc")):
+                value = resolve_metric_value(
+                    source_stats,
+                    f"{spec.metric.rsplit('_', 1)[0]}_{reducer}",
+                )
+            if value is None:
+                basis_label = (
+                    f"scenario {basis.scenario!r}"
+                    if basis.scenario is not None
+                    else f"reducer {reducer!r}"
+                )
+                raise ValueError(
+                    "missing optimizer scoring metric "
+                    f"{spec.metric!r} for {basis_label}; "
+                    f"available metrics: {_format_available_metric_keys(source_stats)}"
+                )
+            objective_values.append(float(value))
+        objectives, total_penalty = self.base.calc_fitness(
+            flat_stats,
+            limit_metrics=flat_stats,
+            scenario_limit_metrics=scenario_stats_by_label,
+            objective_values=objective_values,
+        )
+        return {
+            "objectives": tuple(objectives),
+            "unpenalized_objectives": tuple(
+                to_engine_value(spec, value)
+                for spec, value in zip(self.base.scoring_specs, objective_values)
+            ),
+            "constraint_violation": float(total_penalty),
+            "suite_metrics": suite_payload,
+            "reduce_metrics_ms": reduce_metrics_ms,
+            "fitness_payload_ms": (time.perf_counter() - fitness_started) * 1000.0,
+        }
 
     def evaluate(self, individual, overrides_list):
         profile_enabled = _optimize_profile_enabled()
         timings: Dict[str, float] | None = {} if profile_enabled else None
         profile_total_start = _profile_start(profile_enabled)
-        individual[:] = enforce_bounds(individual, self.base.bounds, self.base.sig_digits)
+        individual[:] = enforce_bounds(
+            individual, self.base.bounds, self.base.sig_digits
+        )
         config = _canonicalize_optimizer_individual(
             individual,
             self.base.config,
@@ -1954,7 +2464,9 @@ class SuiteEvaluator:
                 ]
                 for perturb_fn in perturbation_funcs:
                     perturbed = perturb_fn(individual)
-                    perturbed = enforce_bounds(perturbed, self.base.bounds, self.base.sig_digits)
+                    perturbed = enforce_bounds(
+                        perturbed, self.base.bounds, self.base.sig_digits
+                    )
                     perturbed_config = _canonicalize_optimizer_individual(
                         perturbed,
                         self.base.config,
@@ -1989,7 +2501,7 @@ class SuiteEvaluator:
 
         for ctx in self.contexts:
             phase_start = _profile_start(profile_enabled)
-            scenario_config = self._build_scenario_candidate_config(config, ctx)
+            scenario_config = self.build_scenario_candidate_config(config, ctx)
             skip_btc_analysis = _optimizer_can_skip_btc_analysis(
                 scenario_config,
                 self.base.scoring_specs,
@@ -2017,16 +2529,9 @@ class SuiteEvaluator:
 
             analyses = {}
             for exchange in ctx.exchanges:
-                # Get data arrays - either from lazy slicing or cached SharedMemory
-                if self._uses_lazy_slicing(ctx, exchange):
-                    # Get time-sliced VIEW (O(1) memory) + coin indices
-                    # Coin subsetting is passed to Rust as active indices.
-                    hlcvs_data, btc_data, coin_indices = self._get_lazy_slice_data(ctx, exchange)
-                else:
-                    self._ensure_context_attachment(ctx, exchange)
-                    hlcvs_data = ctx.shared_hlcvs_np[exchange]
-                    btc_data = ctx.shared_btc_np.get(exchange)
-                    coin_indices = ctx.coin_indices.get(exchange)
+                hlcvs_data, btc_data, coin_indices = self.get_prepared_context_data(
+                    ctx, exchange
+                )
 
                 phase_start = _profile_start(profile_enabled)
                 payload = build_backtest_payload(
@@ -2046,7 +2551,9 @@ class SuiteEvaluator:
                 _profile_add(timings, "payload_build_ms", phase_start)
                 try:
                     phase_start = _profile_start(profile_enabled)
-                    fills, equities_array, analysis = execute_backtest(payload, scenario_config)
+                    fills, equities_array, analysis = execute_backtest(
+                        payload, scenario_config
+                    )
                     _profile_add(timings, "rust_backtest_ms", phase_start)
                     if timings is not None and isinstance(
                         getattr(payload, "rust_profile", None), dict
@@ -2068,15 +2575,20 @@ class SuiteEvaluator:
                         exchange,
                         error,
                     )
-                    objectives, total_penalty, metrics_payload = _build_invalid_candidate_metrics(
-                        self.base.config["optimize"]["scoring"],
-                        error,
-                        include_stats=False,
-                        include_suite_metrics=True,
+                    objectives, total_penalty, metrics_payload = (
+                        _build_invalid_candidate_metrics(
+                            self.base.config["optimize"]["scoring"],
+                            error,
+                            include_stats=False,
+                            include_suite_metrics=True,
+                        )
                     )
                     _set_candidate_metrics(individual, metrics_payload)
                     actual_hash = calc_hash(individual)
-                    self.base.seen_hashes[actual_hash] = (tuple(objectives), total_penalty)
+                    self.base.seen_hashes[actual_hash] = (
+                        tuple(objectives),
+                        total_penalty,
+                    )
                     return build_evaluation_payload(
                         objectives,
                         total_penalty,
@@ -2103,11 +2615,13 @@ class SuiteEvaluator:
                     ctx.label,
                     error,
                 )
-                objectives, total_penalty, metrics_payload = _build_invalid_candidate_metrics(
-                    self.base.config["optimize"]["scoring"],
-                    error,
-                    include_stats=False,
-                    include_suite_metrics=True,
+                objectives, total_penalty, metrics_payload = (
+                    _build_invalid_candidate_metrics(
+                        self.base.config["optimize"]["scoring"],
+                        error,
+                        include_stats=False,
+                        include_suite_metrics=True,
+                    )
                 )
                 metrics_payload["liquidated"] = liquidated
                 _set_candidate_metrics(individual, metrics_payload)
@@ -2145,76 +2659,24 @@ class SuiteEvaluator:
                         ignored_coins=None,
                     ),
                     per_exchange={},
-                    metrics={"stats": combined_metrics.get("stats", {})},
+                    metrics=combined_metrics,
                     elapsed_seconds=0.0,
                     output_path=None,
                 )
             )
 
-        phase_start = _profile_start(profile_enabled)
-        aggregate_summary = aggregate_metrics(scenario_results, self.aggregate_cfg)
-        _profile_add(timings, "aggregate_metrics_ms", phase_start)
-        phase_start = _profile_start(profile_enabled)
-        suite_payload = build_suite_metrics_payload(scenario_results, aggregate_summary)
-        aggregate_stats = aggregate_summary.get("stats", {})
-
-        aggregate_stats_flat = flatten_metric_stats(aggregate_stats)
-        flat_stats = dict(aggregate_stats_flat)
-        # Override _mean with correctly aggregated values so calc_fitness
-        # and limit defaults respect the aggregate config (e.g. "max" instead of "mean").
-        aggregated_values = aggregate_summary.get("aggregated", {})
-        for metric, agg_value in aggregated_values.items():
-            flat_stats[f"{metric}_mean"] = agg_value
-        required_scenario_labels = {
-            basis.scenario for basis in self.objective_bases if basis.scenario is not None
-        }
-        required_scenario_labels.update(
-            check["scenario"]
-            for check in self.base.limit_checks
-            if check.get("scenario") is not None
-        )
-        scenario_stats_by_label = {
-            result.scenario.label: flatten_metric_stats(result.metrics.get("stats", {}))
-            for result in scenario_results
-            if result.scenario.label in required_scenario_labels
-        }
-        objective_values: List[float] = []
-        for spec, basis in zip(self.base.scoring_specs, self.objective_bases):
-            if basis.scenario is not None:
-                source_stats = scenario_stats_by_label[basis.scenario]
-                stat = "mean"
-            else:
-                source_stats = aggregate_stats_flat
-                stat = basis.aggregate or "mean"
-            value = resolve_metric_value(source_stats, f"{spec.metric}_{stat}")
-            if value is None and spec.metric.endswith(("_usd", "_btc")):
-                value = resolve_metric_value(
-                    source_stats,
-                    f"{spec.metric.rsplit('_', 1)[0]}_{stat}",
-                )
-            if value is None:
-                basis_label = (
-                    f"scenario {basis.scenario!r}"
-                    if basis.scenario is not None
-                    else f"aggregate {stat!r}"
-                )
-                raise ValueError(
-                    "missing optimizer scoring metric "
-                    f"{spec.metric!r} for {basis_label}; "
-                    f"available metrics: {_format_available_metric_keys(source_stats)}"
-                )
-            objective_values.append(float(value))
-        objectives, total_penalty = self.base.calc_fitness(
-            flat_stats,
-            limit_metrics=flat_stats,
-            scenario_limit_metrics=scenario_stats_by_label,
-            objective_values=objective_values,
-        )
+        suite_fitness = self.score_scenario_results(scenario_results)
+        objectives = suite_fitness["objectives"]
+        total_penalty = suite_fitness["constraint_violation"]
+        suite_payload = suite_fitness["suite_metrics"]
+        if timings is not None:
+            timings["reduce_metrics_ms"] = suite_fitness["reduce_metrics_ms"]
+            timings["fitness_payload_ms"] = suite_fitness["fitness_payload_ms"]
         objectives_map = {f"w_{i}": val for i, val in enumerate(objectives)}
-        _profile_add(timings, "fitness_payload_ms", phase_start)
 
         metrics_payload = {
             "objectives": objectives_map,
+            "unpenalized_objectives": suite_fitness["unpenalized_objectives"],
             "suite_metrics": suite_payload,
             "constraint_violation": total_penalty,
             "liquidated": liquidated,
@@ -2224,11 +2686,12 @@ class SuiteEvaluator:
         if timings is not None:
             timings["total_ms"] = (time.perf_counter() - profile_total_start) * 1000.0
             profile_payload = {
-                key: round(value, 3)
-                for key, value in sorted(timings.items())
+                key: round(value, 3) for key, value in sorted(timings.items())
             }
             profile_payload["scenarios"] = len(self.contexts)
-            profile_payload["exchange_evals"] = sum(len(ctx.exchanges) for ctx in self.contexts)
+            profile_payload["exchange_evals"] = sum(
+                len(ctx.exchanges) for ctx in self.contexts
+            )
             metrics_payload["profile"] = profile_payload
             rust_detail = " ".join(
                 f"{key}={profile_payload[key]:.3f}"
@@ -2236,14 +2699,14 @@ class SuiteEvaluator:
                 if key.startswith("rust_") and key != "rust_backtest_ms"
             )
             logging.info(
-                "[opt-profile] suite_eval total_ms=%.3f scenario_config_ms=%.3f runtime_compile_ms=%.3f payload_build_ms=%.3f rust_backtest_ms=%.3f combine_metrics_ms=%.3f aggregate_metrics_ms=%.3f fitness_payload_ms=%.3f scenarios=%d exchange_evals=%d rust_detail=%s",
+                "[opt-profile] suite_eval total_ms=%.3f scenario_config_ms=%.3f runtime_compile_ms=%.3f payload_build_ms=%.3f rust_backtest_ms=%.3f combine_metrics_ms=%.3f reduce_metrics_ms=%.3f fitness_payload_ms=%.3f scenarios=%d exchange_evals=%d rust_detail=%s",
                 profile_payload.get("total_ms", 0.0),
                 profile_payload.get("scenario_config_ms", 0.0),
                 profile_payload.get("runtime_compile_ms", 0.0),
                 profile_payload.get("payload_build_ms", 0.0),
                 profile_payload.get("rust_backtest_ms", 0.0),
                 profile_payload.get("combine_metrics_ms", 0.0),
-                profile_payload.get("aggregate_metrics_ms", 0.0),
+                profile_payload.get("reduce_metrics_ms", 0.0),
                 profile_payload.get("fitness_payload_ms", 0.0),
                 profile_payload["scenarios"],
                 profile_payload["exchange_evals"],
@@ -2254,7 +2717,29 @@ class SuiteEvaluator:
         actual_hash = calc_hash(individual)
         if self.base.use_duplicate_guard:
             self.base.seen_hashes[actual_hash] = (tuple(objectives), total_penalty)
-        return build_evaluation_payload(objectives, total_penalty, metrics_payload, individual)
+        return build_evaluation_payload(
+            objectives, total_penalty, metrics_payload, individual
+        )
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["contexts"] = [
+            replace(
+                ctx,
+                shared_hlcvs_np={},
+                shared_btc_np={},
+                attachments={"hlcvs": {}, "btc": {}},
+            )
+            for ctx in self.contexts
+        ]
+        state["_master_attachments"] = {"hlcvs": {}, "btc": {}}
+        state["_master_arrays"] = {"hlcvs": {}, "btc": {}}
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._master_attachments = {"hlcvs": {}, "btc": {}}
+        self._master_arrays = {"hlcvs": {}, "btc": {}}
 
     def __del__(self):
         self.close()
@@ -2456,13 +2941,17 @@ def _step_supported_by_range(step: Any, low: float, high: float) -> bool:
         return False
 
 
-def apply_polish_bounds(config: dict, pct: float, *, bounds_mode: str = "clamp") -> None:
+def apply_polish_bounds(
+    config: dict, pct: float, *, bounds_mode: str = "clamp"
+) -> None:
     if (
         not isinstance(pct, (int, float))
         or not math.isfinite(float(pct))
         or float(pct) < 0.0
     ):
-        raise ValueError("polish bounds percentage must be a finite non-negative number")
+        raise ValueError(
+            "polish bounds percentage must be a finite non-negative number"
+        )
     if bounds_mode not in ("clamp", "override-tunable", "override-all"):
         raise ValueError(
             "polish bounds mode must be one of: clamp, override-tunable, override-all"
@@ -2531,16 +3020,22 @@ def _format_bound_path_for_log(path) -> str:
 
 
 def _format_bound_key_for_log(config: dict, bound_key: str, path=None) -> str:
-    resolved_path = path if path is not None else resolve_optimization_bound_path(config, bound_key)
+    resolved_path = (
+        path if path is not None else resolve_optimization_bound_path(config, bound_key)
+    )
     if resolved_path is None:
         return bound_key
     return _format_bound_path_for_log(resolved_path)
 
 
-def _resolve_bound_selectors_for_config(config: dict, selectors, label: str) -> set[str]:
+def _resolve_bound_selectors_for_config(
+    config: dict, selectors, label: str
+) -> set[str]:
     flat_bounds, _ = _flat_optimize_bounds_for_config(config)
     resolved: set[str] = set()
-    selectors_sorted = sorted({str(selector).strip() for selector in selectors if str(selector).strip()})
+    selectors_sorted = sorted(
+        {str(selector).strip() for selector in selectors if str(selector).strip()}
+    )
     if not selectors_sorted:
         return resolved
     logging.info("%s selectors:", label)
@@ -2548,12 +3043,16 @@ def _resolve_bound_selectors_for_config(config: dict, selectors, label: str) -> 
         selector_matches = resolve_bound_selectors(config, [selector], flat_bounds)
         matches = sorted(selector_matches)
         if not matches:
-            logging.warning("%s selector matched no optimize bounds: %s", label, selector)
+            logging.warning(
+                "%s selector matched no optimize bounds: %s", label, selector
+            )
             continue
         logging.info("  %s ->", selector)
         for match in sorted(
             matches,
-            key=lambda key: _format_bound_key_for_log(config, key, selector_matches[key]),
+            key=lambda key: _format_bound_key_for_log(
+                config, key, selector_matches[key]
+            ),
         ):
             logging.info(
                 "    %s (%s)",
@@ -2590,14 +3089,18 @@ def _resolve_fine_tune_key_sets(
     )
     effective_fixed_params = set(config_fixed_params)
     if fine_tune_params:
-        effective_fixed_params.update(key for key in flat_bounds if key not in fine_tune_set)
+        effective_fixed_params.update(
+            key for key in flat_bounds if key not in fine_tune_set
+        )
     return flat_bounds, fine_tune_set, config_fixed_params, effective_fixed_params
 
 
 def _fix_bound_to_current_value(config: dict, bound_key: str) -> bool:
     path = resolve_optimization_bound_path(config, bound_key)
     if path is None:
-        logging.warning("fine-tune bounds: unable to resolve key '%s', skipping", bound_key)
+        logging.warning(
+            "fine-tune bounds: unable to resolve key '%s', skipping", bound_key
+        )
         return False
     target = config
     try:
@@ -2680,7 +3183,11 @@ def install_anchored_fine_tune_plan(
     flat_bounds, fine_tune_set, config_fixed_params, effective_fixed_params = (
         _resolve_fine_tune_key_sets(config, fine_tune_params)
     )
-    tunable_keys = sorted(key for key in fine_tune_set if key in flat_bounds and key not in config_fixed_params)
+    tunable_keys = sorted(
+        key
+        for key in fine_tune_set
+        if key in flat_bounds and key not in config_fixed_params
+    )
     fixed_keys = sorted(key for key in flat_bounds if key not in tunable_keys)
     if fine_tune_set:
         _log_bound_set(config, "fine-tune tunable bounds", set(tunable_keys))
@@ -2693,12 +3200,16 @@ def install_anchored_fine_tune_plan(
         )
 
     anchors = []
-    base_strategy_kind = normalize_strategy_kind(config.get("live", {}).get("strategy_kind"))
+    base_strategy_kind = normalize_strategy_kind(
+        config.get("live", {}).get("strategy_kind")
+    )
     base_key_paths = get_optimization_key_paths(config)
     key_path_by_key = {key: path for key, path in base_key_paths}
     bound_by_key = {
         key: bound
-        for (key, _path), bound in zip(base_key_paths, extract_bounds_tuple_list_from_config(config))
+        for (key, _path), bound in zip(
+            base_key_paths, extract_bounds_tuple_list_from_config(config)
+        )
     }
     sig_digits = config.get("optimize", {}).get("round_to_n_significant_digits", 6)
     clamp_collector = {}
@@ -2751,7 +3262,9 @@ def install_anchored_fine_tune_plan(
                 }
             )
         except Exception as exc:
-            logging.warning("failed to use starting config as fine-tune anchor: %s", exc)
+            logging.warning(
+                "failed to use starting config as fine-tune anchor: %s", exc
+            )
     _flush_seed_bounds_adjustments(clamp_collector)
     if not anchors:
         raise ValueError(
@@ -2786,7 +3299,9 @@ def iter_extract_configs(path):
             raw = load_hjson_config(path, log_errors=False)
             yield _extract_starting_config(raw, source=path)
         except Exception as e:
-            logging.warning(f"failed to extract bot config from starting config {path}: {e}")
+            logging.warning(
+                f"failed to extract bot config from starting config {path}: {e}"
+            )
         return
     if path.endswith("_pareto.txt"):
         with open(path) as f:
@@ -2795,7 +3310,44 @@ def iter_extract_configs(path):
                     cfg = json.loads(line)
                     yield _extract_starting_config(cfg, source=path)
                 except Exception as e:
-                    logging.warning(f"failed to extract bot config from starting config {path}: {e}")
+                    logging.warning(
+                        f"failed to extract bot config from starting config {path}: {e}"
+                    )
+
+
+def _format_starting_seed_bot(bot, live=None):
+    """Normalize numeric seed parameters without inheriting HSL activation policy.
+
+    Fresh searches evaluate every seed under the main config's current policy;
+    seed enablement/restart choices and old fitness are never runtime authority.
+    """
+    from config.shared_bot import canonicalize_shared_bot_side
+
+    bot = deepcopy(bot)
+    live = deepcopy(live) if isinstance(live, dict) else {}
+    live.pop("hsl_engine", None)
+    for side in ("long", "short"):
+        if isinstance(bot.get(side), dict):
+            canonicalize_shared_bot_side(bot[side])
+    defaults = get_template_config()["bot"]["long"]["hsl"]
+    numeric_fields = ("red_threshold", "ema_span_minutes", "cooldown_minutes_after_red")
+    numeric_seeds = {}
+    for scope in ("long", "short", "portfolio"):
+        block = bot.get("hsl") if scope == "portfolio" else bot.get(scope, {}).get("hsl")
+        if not isinstance(block, dict):
+            continue
+        numeric_seeds[scope] = {key: float(block[key]) for key in numeric_fields if key in block}
+        if any(not math.isfinite(value) for value in numeric_seeds[scope].values()):
+            raise ValueError(f"non-finite HSL optimizer seed value in {scope} policy")
+        # Seed HSL policy is not used. Validate the bot layout with inert current
+        # defaults, then leave numeric suggestions for the optimizer's bounds clamp.
+        block.clear()
+        block.update(deepcopy(defaults), enabled=False, restart_after_red_policy=None)
+    formatted = format_bot_config(bot, live_cfg=live, verbose=False, warn_deprecations=False)
+    for scope, values in numeric_seeds.items():
+        block = formatted["hsl"] if scope == "portfolio" else formatted[scope]["hsl"]
+        block.update(values)
+    return formatted
 
 
 def _extract_starting_config(raw_config, *, source: str = "<memory>"):
@@ -2807,23 +3359,28 @@ def _extract_starting_config(raw_config, *, source: str = "<memory>"):
     bot_cfg = current.get("bot")
     if not isinstance(bot_cfg, dict):
         raise KeyError("missing bot config")
-    extracted = {
-        "bot": format_bot_config(
-            bot_cfg,
-            live_cfg=current.get("live"),
-            verbose=False,
-            warn_deprecations=False,
-        )
-    }
+    extracted = {"bot": _format_starting_seed_bot(bot_cfg, current.get("live"))}
     live_cfg = current.get("live")
     if isinstance(live_cfg, dict):
         strategy_kind = live_cfg.get("strategy_kind")
-        if strategy_kind and normalize_strategy_kind(strategy_kind) != normalize_strategy_kind(None):
+        if strategy_kind and normalize_strategy_kind(
+            strategy_kind
+        ) != normalize_strategy_kind(None):
             extracted["live"] = {"strategy_kind": strategy_kind}
+        if live_cfg.get("hsl_signal_mode") == "unified":
+            extracted.setdefault("live", {})["hsl_signal_mode"] = "unified"
     optimize_cfg = current.get("optimize")
     if isinstance(optimize_cfg, dict) and isinstance(optimize_cfg.get("bounds"), dict):
         extracted["optimize"] = {"bounds": deepcopy(optimize_cfg["bounds"])}
     record_source = source or "<memory>"
+    from config.migrations.legacy_v7 import _parse_version_tuple
+    version = _parse_version_tuple(current.get("config_version"))
+    if version is None or version < (8, 6, 0) or "hsl_engine" in (live_cfg or {}):
+        logging.warning(
+            "Loading legacy optimizer seed %s best effort under the current schema; "
+            "main config owns HSL activation/restart policy and all fitness is reevaluated",
+            record_source,
+        )
     extracted["_starting_config_source"] = record_source
     return extracted
 
@@ -2831,8 +3388,12 @@ def _extract_starting_config(raw_config, *, source: str = "<memory>"):
 def _build_starting_seed_config(cfg):
     if not isinstance(cfg, dict):
         raise TypeError(f"expected dict, got {type(cfg).__name__}")
-    if all(pside in cfg and isinstance(cfg.get(pside), dict) for pside in ("long", "short")):
-        extracted = {"bot": format_bot_config(cfg, verbose=False, warn_deprecations=False)}
+    if all(
+        pside in cfg and isinstance(cfg.get(pside), dict) for pside in ("long", "short")
+    ):
+        extracted = {
+            "bot": _format_starting_seed_bot(cfg)
+        }
     elif "bot" in cfg and isinstance(cfg.get("bot"), dict):
         extracted = cfg
     else:
@@ -2870,26 +3431,25 @@ def preselect_starting_configs(
     *,
     filter_by_limits: bool,
     max_count: int | None,
-    aggregate_cfg: Mapping[str, Any] | None,
+    reducer_cfg: Mapping[str, Any] | None,
     scenario_labels: Sequence[str] | None = None,
 ) -> list[dict]:
     optimize_cfg = config.get("optimize")
     limits = optimize_cfg.get("limits", []) if isinstance(optimize_cfg, Mapping) else []
-    effective_aggregate_cfg = (
-        aggregate_cfg if isinstance(aggregate_cfg, Mapping) else {"default": "mean"}
+    effective_reducer_cfg = (
+        reducer_cfg if isinstance(reducer_cfg, Mapping) else {"default": "mean"}
     )
     selection = select_starting_config_artifacts(
         starting_configs_path,
         limits=limits,
-        aggregate_cfg=effective_aggregate_cfg,
+        reducer_cfg=effective_reducer_cfg,
         scenario_labels=scenario_labels,
         filter_by_limits=filter_by_limits,
         max_count=max_count,
     )
     current_specs = extract_objective_specs(config)
-    if (
-        selection.selected_count < selection.filtered_count
-        and current_specs != list(selection.scoring_specs)
+    if selection.selected_count < selection.filtered_count and current_specs != list(
+        selection.scoring_specs
     ):
         logging.warning(
             "Stored starting-config optimize.scoring differs from this optimization run; "
@@ -2904,8 +3464,91 @@ def preselect_starting_configs(
 def _active_suite_scenario_labels(suite_cfg: Mapping[str, Any]) -> list[str] | None:
     if not suite_cfg.get("enabled"):
         return None
-    scenarios, _aggregate_cfg = build_scenarios(dict(suite_cfg))
+    scenarios, _reducer_cfg = build_scenarios(dict(suite_cfg))
     return [scenario.label for scenario in scenarios]
+
+
+def _materialize_suite_run_contract(
+    config: Dict[str, Any], suite_cfg: Mapping[str, Any]
+) -> None:
+    """Persist the effective external/filterable suite for every optimizer backend."""
+
+    backtest = config.setdefault("backtest", {})
+    backtest["suite_enabled"] = bool(suite_cfg.get("enabled"))
+    if not backtest["suite_enabled"]:
+        return
+    for key in ("scenarios", "reducer", "exchanges", "volume_normalization"):
+        if key in suite_cfg:
+            backtest[key] = deepcopy(suite_cfg[key])
+
+
+def _run_gpu_preparation_preflight(
+    config: Dict[str, Any], suite_cfg: Mapping[str, Any]
+) -> None:
+    """Validate immutable Apple MPS requirements before loading historical data."""
+
+    if str(config.get("optimize", {}).get("backend", "")).strip().lower() != "gpu":
+        return
+    from optimization.backends.gpu_backend import (
+        materialize_gpu_preparation_config,
+        validate_gpu_preparation_scope,
+    )
+
+    effective_config = materialize_gpu_preparation_config(config)
+    normalized_suite_cfg = dict(suite_cfg)
+    if bool(normalized_suite_cfg.get("enabled")):
+        scenarios, _reducer_cfg = build_scenarios(
+            normalized_suite_cfg,
+            base_exchanges=effective_config.get("backtest", {}).get("exchanges"),
+        )
+        normalized_suite_cfg["scenarios"] = [
+            {
+                "label": scenario.label,
+                "overrides": dict(scenario.overrides or {}),
+            }
+            for scenario in scenarios
+        ]
+    validate_gpu_preparation_scope(effective_config, normalized_suite_cfg)
+
+
+def _materialize_resolved_suite_dates(
+    config: Dict[str, Any], scenario_contexts: Sequence[ScenarioEvalContext]
+) -> None:
+    """Persist concrete dates and the resolved policy used by prepared scenarios."""
+
+    if not config.get("backtest", {}).get("suite_enabled"):
+        return
+    scenarios = config["backtest"].get("scenarios") or []
+    if len(scenarios) != len(scenario_contexts):
+        raise RuntimeError(
+            "Optimizer suite run contract does not match prepared scenario count: "
+            f"{len(scenarios)} != {len(scenario_contexts)}"
+        )
+    resolved_scenarios = []
+    for scenario, ctx in zip(scenarios, scenario_contexts):
+        resolved = deepcopy(scenario)
+        resolved["label"] = ctx.label
+        if scenario.get("overrides"):
+            resolved["overrides"] = deepcopy(ctx.overrides)
+        for key in ("start_date", "end_date"):
+            meta_key = f"requested_{key}"
+            prepared_values = {
+                str(mss.get("__meta__", {}).get(meta_key))
+                for mss in ctx.msss.values()
+                if mss.get("__meta__", {}).get(meta_key) is not None
+            }
+            if not prepared_values:
+                raise RuntimeError(
+                    f"Optimizer suite scenario {ctx.label!r} has no prepared {meta_key}"
+                )
+            if len(prepared_values) != 1:
+                raise RuntimeError(
+                    f"Optimizer suite scenario {ctx.label!r} has inconsistent prepared "
+                    f"{meta_key} values: {sorted(prepared_values)}"
+                )
+            resolved[key] = prepared_values.pop()
+        resolved_scenarios.append(resolved)
+    config["backtest"]["scenarios"] = resolved_scenarios
 
 
 def _validate_optimizer_limit_suite_mode(
@@ -2949,9 +3592,11 @@ def iter_anchored_fine_tune_seed_configs(config: dict):
     for anchor in anchor_plan.get("anchors") or []:
         yield {
             "bot": deepcopy(anchor.get("seed_bot") or {}),
-            "live": {"strategy_kind": anchor_plan.get("strategy_kind")}
-            if anchor_plan.get("strategy_kind")
-            else {},
+            "live": (
+                {"strategy_kind": anchor_plan.get("strategy_kind")}
+                if anchor_plan.get("strategy_kind")
+                else {}
+            ),
             "_starting_config_source": anchor.get("source", "<memory>"),
         }
 
@@ -2992,17 +3637,35 @@ def configs_to_individuals_streaming(
         raw_count += 1
         try:
             fcfg = _build_starting_seed_config(cfg)
+            resolved_anchor_id = None
+            if anchored_shape:
+                has_persisted_anchor = isinstance(cfg, dict) and any(
+                    key in cfg for key in ("_optimizer_anchor", "optimizer_anchor")
+                )
+                resolved_anchor_id = (
+                    _optimizer_anchor_id(cfg) if has_persisted_anchor else anchor_idx
+                )
+                if resolved_anchor_id is None:
+                    raise ValueError("invalid persisted optimizer anchor id")
+                anchor_high = int(bounds[0].high)
+                if not 0 <= resolved_anchor_id <= anchor_high:
+                    raise ValueError(
+                        "persisted optimizer anchor id is outside the optimization "
+                        f"shape: id={resolved_anchor_id}, allowed=0..{anchor_high}"
+                    )
             individual = config_to_individual(
                 fcfg,
                 bounds,
                 sig_digits,
                 key_paths=key_paths,
                 optimization_shape=optimization_shape,
-                anchor_id=anchor_idx if anchored_shape else None,
+                anchor_id=resolved_anchor_id,
                 clamp_context="starting config",
-                source=cfg.get("_starting_config_source", "<memory>")
-                if isinstance(cfg, dict)
-                else "<memory>",
+                source=(
+                    cfg.get("_starting_config_source", "<memory>")
+                    if isinstance(cfg, dict)
+                    else "<memory>"
+                ),
                 clamp_collector=clamp_collector,
             )
             inds.add(tuple(individual))
@@ -3105,9 +3768,9 @@ async def main():
         metavar="SPEC",
         help=(
             "Repeatable optimize limit override. Example: "
-            "\"drawdown_worst > 0.35\" or "
-            "\"drawdown_worst_strategy_eq <= 0.5 scenario=base\". "
-            "Aggregate limits may use stat=min|max|mean|std|median."
+            '"drawdown_worst > 0.35" or '
+            '"drawdown_worst_strategy_eq <= 0.5 scenario=base". '
+            "Suite limits may use reducer=min|max|mean|std|median."
         ),
     )
     optimize_common_group.add_argument(
@@ -3133,15 +3796,31 @@ async def main():
     initial_log_level = resolve_log_level(args.log_level, None, fallback=1)
     configure_logging(debug=initial_log_level)
     source_config, base_config_path, raw_snapshot = load_input_config(args.config_path)
-    existing_limits = deepcopy(source_config.get("optimize", {}).get("limits"))
-    update_config_with_args(source_config, args, verbose=True, allowed_keys=allowed_config_keys)
-    cli_limits_override = _resolve_cli_limits_override(args, existing_limits=existing_limits)
+    existing_limits = deepcopy(
+        effective_config_payload(source_config).get("optimize", {}).get("limits")
+    )
+    update_config_with_args(
+        source_config, args, verbose=True, allowed_keys=allowed_config_keys
+    )
+    cli_limits_override = _resolve_cli_limits_override(
+        args, existing_limits=existing_limits
+    )
     if cli_limits_override is not None:
-        recursive_config_update(
+        update_config_with_args(
             source_config,
-            "optimize.limits",
-            cli_limits_override,
+            argparse.Namespace(**{"optimize.limits": cli_limits_override}),
             verbose=True,
+            allowed_keys={"optimize.limits"},
+        )
+    # External suite patches share the raw base's schema contract. Load and
+    # gate them before preparation upgrades that schema and erases provenance.
+    suite_override = None
+    if args.suite_config:
+        logging.info("loading suite config %s", args.suite_config)
+        suite_override = load_suite_override_config(
+            args.suite_config,
+            source_config=source_config,
+            base_config_path=base_config_path,
         )
     config = prepare_config(
         source_config,
@@ -3149,9 +3828,21 @@ async def main():
         verbose=False,
         raw_snapshot=raw_snapshot,
     )
+    from config.hsl import require_runtime_support
+
+    require_runtime_support(config, supported_modes=("coin", "pside", "unified"))
+    config = parse_overrides(config, verbose=False)
     validate_optimizer_overrides(config.get("optimize", {}).get("enable_overrides", []))
+    if "couple_unstuck_ema_spans" in (
+        config.get("optimize", {}).get("enable_overrides") or []
+    ):
+        logging.info(
+            "Coupled unstuck EMA search: effective strategy spans own unstuck horizons; independent unstuck span bounds and pins are ignored. Saved candidates retain explicit spans."
+        )
     config_logging_value = get_optional_config_value(config, "logging.level", None)
-    effective_log_level = resolve_log_level(args.log_level, config_logging_value, fallback=1)
+    effective_log_level = resolve_log_level(
+        args.log_level, config_logging_value, fallback=1
+    )
     if effective_log_level != initial_log_level:
         configure_logging(debug=effective_log_level)
     logging.info(
@@ -3159,14 +3850,10 @@ async def main():
         TEMPLATE_CONFIG_MODE,
         ",".join(objective_metric_names(config)),
     )
-    suite_override = None
-    if args.suite_config:
-        logging.info("loading suite config %s", args.suite_config)
-        suite_override = load_suite_override_config(args.suite_config)
-        if _suite_config_implies_suite_mode(args):
-            recursive_config_update(
-                config, "backtest.suite_enabled", True, verbose=True
-            )
+    if _suite_config_implies_suite_mode(args):
+        recursive_config_update(
+            config, "backtest.suite_enabled", True, verbose=True
+        )
     suite_cfg = extract_suite_config(config, suite_override)
 
     # Handle --scenarios filter (implies --suite y)
@@ -3188,12 +3875,32 @@ async def main():
         )
         suite_cfg["enabled"] = bool(args.suite)
 
+    _materialize_suite_run_contract(config, suite_cfg)
     active_suite_scenario_labels = _active_suite_scenario_labels(suite_cfg)
     _validate_optimizer_limit_suite_mode(
         config,
         suite_enabled=bool(suite_cfg.get("enabled")),
         scenario_labels=active_suite_scenario_labels,
     )
+
+    # Record the actual seed before hashing a new search. Legacy resumes retain
+    # their original seed policy; new sessions restore the seed from metadata.
+    resume_results_dir = None
+    resume_checkpoint_path = None
+    restored_resume_anchor_plan = False
+    if args.resume:
+        resume_results_dir = _resolve_resume_results_dir(args.resume)
+        resume_checkpoint_path = _require_resume_checkpoint(resume_results_dir)
+        resolve_optimizer_seed(config["optimize"], resume_results_dir)
+        if get_anchor_plan(config) is None:
+            restored_resume_anchor_plan = _restore_gpu_resume_anchor_plan(
+                config, resume_checkpoint_path
+            )
+        else:
+            restored_resume_anchor_plan = True
+
+    if not args.resume:
+        resolve_optimizer_seed(config["optimize"])
 
     preselected_starting_configs = None
     if args.filter_starting_configs or args.starting_configs_max is not None:
@@ -3202,8 +3909,8 @@ async def main():
             config,
             filter_by_limits=bool(args.filter_starting_configs),
             max_count=args.starting_configs_max,
-            aggregate_cfg=(
-                suite_cfg.get("aggregate") if suite_cfg.get("enabled") else None
+            reducer_cfg=(
+                suite_cfg.get("reducer") if suite_cfg.get("enabled") else None
             ),
             scenario_labels=active_suite_scenario_labels,
         )
@@ -3219,65 +3926,79 @@ async def main():
     }
     if polish_bounds_pct is not None:
         apply_polish_bounds(config, polish_bounds_pct, bounds_mode=polish_bounds_mode)
-    if fine_tune_params and args.starting_configs:
+    installing_anchor_plan = bool(fine_tune_params and args.starting_configs)
+    if installing_anchor_plan:
         install_anchored_fine_tune_plan(
             config,
             fine_tune_params,
             args.starting_configs,
             starting_configs_override=preselected_starting_configs,
         )
-    else:
+    elif _should_apply_fine_tune_bounds(
+        restored_resume_anchor_plan=restored_resume_anchor_plan,
+        installing_anchor_plan=installing_anchor_plan,
+    ):
         apply_fine_tune_bounds(config, fine_tune_params, cli_bounds_overrides)
     if not suite_cfg.get("enabled"):
         config = prepare_organillo_config(config)
+    validate_optimizer_effective_configs(config)
     backtest_exchanges = require_config_value(config, "backtest.exchanges")
     await format_approved_ignored_coins(
         config, backtest_exchanges, prefer_backtest_coin_source_keys=True
     )
     data_config = build_optimizer_data_config(config)
+    allow_internal_nan_gaps = (
+        str(config.get("optimize", {}).get("backend", "")).strip().lower() == "gpu"
+    )
     interrupted = False
     failed = False
+    starting_snapshot = None
     pool = None
     manager = None
     pool_terminated = False
     try:
+        _run_gpu_preparation_preflight(config, suite_cfg)
         array_manager = SharedArrayManager()
         hlcvs_specs = {}
         btc_usd_specs = {}
         msss = {}
         timestamps_dict = {}
         config["backtest"]["coins"] = {}
-        aggregate_cfg: Dict[str, Any] = {"default": "mean"}
+        reducer_cfg: Dict[str, Any] = {"default": "mean"}
         scenario_contexts: List[ScenarioEvalContext] = []
         suite_enabled = bool(suite_cfg.get("enabled"))
 
         if suite_enabled:
-            scenario_contexts, aggregate_cfg = await prepare_suite_contexts(
+            scenario_contexts, reducer_cfg = await prepare_suite_contexts(
                 data_config,
                 suite_cfg,
                 shared_array_manager=array_manager,
+                allow_internal_nan_gaps=allow_internal_nan_gaps,
             )
             if not scenario_contexts:
                 raise ValueError("Suite configuration produced no scenarios.")
-            logging.info("Optimizer suite enabled with %d scenario(s)", len(scenario_contexts))
-            resolved_scenarios = deepcopy(suite_cfg["scenarios"])
+            _materialize_resolved_suite_dates(config, scenario_contexts)
+            logging.info(
+                "Optimizer suite enabled with %d scenario(s)", len(scenario_contexts)
+            )
             by_label = {ctx.label: ctx.config["backtest"] for ctx in scenario_contexts}
-            source_scenarios, _ = build_scenarios(suite_cfg, base_exchanges=backtest_exchanges)
-            for item, scenario in zip(resolved_scenarios, source_scenarios):
-                bt = by_label.get(scenario.label)
+            for item in config["backtest"].get("scenarios") or []:
+                bt = by_label.get(item.get("label"))
                 if bt and bt.get("organillo_mode", False):
-                    item["label"] = scenario.label
                     overrides = item.setdefault("overrides", {})
                     for key in ("organillo_mode", "organillo_carton_path", "organillo_carton_hash"):
                         overrides[f"backtest.{key}"] = bt[key]
-            config["backtest"]["scenarios"] = resolved_scenarios
             first_ctx = scenario_contexts[0]
             hlcvs_specs = first_ctx.hlcvs_specs
             btc_usd_specs = first_ctx.btc_usd_specs
             msss = first_ctx.msss
             timestamps_dict = first_ctx.timestamps
-            config["backtest"]["coins"] = deepcopy(first_ctx.config["backtest"]["coins"])
-            backtest_exchanges = sorted({ex for ctx in scenario_contexts for ex in ctx.exchanges})
+            config["backtest"]["coins"] = deepcopy(
+                first_ctx.config["backtest"]["coins"]
+            )
+            backtest_exchanges = sorted(
+                {ex for ctx in scenario_contexts for ex in ctx.exchanges}
+            )
 
             # Estimate memory usage (per-scenario SharedMemory, shared by all workers)
             total_shm_bytes = 0
@@ -3295,7 +4016,9 @@ async def main():
                         if spec.name in seen_specs:
                             continue
                         seen_specs.add(spec.name)
-                        total_shm_bytes += np.prod(spec.shape) * np.dtype(spec.dtype).itemsize
+                        total_shm_bytes += (
+                            np.prod(spec.shape) * np.dtype(spec.dtype).itemsize
+                        )
             if total_shm_bytes > 0:
                 total_shm_gb = total_shm_bytes / (1024**3)
                 try:
@@ -3321,7 +4044,9 @@ async def main():
                     f" | system={available_gb:.1f}GB" if available_gb else "",
                 )
                 if shm_gb is not None:
-                    logging.info("Shared memory filesystem size | /dev/shm=%.1fGB", shm_gb)
+                    logging.info(
+                        "Shared memory filesystem size | /dev/shm=%.1fGB", shm_gb
+                    )
                 if available_gb and total_shm_gb > available_gb * 0.7:
                     logging.warning(
                         "Shared memory for scenarios (%.1fGB) is high relative to RAM (%.1fGB). "
@@ -3339,13 +4064,18 @@ async def main():
                 exchange = "combined"
                 coins, mss = _register_exchange_data(
                     exchange,
-                    await prepare_hlcvs_mss(data_config, exchange),
+                    await prepare_hlcvs_mss(
+                        data_config,
+                        exchange,
+                        allow_internal_nan_gaps=allow_internal_nan_gaps,
+                    ),
                     config,
                     msss=msss,
                     hlcvs_specs=hlcvs_specs,
                     btc_usd_specs=btc_usd_specs,
                     timestamps_dict=timestamps_dict,
                     array_manager=array_manager,
+                    preserve_internal_nan_gaps=allow_internal_nan_gaps,
                 )
                 exchange_preference = defaultdict(list)
                 for coin in coins:
@@ -3354,7 +4084,13 @@ async def main():
                     logging.info(f"chose {ex} for {','.join(exchange_preference[ex])}")
             else:
                 tasks = {
-                    exchange: asyncio.create_task(prepare_hlcvs_mss(data_config, exchange))
+                    exchange: asyncio.create_task(
+                        prepare_hlcvs_mss(
+                            data_config,
+                            exchange,
+                            allow_internal_nan_gaps=allow_internal_nan_gaps,
+                        )
+                    )
                     for exchange in backtest_exchanges
                 }
                 for exchange, task in tasks.items():
@@ -3367,39 +4103,80 @@ async def main():
                         btc_usd_specs=btc_usd_specs,
                         timestamps_dict=timestamps_dict,
                         array_manager=array_manager,
+                        preserve_internal_nan_gaps=allow_internal_nan_gaps,
                     )
-        exchanges = backtest_exchanges
-        exchanges_fname = "combined" if len(backtest_exchanges) > 1 else "_".join(exchanges)
-        date_fname = ts_to_date(utc_ms())[:19].replace(":", "_")
-        coins = sorted(set([x for y in config["backtest"]["coins"].values() for x in y]))
-        suite_flag = suite_enabled or bool(args.suite)
-        if suite_flag:
-            coins_fname = f"suite_{len(coins)}_coins"
-        else:
-            coins_fname = "_".join(coins) if len(coins) <= 6 else f"{len(coins)}_coins"
-        hash_snippet = uuid4().hex[:8]
-        n_days = int(
-            round(
-                (
-                    date_to_ts(require_config_value(config, "backtest.end_date"))
-                    - date_to_ts(require_config_value(config, "backtest.start_date"))
-                )
-                / (1000 * 60 * 60 * 24)
-            )
+        config[PREPARED_DATASET_KEY] = build_prepared_dataset_identity(
+            config=config,
+            hlcvs_specs=hlcvs_specs,
+            btc_usd_specs=btc_usd_specs,
+            msss=msss,
+            timestamps=timestamps_dict,
+            scenario_contexts=scenario_contexts,
         )
+        config[CONTRACT_CACHE_KEY] = build_evaluation_contract(config)
+        starting_config_iter = iter_starting_configs
+        if preselected_starting_configs is not None:
+            starting_config_iter = lambda _path: iter(preselected_starting_configs)
+        if get_anchor_plan(config) is not None:
+            starting_config_iter = lambda _path: iter_anchored_fine_tune_seed_configs(
+                config
+            )
+        seed_identity = None
+        if not args.resume:
+            starting_snapshot, seed_identity = snapshot_starting_configs(
+                starting_config_iter(args.starting_configs)
+            )
+            starting_config_iter = lambda _path: iter_starting_snapshot(
+                starting_snapshot
+            )
+        run_configs = [ctx.config for ctx in scenario_contexts] or [config]
+        coins = sorted(
+            {
+                coin
+                for cfg in run_configs
+                for values in cfg["backtest"]["coins"].values()
+                for coin in values
+            }
+        )
+        source = "combined" if len(backtest_exchanges) > 1 else backtest_exchanges[0]
+        span, span_metadata = date_span(run_configs)
         previous_evals = 0
+        resume_recorder_state = {}
         checkpoint_path = None
         if args.resume:
             if not config["optimize"].get("write_all_results", True):
                 raise ValueError("Cannot resume with optimize.write_all_results=false")
-            results_dir = _resolve_resume_results_dir(args.resume)
-            checkpoint_path = _require_resume_checkpoint(results_dir)
-            previous_evals = _validate_resume_results(results_dir, config)
-        else:
-            results_dir = make_get_filepath(
-                f"optimize_results/{date_fname}_{exchanges_fname}_{n_days}days_{coins_fname}_{hash_snippet}/"
+            results_dir = resume_results_dir
+            checkpoint_path = resume_checkpoint_path
+            previous_evals = _validate_resume_results(
+                results_dir,
+                config,
+                checkpoint_path=checkpoint_path,
+                resume_state=resume_recorder_state,
             )
-            os.makedirs(results_dir, exist_ok=True)
+        else:
+            directory, session_metadata = create_session_dir(
+                "optimize_results",
+                coins=coins,
+                source=source,
+                span=span,
+                scenarios=len(scenario_contexts),
+                setup={
+                    "version": 1,
+                    "config": effective_setup_config(config, optimize=True),
+                    "evaluation_contract": config[CONTRACT_CACHE_KEY],
+                    "starting_configs": seed_identity,
+                },
+                metadata={
+                    "kind": "optimize",
+                    "seed": config["optimize"]["seed"],
+                    "coins": coins,
+                    "data_source": source,
+                    **span_metadata,
+                    "starting_configs": seed_identity,
+                },
+            )
+            results_dir = str(directory)
 
         config["results_dir"] = results_dir
         results_filename = os.path.join(results_dir, "all_results.bin")
@@ -3431,7 +4208,9 @@ async def main():
         )
 
         if suite_enabled:
-            evaluator_for_pool = SuiteEvaluator(evaluator, scenario_contexts, aggregate_cfg)
+            evaluator_for_pool = SuiteEvaluator(
+                evaluator, scenario_contexts, reducer_cfg
+            )
         else:
             evaluator_for_pool = evaluator
 
@@ -3449,16 +4228,12 @@ async def main():
             pareto_max_size=pareto_max,
             bounds=evaluator.bounds,
             starting_iters=previous_evals,
+            previous_data=resume_recorder_state.get("previous_data"),
         )
         backend_name = config["optimize"]["backend"]
         logging.info("Selected optimizer backend: %s", backend_name)
         backend_runner = get_backend_runner(backend_name)
-        starting_config_iter = iter_starting_configs
-        if preselected_starting_configs is not None:
-            starting_config_iter = lambda _path: iter(preselected_starting_configs)
-        if get_anchor_plan(config) is not None:
-            starting_config_iter = lambda _path: iter_anchored_fine_tune_seed_configs(config)
-        backend_result = backend_runner(
+        backend_kwargs = dict(
             config=config,
             evaluator=evaluator,
             evaluator_for_pool=evaluator_for_pool,
@@ -3480,18 +4255,29 @@ async def main():
             build_config_fn=individual_to_config,
             overrides_fn=optimizer_overrides,
         )
+        if backend_name == "gpu":
+            interrupt_latch = OptimizerInterruptLatch()
+            backend_kwargs["interrupt_check"] = interrupt_latch.raise_if_requested
+            with interrupt_latch:
+                backend_result = backend_runner(**backend_kwargs)
+        else:
+            backend_result = backend_runner(**backend_kwargs)
         pool = backend_result.get("pool")
         pool_terminated = backend_result.get("pool_terminated", False)
 
-    except KeyboardInterrupt:
+    except KeyboardInterrupt as exc:
         interrupted = True
         logging.info("SIGINT received; starting graceful shutdown")
+        pool = getattr(exc, "pool", pool)
+        pool_terminated = bool(getattr(exc, "pool_terminated", pool_terminated))
         pool_terminated = _terminate_optimizer_pool(pool, pool_terminated)
     except Exception as e:
         failed = True
         logging.error(f"An error occurred: {e}")
         traceback.print_exc()
     finally:
+        if starting_snapshot is not None:
+            starting_snapshot.close()
         if "recorder" in locals():
             logging.info("Flushing Pareto/results recorder...")
             try:
@@ -3511,7 +4297,9 @@ async def main():
             try:
                 pool.join()
             except KeyboardInterrupt:
-                logging.info("Additional SIGINT received during pool join; continuing shutdown")
+                logging.info(
+                    "Additional SIGINT received during pool join; continuing shutdown"
+                )
         if manager is not None:
             logging.info("Shutting down multiprocessing manager...")
             try:
