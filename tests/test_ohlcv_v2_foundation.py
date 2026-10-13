@@ -356,6 +356,48 @@ def test_materializer_creates_shared_memmap_payload(tmp_path):
     assert handle.mss["ETH/USDT"]["last_valid_index"] == 2
 
 
+def test_materializer_coin_grouping_does_not_change_payload(tmp_path, monkeypatch):
+    import backtest_dataset_materializer as materializer_module
+
+    catalog = OhlcvCatalog(tmp_path / "caches" / "ohlcvs" / "catalog.sqlite")
+    store = OhlcvStore(tmp_path / "caches" / "ohlcvs", catalog)
+    start = month_start_ts(2026, 4) + 10 * 60_000
+    end = start + 5 * 60_000
+    ts_full = np.arange(start, end + 60_000, 60_000, dtype=np.int64)
+    coins = ["A/USDT", "B/USDT", "C/USDT"]
+    for i, coin in enumerate(coins):
+        vals = np.arange(len(ts_full) * 4, dtype=np.float32).reshape(-1, 4) + 100.0 * (i + 1)
+        keep = np.ones(len(ts_full), dtype=bool)
+        keep[i + 1] = False  # internal gap at a different row per coin
+        if i == 2:
+            keep[:2] = False  # leading gap stays NaN
+        store.write_rows("binance", "1m", coin, ts_full[keep], vals[keep])
+
+    def run(group_bytes, run_id):
+        monkeypatch.setattr(materializer_module, "_COIN_GROUP_TARGET_BYTES", group_bytes)
+        handle = BacktestDatasetMaterializer(
+            store, tmp_path / "caches" / "ohlcvs" / "materialized"
+        ).materialize(
+            exchange="binance",
+            coins=coins,
+            start_ts=int(start),
+            end_ts=int(end),
+            btc_usd_prices=np.full(len(ts_full), 30_000.0),
+            mss={coin: {} for coin in coins},
+            run_id=run_id,
+        )
+        return np.array(handle.open_hlcvs()), handle.mss
+
+    coin_bytes = len(ts_full) * 4 * 8
+    reference, reference_mss = run(1 << 30, "all_in_one_group")
+    for group_bytes in (coin_bytes, 2 * coin_bytes):
+        grouped, grouped_mss = run(group_bytes, f"group_{group_bytes}")
+        np.testing.assert_array_equal(grouped, reference)
+        assert grouped_mss == reference_mss
+    assert np.isnan(reference[:2, 2, :]).all()
+    assert not np.isnan(reference[:, :2, :]).any()
+
+
 def test_materializer_supports_distinct_coin_keys_and_store_symbols(tmp_path):
     catalog = OhlcvCatalog(tmp_path / "caches" / "ohlcvs" / "catalog.sqlite")
     store = OhlcvStore(tmp_path / "caches" / "ohlcvs", catalog)

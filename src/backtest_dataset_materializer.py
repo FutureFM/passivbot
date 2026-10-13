@@ -15,6 +15,9 @@ from ohlcv_store import OhlcvStore, timeframe_to_interval_ms
 
 
 _FRAME_MATERIALIZER_TARGET_CHUNK_BYTES = 64 * 1024 * 1024
+# Coins are staged in a contiguous RAM buffer and written to the time-major memmap in groups.
+# Writing one coin column at a time touches every page of the whole payload per coin.
+_COIN_GROUP_TARGET_BYTES = 2 * 1024 * 1024 * 1024
 
 
 def _fill_sparse_hlcv_gaps(
@@ -255,8 +258,6 @@ class BacktestDatasetMaterializer:
             hlcvs = np.memmap(
                 hlcvs_path, mode="w+", dtype=np.float64, shape=(n_steps, len(coins), 4)
             )
-            hlcvs[:] = np.nan
-            raise_if_backtest_cancel_requested("materializer hlcvs initialization")
             timestamps = np.memmap(timestamps_path, mode="w+", dtype=np.int64, shape=(n_steps,))
             timestamps[:] = np.arange(start_ts, end_ts + interval_ms, interval_ms, dtype=np.int64)
             btc_mm = np.memmap(btc_path, mode="w+", dtype=np.float64, shape=(n_steps,))
@@ -267,8 +268,16 @@ class BacktestDatasetMaterializer:
             valid_buffer = np.zeros(n_steps, dtype=np.bool_)
             symbols_by_coin = symbols_by_coin or {}
             source_windows_by_coin = source_windows_by_coin or {}
+            coin_bytes = max(1, n_steps * 4 * np.dtype(np.float64).itemsize)
+            group_size = max(1, _COIN_GROUP_TARGET_BYTES // coin_bytes)
+            group_buffer = None
+            group_start = 0
             for coin_idx, coin in enumerate(coins):
                 raise_if_backtest_cancel_requested("materializer coin loop")
+                if coin_idx % group_size == 0:
+                    group_start = coin_idx
+                    group_len = min(group_size, len(coins) - group_start)
+                    group_buffer = np.full((group_len, n_steps, 4), np.nan, dtype=np.float64)
                 coin_t0 = time.monotonic()
                 logging.info(
                     "[materializer] coin start %d/%d exchange=%s coin=%s",
@@ -278,7 +287,7 @@ class BacktestDatasetMaterializer:
                     coin,
                 )
                 valid_buffer[:] = False
-                coin_view = hlcvs[:, coin_idx, :]
+                coin_view = group_buffer[coin_idx - group_start]
                 store_symbol = symbols_by_coin.get(coin, coin)
                 copy_start_ts, copy_end_ts = source_windows_by_coin.get(coin, (start_ts, end_ts))
                 copy_start_ts = int(copy_start_ts)
@@ -346,6 +355,19 @@ class BacktestDatasetMaterializer:
                     time.monotonic() - coin_t0,
                 )
                 raise_if_backtest_cancel_requested("materializer coin finalize")
+                if coin_idx == group_start + len(group_buffer) - 1:
+                    group_t0 = time.monotonic()
+                    _write_time_major_frame_chunks(
+                        hlcvs[:, group_start : coin_idx + 1, :], list(group_buffer)
+                    )
+                    logging.info(
+                        "[materializer] group write coins %d-%d/%d elapsed_s=%.1f",
+                        group_start + 1,
+                        coin_idx + 1,
+                        len(coins),
+                        time.monotonic() - group_t0,
+                    )
+                    group_buffer = None
 
             raise_if_backtest_cancel_requested("materializer close")
             _close_memmap(hlcvs)
