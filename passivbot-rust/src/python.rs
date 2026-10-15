@@ -2402,6 +2402,22 @@ fn bot_params_from_dict(dict: &PyDict, hsl: bool) -> PyResult<BotParams> {
             "divergence_extended_horizons",
             false,
         )?,
+        divergence_hold_minutes: extract_optional_f64_or(dict, "divergence_hold_minutes", 0.0)?,
+        divergence_persistence_pct: extract_optional_f64_or(
+            dict,
+            "divergence_persistence_pct",
+            70.0,
+        )?,
+        divergence_delay_add_minutes: extract_optional_f64_or(
+            dict,
+            "divergence_delay_add_minutes",
+            0.0,
+        )?,
+        divergence_market_delay_add_minutes: extract_optional_f64_or(
+            dict,
+            "divergence_market_delay_add_minutes",
+            0.0,
+        )?,
         n_positions,
         total_wallet_exposure_limit,
         wallet_exposure_limit,

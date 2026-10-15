@@ -609,6 +609,10 @@ pub struct Backtest<'a> {
     any_trailing_short: bool,
     equities: Equities,
     last_valid_timestamps: Vec<Option<usize>>,
+    /// `divergence_hold_minutes` latch per side `[long, short]` and coin.
+    divergence_hold_states: [Vec<crate::divergence::HoldState>; 2],
+    divergence_held: [Vec<f64>; 2],
+    divergence_hold_enabled: Option<[bool; 2]>,
     did_fill_long: Vec<bool>,
     did_fill_short: Vec<bool>,
     last_increase_fill_timestamp_long: Vec<Option<u64>>,
@@ -1301,6 +1305,48 @@ impl<'a> Backtest<'a> {
         }
     }
 
+    /// Advance the `divergence_hold_minutes` latch with the detector state at candle `k`.
+    /// Runs every candle (including warmup) so the latch matches live's candle replay.
+    fn update_divergence_hold(&mut self, k: usize) {
+        // Divergence params are static for the run; evaluate the per-coin switch once.
+        let enabled = match self.divergence_hold_enabled {
+            Some(enabled) => enabled,
+            None => {
+                let enabled: [bool; 2] = std::array::from_fn(|side| {
+                    let params: Vec<&BotParams> =
+                        (0..self.n_coins).map(|idx| self.bp(idx, side)).collect();
+                    crate::divergence::hold_enabled(&params)
+                });
+                self.divergence_hold_enabled = Some(enabled);
+                enabled
+            }
+        };
+        if !enabled[0] && !enabled[1] {
+            return;
+        }
+        let rocs: Vec<_> = (0..self.n_coins)
+            .map(|idx| self.divergence_roc_at(k, idx))
+            .collect();
+        let interval_minutes = self.interval_ms as f64 / 60_000.0;
+        for side in 0..2 {
+            if !enabled[side] {
+                continue;
+            }
+            let mut states = std::mem::take(&mut self.divergence_hold_states[side]);
+            let params: Vec<&BotParams> = (0..self.n_coins).map(|idx| self.bp(idx, side)).collect();
+            let raw = crate::divergence::detect(&rocs, &params, side == 1);
+            let held = crate::divergence::update_hold_states(
+                &mut states,
+                k as u64,
+                &raw,
+                &params,
+                interval_minutes,
+            );
+            self.divergence_hold_states[side] = states;
+            self.divergence_held[side] = held;
+        }
+    }
+
     fn divergence_roc_at(&self, k: usize, idx: usize) -> crate::divergence::DivergenceRocs {
         let long = &self.bot_params_master.long;
         let short = &self.bot_params_master.short;
@@ -1565,6 +1611,10 @@ impl<'a> Backtest<'a> {
                 orchestrator::SymbolInput {
                     symbol_idx: idx,
                     divergence_roc_pct: self.divergence_roc_at(k, idx),
+                    divergence_held_intensity: [
+                        self.divergence_held[0][idx],
+                        self.divergence_held[1][idx],
+                    ],
                     order_book,
                     exchange,
                     tradable,
@@ -1687,6 +1737,8 @@ impl<'a> Backtest<'a> {
         for sym in input.symbols.iter_mut() {
             let idx = sym.symbol_idx;
             sym.divergence_roc_pct = self.divergence_roc_at(k, idx);
+            sym.divergence_held_intensity =
+                [self.divergence_held[0][idx], self.divergence_held[1][idx]];
             let (start, end) = self.coin_valid_range(idx).unwrap_or((0, 0));
             let price_idx = k.clamp(start, end);
             let close_price = self.hlcvs_value(price_idx, idx, CLOSE).max(f64::EPSILON);
@@ -2291,6 +2343,12 @@ impl<'a> Backtest<'a> {
             any_trailing_short,
             equities: equities,
             last_valid_timestamps: vec![None; n_coins],
+            divergence_hold_states: [
+                vec![Default::default(); n_coins],
+                vec![Default::default(); n_coins],
+            ],
+            divergence_held: [vec![0.0; n_coins], vec![0.0; n_coins]],
+            divergence_hold_enabled: None,
             did_fill_long: vec![false; n_coins],
             did_fill_short: vec![false; n_coins],
             last_increase_fill_timestamp_long: vec![None; n_coins],
@@ -2433,6 +2491,7 @@ impl<'a> Backtest<'a> {
             self.update_emas(k);
             self.update_rounded_balance(k);
             self.update_trailing_prices(k);
+            self.update_divergence_hold(k);
             if self.equity_tracking_active
                 && self.balance.usd_total_balance.is_finite()
                 && (self.balance.usd_total_balance <= 0.0

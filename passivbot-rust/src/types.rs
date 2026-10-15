@@ -507,6 +507,9 @@ fn default_divergence_we_cap_pct() -> f64 {
 fn default_divergence_min_timeframes() -> usize {
     2
 }
+fn default_divergence_persistence_pct() -> f64 {
+    70.0
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -601,6 +604,19 @@ pub struct BotParams {
     pub divergence_min_timeframes: usize,
     #[serde(default)]
     pub divergence_extended_horizons: bool,
+    /// Minutes a persistent divergence flag stays latched; 0 disables the latch.
+    #[serde(default)]
+    pub divergence_hold_minutes: f64,
+    /// Share (percent) of the trailing persistence window that must be flagged to latch.
+    #[serde(default = "default_divergence_persistence_pct")]
+    pub divergence_persistence_pct: f64,
+    /// Extra entry-cooldown minutes for held positions at full divergence intensity.
+    #[serde(default)]
+    pub divergence_delay_add_minutes: f64,
+    /// Extra entry-cooldown minutes for held positions when every evaluated horizon shows a
+    /// market-wide adverse move (scaled by the suppressed share).
+    #[serde(default)]
+    pub divergence_market_delay_add_minutes: f64,
     #[serde(default)]
     pub entry_cooldown_min_duration_minutes: f64,
     #[serde(default)]
@@ -682,6 +698,10 @@ impl Default for BotParams {
             divergence_we_cap_pct: default_divergence_we_cap_pct(),
             divergence_min_timeframes: default_divergence_min_timeframes(),
             divergence_extended_horizons: false,
+            divergence_hold_minutes: 0.0,
+            divergence_persistence_pct: default_divergence_persistence_pct(),
+            divergence_delay_add_minutes: 0.0,
+            divergence_market_delay_add_minutes: 0.0,
             entry_cooldown_min_duration_minutes: 0.0,
             entry_cooldown_max_duration_minutes: None,
             entry_cooldown_weights_minutes: Default::default(),

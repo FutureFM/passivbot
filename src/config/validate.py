@@ -211,6 +211,10 @@ def validate_config(
             "divergence_breadth_drop_pct": (0.0, None),
             "divergence_delay_multiplier": (1.0, None),
             "divergence_we_cap_pct": (0.0, 1.0),
+            "divergence_hold_minutes": (0.0, None),
+            "divergence_persistence_pct": (0.0, 100.0),
+            "divergence_delay_add_minutes": (0.0, None),
+            "divergence_market_delay_add_minutes": (0.0, None),
         }
         for name, (minimum, maximum) in divergence_ranges.items():
             value = get_grouped_bot_value(bot_side, name)
