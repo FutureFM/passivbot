@@ -6,6 +6,13 @@ since the latest release tag; these features may already be available when insta
 
 ## Unreleased
 
+- Write `trade_distribution.html` after each backtest: the distribution of per-trade results
+  (position round trips, net of fees, as % of balance at open) with mean win/loss, break-even
+  win rate, skew, tail severity, dependence on outlier trades, results by averaging depth,
+  year, coin and exit type, and closed trades per day. Also writes `trades.csv` and
+  `trade_distribution.json`. `src/trade_distribution_report.py` builds it for existing results
+  and compares several runs with `--compare`. Disable with `-dp trade_distribution`.
+
 - Write `quantstats_report.html` after each backtest: a QuantStats tearsheet of daily
   strategy-equity returns benchmarked against BTC, using the backtest's own BTC prices (offline). Disable with `-dp quantstats`. Daily closes
   understate intraday drawdowns; the analysis metrics remain the risk reference.
