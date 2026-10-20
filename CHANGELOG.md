@@ -6,6 +6,12 @@ since the latest release tag; these features may already be available when insta
 
 ## Unreleased
 
+- Backtests can load perps the exchange no longer lists (for example LUNA, MATIC and EOS on
+  Binance) from an optional `caches/<exchange>/synthetic_markets.json`. Entries are CCXT-style
+  markets with `info.onboardDate` (ms) as the first candle; they are merged after every market
+  refresh, forced inactive, and never reach live trading. Candles come from the exchange's public
+  archive; the position is force-closed at the last archived price, as for other delisted coins.
+
 - Add an optional latch to divergence protection (`bot.<side>.risk.divergence_hold_minutes`,
   default `0` = off; `divergence_persistence_pct`, default `70`). A coin flagged on at least that
   share of the last 60 minutes keeps its strongest severity for the hold period, so protection no

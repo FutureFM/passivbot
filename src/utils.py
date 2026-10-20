@@ -413,6 +413,52 @@ def filter_markets(markets: dict, exchange: str, quote=None, verbose=False) -> (
     return eligible, ineligible, reasons
 
 
+SYNTHETIC_MARKETS_FILENAME = "synthetic_markets.json"
+
+
+def load_synthetic_markets(exchange: str) -> dict:
+    """Load backtest-only stubs for perps the exchange no longer lists.
+
+    Source: caches/{exchange}/synthetic_markets.json, a CCXT-style markets dict placed by the
+    operator on backtest hosts only. Entries are forced inactive and tagged
+    ``info.synthetic`` so live trading can reject them. ``info.onboardDate`` (ms) is required:
+    it replaces the listing-timestamp probe, which cannot reach a purged market.
+    """
+    ex = to_standard_exchange_name(exchange or "")
+    path = os.path.join("caches", ex, SYNTHETIC_MARKETS_FILENAME)
+    if not os.path.exists(path):
+        return {}
+    with open(path) as f:
+        raw = json.load(f)
+    if not isinstance(raw, dict):
+        raise ValueError(f"{path}: expected a markets dict")
+    synthetic = {}
+    for symbol, market in raw.items():
+        if not isinstance(market, dict) or market.get("symbol") != symbol:
+            raise ValueError(f"{path}: market {symbol!r} must be a dict with matching 'symbol'")
+        info = market.get("info")
+        if not isinstance(info, dict) or float(info.get("onboardDate") or 0) <= 0:
+            raise ValueError(f"{path}: market {symbol!r} needs info.onboardDate (ms)")
+        market = deepcopy(market)
+        market["active"] = False
+        market["info"]["synthetic"] = True
+        synthetic[symbol] = market
+    return synthetic
+
+
+def is_synthetic_market(market) -> bool:
+    return isinstance(market, dict) and bool((market.get("info") or {}).get("synthetic"))
+
+
+def merge_synthetic_markets(exchange: str, markets: dict) -> dict:
+    """Return markets plus synthetic stubs; real exchange markets always win."""
+    added = {k: v for k, v in load_synthetic_markets(exchange).items() if k not in markets}
+    if not added:
+        return markets
+    logging.info("%s: added synthetic backtest markets %s", exchange, ",".join(sorted(added)))
+    return {**markets, **added}
+
+
 async def load_markets(
     exchange: str,
     max_age_ms: int = 1000 * 60 * 60 * 24,
@@ -446,14 +492,15 @@ async def load_markets(
             ):
                 raise ValueError("invalid markets dictionary")
             snapshot_file(markets_path)
-            create_coin_symbol_map_cache(ex, markets, quote=quote, verbose=verbose)
-            logging.info("[offline] loaded cached markets for %s (freshness ignored)", ex)
-            return markets
         except (OSError, ValueError, TypeError) as exc:
             raise OfflineDataError(
                 f"Offline market metadata missing or invalid: {markets_path}. "
                 "Refresh and copy markets.json from a connected host."
             ) from exc
+        markets = merge_synthetic_markets(ex, markets)
+        create_coin_symbol_map_cache(ex, markets, quote=quote, verbose=verbose)
+        logging.info("[offline] loaded cached markets for %s (freshness ignored)", ex)
+        return markets
 
     # Try cache first
     try:
@@ -463,6 +510,7 @@ async def load_markets(
                     markets = json.load(f)
                 if verbose:
                     logging.info(f"{ex} Loaded markets from cache")
+                markets = merge_synthetic_markets(ex, markets)
                 create_coin_symbol_map_cache(ex, markets, quote=quote, verbose=verbose)
                 return markets
     except Exception as e:
@@ -513,6 +561,7 @@ async def load_markets(
             logging.info(f"{ex} Dumped markets to cache")
     except Exception as e:
         logging.error("Error dumping markets to cache at %s: %s", markets_path, e)
+    markets = merge_synthetic_markets(ex, markets)
     create_coin_symbol_map_cache(ex, markets, quote=quote, verbose=verbose)
     return markets
 

@@ -27,6 +27,7 @@ from utils import (
     date_to_ts,
     get_first_ohlcv_iteratively,
     load_ccxt_instance,
+    load_synthetic_markets,
     split_exchange_qualified_market_identifier,
     to_ccxt_exchange_id,
     to_standard_exchange_name,
@@ -538,6 +539,26 @@ async def get_first_timestamps_unified(
             and float(exchange_value) == float(value)
             for exchange_name, exchange_value in ftss_exchange_specific.get(coin, {}).items()
         )
+
+    # Purged perps cannot be probed for their first candle; synthetic backtest markets
+    # declare it as info.onboardDate instead.
+    seed_exchanges = (
+        [exchange]
+        if exchange is not None
+        else ["binanceusdm", "bybit", "okx", "gateio", "bitget", "hyperliquid"]
+    )
+    for ex_name in seed_exchanges:
+        synthetic = load_synthetic_markets(ex_name)
+        for coin in coins:
+            for symbol, market in synthetic.items():
+                if coin not in (symbol, market.get("base")):
+                    continue
+                first_ts = float(market["info"]["onboardDate"])
+                resolved_symbol_cache[(coin, ex_name)] = symbol
+                ftss_exchange_specific.setdefault(coin, {})[ex_name] = first_ts
+                fts_symbols_exchange_specific.setdefault(coin, {})[ex_name] = symbol
+                if not _valid_first_timestamp(ftss.get(coin)) or first_ts < float(ftss[coin]):
+                    ftss[coin] = first_ts
 
     if is_offline():
         for path in (cache_version_fpath, cache_fpath, cache_fpath_exchange_specific,
