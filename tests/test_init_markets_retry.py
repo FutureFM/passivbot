@@ -840,3 +840,32 @@ async def test_protective_refresh_rechecks_newly_held_position_before_applying_o
     with pytest.raises(FatalBotException, match="protective execution requires"):
         await refresh_protective_authoritative_state(bot, require_balance=False)
     assert bot._apply_open_orders_snapshot.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_init_markets_drops_synthetic_backtest_markets(monkeypatch):
+    import passivbot as pb_mod
+
+    synthetic = {"id": "LUNAUSDT", "active": False, "info": {"synthetic": True}}
+
+    async def _load_markets(*_args, **_kwargs):
+        return {"BTC/USDT:USDT": {"id": "BTCUSDT"}, "LUNA/USDT:USDT": synthetic}
+
+    async def _update_exchange_config(_attempt):
+        return None
+
+    seen = []
+
+    def _filter_markets(markets, *_args, **_kwargs):
+        seen.append(set(markets))
+        return (["BTC/USDT:USDT"], [], {})
+
+    monkeypatch.setattr(pb_mod, "load_markets", _load_markets)
+    monkeypatch.setattr(pb_mod, "filter_markets", _filter_markets)
+
+    bot = _FakeBot(_update_exchange_config)
+
+    await pb_mod.Passivbot.init_markets(bot, verbose=False)
+
+    assert bot.markets_dict == {"BTC/USDT:USDT": {"id": "BTCUSDT"}}
+    assert seen == [{"BTC/USDT:USDT"}]

@@ -170,6 +170,7 @@ from utils import (
     ts_to_date,
     format_approved_ignored_coins,
     filter_markets,
+    is_synthetic_market,
     to_ccxt_exchange_id,
     coin_symbol_warning_counts,
     _coins_source_side_is_all,
@@ -3704,9 +3705,11 @@ class Passivbot:
         """Initialize symbol and execution metadata without account/history refresh."""
         # Reuse existing ccxt session when available (ensures shared options such as fetchMarkets types).
         cc_instance = getattr(self, "cca", None)
-        self.markets_dict = await load_markets(
+        markets = await load_markets(
             self.exchange, 0, verbose=False, cc=cc_instance, quote=self.quote
         )
+        # Synthetic markets are backtest-only stubs for purged perps; live never sees them.
+        self.markets_dict = {k: v for k, v in markets.items() if not is_synthetic_market(v)}
         if hasattr(self, "refresh_and_log_user_abstraction_state"):
             await self.refresh_and_log_user_abstraction_state()
         # ineligible symbols cannot open new positions
