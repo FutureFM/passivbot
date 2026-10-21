@@ -161,6 +161,33 @@ volatility figures can be far smaller than Passivbot's minute-resolution
 `-dp quantstats`, `-dp summary` or `-dp`. It requires `quantstats` (in `requirements-full.txt`);
 if it is missing or the report cannot be built, the backtest logs a warning and keeps its results.
 
+Each backtest also writes `trade_distribution.html`, a per-trade view of the strategy:
+
+- A **trade** is one round trip of a (coin, side) position: from the first fill while flat to
+  the fill that brings the position back to exactly zero. Its result is realized PnL plus fees of
+  all its fills, normalized by the wallet balance just before its first fill, so trades from the
+  start and the end of a growing backtest are comparable. Positions still open at the end are
+  excluded from the distribution.
+- The report shows mean/median win and loss, payoff ratio and the break-even win rate it
+  implies, skewness (moment and an outlier-robust quantile version), a tail-severity ladder
+  (how many trades lose more than 0.1%…5% of the balance and their share of all losses), how
+  much of the summed result survives removing the best 0.1–5% of trades, results by number of
+  entry fills (averaging depth), duration, year, coin, exit type, worst/best days, and closed
+  trades per day. A short list of plain-language findings sits at the top.
+- `trades.csv` (one row per trade) and `trade_distribution.json` (all statistics) are written
+  next to it for further analysis.
+
+The report can be generated for existing results and used to compare runs side by side (best
+value per metric highlighted, loss-tail and loss-concentration curves overlaid):
+
+```bash
+python src/trade_distribution_report.py backtests/binance/<run_dir>
+python src/trade_distribution_report.py <run_a> <run_b> --labels a,b --compare comparison.html
+```
+
+Disable it with `-dp trade_distribution`, `-dp summary` or `-dp`. Like the QuantStats report, a
+failure only logs a warning.
+
 Each run also writes `dataset.json`, which points to the exact HLCV cache files used for that
 run. In notebooks or ad-hoc Python analysis you can load the full artifact bundle like this:
 
@@ -238,7 +265,8 @@ the override dataset:
 ## Backtest CLI args
 
 - `-dp` to disable all plotting; `-dp coin_fills` disables only per-coin fill plots,
-  and `-dp pnl` disables both global and per-coin PnL plots.
+  `-dp pnl` disables both global and per-coin PnL plots, and `-dp quantstats` /
+  `-dp trade_distribution` disable the HTML reports.
 - `--suite [y/n]` to override `backtest.suite_enabled` (omit the value to enable, e.g. `--suite`).
 - `--scenarios label1,label2,...` to run only specific scenarios by label (implies `--suite y`).
 - `--suite-config path/to/overrides.json` to merge an additional suite definition onto the base config. Useful when you want to keep suite definitions outside the main config file.

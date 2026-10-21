@@ -179,13 +179,14 @@ import passivbot_rust as pbr  # noqa: E402
 verify_loaded_runtime_extension()
 from tools.event_loop_policy import set_windows_event_loop_policy
 
-PLOT_GROUP_SUMMARY = {"balance", "twe", "pnl", "hard_stop", "quantstats"}
+PLOT_GROUP_SUMMARY = {"balance", "twe", "pnl", "hard_stop", "quantstats", "trade_distribution"}
 PLOT_GROUP_ALL = PLOT_GROUP_SUMMARY | {"coin_fills"}
 DISABLE_PLOTTING_HELP = (
     "Disable selected plot groups. Use without a value to disable all plotting. "
-    "Allowed values: all, summary, balance, twe, pnl, hard_stop, quantstats, coin_fills, "
-    "or a comma-separated combination. summary disables balance, twe, pnl, "
-    "hard_stop and the quantstats HTML report; coin_fills disables per-coin fill plots only."
+    "Allowed values: all, summary, balance, twe, pnl, hard_stop, quantstats, "
+    "trade_distribution, coin_fills, or a comma-separated combination. summary disables "
+    "balance, twe, pnl, hard_stop and the quantstats and trade_distribution HTML reports; "
+    "coin_fills disables per-coin fill plots only."
 )
 HLCVS_CACHE_ROOT = Path("caches") / "hlcvs_data"
 HLCVS_CACHE_HASH_LEN = 16
@@ -233,7 +234,7 @@ def parse_disabled_plot_groups(value) -> set[str]:
         else:
             raise ValueError(
                 "disable_plotting must be one of all, summary, balance, twe, pnl, hard_stop, "
-                "quantstats, coin_fills"
+                "quantstats, trade_distribution, coin_fills"
             )
     return disabled
 
@@ -3117,6 +3118,16 @@ def post_process(
 
         write_quantstats_report(
             bal_eq, results_path, title=f"{label_prefix}Passivbot {exchange} backtest".strip()
+        )
+    if "trade_distribution" not in disabled_plot_groups:
+        from trade_distribution_report import write_trade_distribution_report
+
+        write_trade_distribution_report(
+            fdf,
+            results_path,
+            title=f"{label_prefix}Passivbot {exchange} trade distribution".strip(),
+            start=bal_eq.index.min() if not bal_eq.empty else None,
+            end=bal_eq.index.max() if not bal_eq.empty else None,
         )
     if "coin_fills" not in disabled_plot_groups:
         try:

@@ -80,6 +80,7 @@ exposure cap IS modeled on GPU (`mps_ema_anchor_directional.metal` `entry_cap`, 
 | Time-based stops: reduce-only market closes (`close_time_stop_<side>`) after N days; clock and partial-close target are reconstructed from fills + client order IDs (target encoded in the ID), no local timer | `risk.time_stop_*` | `docs/ai/features/time_stop.md`, `docs/time_stop.md` | Rust `calc_time_stop_close` in `orchestrator.rs`; `src/time_stop.py` (`reconstruct_episodes`, ID encode/decode), `src/passivbot.py`, `src/live/reconciler.py` |
 | `pnl_by_coin.png` backtest chart | — | `docs/backtesting.md` | `src/plotting.py` |
 | `quantstats_report.html` tearsheet of daily strategy-equity returns (optional dep, never fails the backtest) | `-dp quantstats` disables | `docs/backtesting.md` | `src/quantstats_report.py`, called from `src/backtest.py` |
+| `trade_distribution.html` per-trade PnL distribution (round trips normalized by balance at open; optional, never fails the backtest) + `--compare` mode across runs | `-dp trade_distribution` disables | `docs/backtesting.md` | `src/trade_distribution_report.py`, called from `src/backtest.py` |
 
 Shared mechanics worth knowing: `time_stop.reconstruct_episodes` replays the fill stream to rebuild
 the time-stop clock and target; missing/ambiguous evidence yields `None`, which Rust treats as
@@ -88,5 +89,5 @@ optimizer bounds must survive both config loading (`config/hydrate.py`) and clea
 (`preserve_optional_adaptive_bounds` in `config/optimize_bounds.py`). Integer-valued bot params
 coming from the optimizer arrive as floats (see `divergence_min_timeframes` in `python.rs`).
 Tests: `tests/test_historical_selection.py`, `test_divergence_inputs.py`, `test_time_stop.py`,
-`test_orchestrator_json_api.py`, `test_pnl_by_coin_plot.py`,
+`test_orchestrator_json_api.py`, `test_pnl_by_coin_plot.py`, `test_trade_distribution_report.py`,
 `tests/optimization/test_gpu_cpu_only_features.py`.
