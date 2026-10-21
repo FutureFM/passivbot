@@ -41,7 +41,7 @@ from candlestick_manager import (
     OhlcvTerminalEmptyPage,
     fetch_candles_with_resolution_ladder,
 )
-from divergence_inputs import collect_divergence_rocs
+from divergence_inputs import collect_divergence_inputs, hold_history_minutes
 from fill_events_manager import (
     FillEventCacheContractError,
     FillEventsManager,
@@ -1975,11 +1975,15 @@ class Passivbot:
             }
         )
         # Divergence can extend a held position's cooldown up to the configured ceiling
-        # (or 24 hours, matching Rust); fill lookbacks must cover that extension.
-        if (
-            horizon > 0.0
-            and bool(self.bp(pside, "divergence_filter_enabled", symbol))
-            and float(self.bp(pside, "divergence_delay_multiplier", symbol)) > 1.0
+        # (or 24 hours, matching Rust); fill lookbacks must cover that extension. The additive
+        # terms apply even when the adaptive duration is zero.
+        if bool(self.bp(pside, "divergence_filter_enabled", symbol)) and (
+            (
+                horizon > 0.0
+                and float(self.bp(pside, "divergence_delay_multiplier", symbol)) > 1.0
+            )
+            or float(self.bp(pside, "divergence_delay_add_minutes", symbol) or 0.0) > 0.0
+            or float(self.bp(pside, "divergence_market_delay_add_minutes", symbol) or 0.0) > 0.0
         ):
             ceiling = self.bp(pside, "entry_cooldown_max_duration_minutes", symbol)
             horizon = max(horizon, 1440.0 if ceiling is None else float(ceiling))
@@ -15046,6 +15050,10 @@ class Passivbot:
             "divergence_we_cap_pct",
             "divergence_min_timeframes",
             "divergence_extended_horizons",
+            "divergence_hold_minutes",
+            "divergence_persistence_pct",
+            "divergence_delay_add_minutes",
+            "divergence_market_delay_add_minutes",
             "entry_cooldown_min_duration_minutes",
             "entry_cooldown_max_duration_minutes",
             "entry_cooldown_weights_minutes",
@@ -17975,8 +17983,23 @@ class Passivbot:
             "long": self._bot_params_to_rust_dict("long", None),
             "short": self._bot_params_to_rust_dict("short", None),
         }
-        divergence_rocs = (
-            await collect_divergence_rocs(
+        divergence_rocs: dict = {}
+        divergence_held: dict = {}
+        if any(global_bp[side]["divergence_filter_enabled"] for side in ("long", "short")):
+            symbol_bp = {
+                side: [self._bot_params_to_rust_dict(side, symbol) for symbol in symbols]
+                for side in ("long", "short")
+            }
+            hold_minutes = max(
+                (
+                    float(bp.get("divergence_hold_minutes") or 0.0)
+                    for side in ("long", "short")
+                    for bp in symbol_bp[side]
+                    if bp.get("divergence_filter_enabled")
+                ),
+                default=0.0,
+            )
+            divergence_rocs, divergence_history = await collect_divergence_inputs(
                 self.cm,
                 symbols,
                 now_ms,
@@ -17985,10 +18008,26 @@ class Passivbot:
                     and global_bp[side]["divergence_extended_horizons"]
                     for side in ("long", "short")
                 ),
+                history_minutes=hold_history_minutes(hold_minutes),
             )
-            if any(global_bp[side]["divergence_filter_enabled"] for side in ("long", "short"))
-            else {}
-        )
+            if divergence_history:
+                # The latch is rebuilt from completed candles every cycle (no local state),
+                # matching the backtest's incremental state over the same window.
+                held = json.loads(
+                    pbr.divergence_held_intensity_json(
+                        json.dumps(
+                            {
+                                "history": divergence_history,
+                                "long": symbol_bp["long"],
+                                "short": symbol_bp["short"],
+                            }
+                        )
+                    )
+                )
+                divergence_held = {
+                    symbol: [float(held["long"][i]), float(held["short"][i])]
+                    for i, symbol in enumerate(symbols)
+                }
         # Effective hedge_mode = config setting AND exchange capability.
         # If either is False, we block same-coin hedging in the orchestrator.
         effective_hedge_mode = self._config_hedge_mode and self.hedge_mode
@@ -18114,6 +18153,7 @@ class Passivbot:
                 {
                     "symbol_idx": int(idx),
                     "divergence_roc_pct": divergence_rocs.get(symbol, [None] * 6),
+                    "divergence_held_intensity": divergence_held.get(symbol, [0.0, 0.0]),
                     "order_book": {"bid": bid, "ask": ask},
                     "exchange": Passivbot._orchestrator_exchange_params(self, symbol),
                     "tradable": tradable,

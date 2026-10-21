@@ -1,7 +1,12 @@
 import numpy as np
 import pytest
 
-from divergence_inputs import collect_divergence_rocs, roc_from_candles
+from divergence_inputs import (
+    collect_divergence_inputs,
+    collect_divergence_rocs,
+    hold_history_minutes,
+    roc_from_candles,
+)
 from config.schema import get_template_config
 from config.validate import validate_config
 
@@ -65,6 +70,40 @@ async def test_live_inputs_require_three_symbols_and_log_missing_coverage(caplog
     assert all(kwargs["start_ts"] == end_ts - 4320 * 60_000 for _, kwargs in cm.calls)
 
 
+@pytest.mark.asyncio
+async def test_hold_history_rows_cover_window_plus_hold_in_symbol_order():
+    assert hold_history_minutes(0.0) == 0
+    assert hold_history_minutes(720.0) == 780
+    end_ts = 10_000 * 60_000
+    history_minutes = 5
+
+    class Manager:
+        def __init__(self):
+            self.calls = []
+
+        async def get_candles(self, symbol, **kwargs):
+            self.calls.append(kwargs)
+            ts = np.arange(kwargs["start_ts"], kwargs["end_ts"] + 1, 60_000)
+            # Symbol A halves at the last two minutes; others are flat.
+            close = np.where((symbol == "A") & (ts >= end_ts - 60_000), 50.0, 100.0)
+            return np.array(list(zip(ts, close, close, close, close, close)),
+                            dtype=[("ts", "i8"), ("o", "f4"), ("h", "f4"),
+                                   ("l", "f4"), ("c", "f4"), ("bv", "f4")])
+
+    cm = Manager()
+    rocs, history = await collect_divergence_inputs(
+        cm, ["A", "B", "C"], end_ts + 60_000, history_minutes=history_minutes
+    )
+    assert all(kw["start_ts"] == end_ts - (240 + history_minutes - 1) * 60_000 for kw in cm.calls)
+    assert len(history) == history_minutes and all(len(step) == 3 for step in history)
+    # The last history row is the latest ROC row; older rows precede the drop.
+    assert history[-1] == [rocs["A"], rocs["B"], rocs["C"]]
+    assert history[-1][0][0] == pytest.approx(-50.0)
+    assert history[0][0][0] == pytest.approx(0.0)
+    rocs_only, empty = await collect_divergence_inputs(cm, ["A", "B", "C"], end_ts + 60_000)
+    assert empty == [] and rocs_only == rocs
+
+
 @pytest.mark.parametrize(
     "key,value",
     [
@@ -74,6 +113,10 @@ async def test_live_inputs_require_three_symbols_and_log_missing_coverage(caplog
         ("divergence_we_cap_pct", 0.0),
         ("divergence_min_timeframes", 5),
         ("divergence_extended_horizons", 1),
+        ("divergence_hold_minutes", -1.0),
+        ("divergence_persistence_pct", 101.0),
+        ("divergence_delay_add_minutes", -1.0),
+        ("divergence_market_delay_add_minutes", -5.0),
     ],
 )
 def test_invalid_divergence_configuration_is_rejected(key, value):
@@ -109,6 +152,28 @@ def test_live_cooldown_lookback_covers_divergence_extension(enabled, multiplier,
         "entry_cooldown_weights_minutes": {"exposure_ratio": 0.0, "adverse_directionality": 0.0},
         "divergence_filter_enabled": enabled,
         "divergence_delay_multiplier": multiplier,
+        "divergence_delay_add_minutes": 0.0,
+        "divergence_market_delay_add_minutes": 0.0,
     }
     bot = SimpleNamespace(bp=lambda pside, key, symbol=None: values[key])
     assert Passivbot._entry_cooldown_horizon(bot, "long") == expected
+
+
+def test_live_cooldown_lookback_covers_additive_divergence_delay_with_zero_cooldown():
+    from types import SimpleNamespace
+    from passivbot import Passivbot
+
+    values = {
+        "risk_entry_cooldown_minutes": 0.0,
+        "entry_cooldown_min_duration_minutes": 0.0,
+        "entry_cooldown_max_duration_minutes": None,
+        "entry_cooldown_weights_minutes": {"exposure_ratio": 0.0, "adverse_directionality": 0.0},
+        "divergence_filter_enabled": True,
+        "divergence_delay_multiplier": 30.0,
+        "divergence_delay_add_minutes": 0.0,
+        "divergence_market_delay_add_minutes": 15.0,
+    }
+    bot = SimpleNamespace(bp=lambda pside, key, symbol=None: values[key])
+    assert Passivbot._entry_cooldown_horizon(bot, "long") == 1440.0
+    values["divergence_market_delay_add_minutes"] = 0.0
+    assert Passivbot._entry_cooldown_horizon(bot, "long") == 0.0

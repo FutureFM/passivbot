@@ -455,6 +455,10 @@ mod core {
         /// Completed 1m close ROC in percent for 5/15/60/240/1440/4320 minute horizons.
         #[serde(default)]
         pub divergence_roc_pct: crate::divergence::DivergenceRocs,
+        /// Latched divergence intensity `[long, short]` from `divergence_hold_minutes`
+        /// (0 = none). The caller rebuilds it from completed-candle history.
+        #[serde(default)]
+        pub divergence_held_intensity: [f64; 2],
         pub order_book: OrderBook, // must have bid>0 and ask>0
         pub exchange: ExchangeParams,
         pub tradable: bool,
@@ -2973,11 +2977,15 @@ mod core {
     /// Divergence extends the adaptive cooldown of a held position by its severity-scaled
     /// multiplier. The result is capped by the configured ceiling (or 24 hours) but never
     /// shortened below the adaptive duration; flat positions keep the unmodified cooldown.
+    /// Held-position cooldown under divergence: `minutes * multiplier + add_minutes`, capped by
+    /// `entry_cooldown.max_duration_minutes` (1440 when unset) and never below `minutes`.
+    /// The multiplier leaves a zero cooldown at zero; the additive term does not.
     fn divergence_scaled_cooldown(
         minutes: f64,
         side: &SymbolSideInput,
         symbol_idx: usize,
         divergence_multiplier: f64,
+        add_minutes: f64,
     ) -> Result<f64, OrchestratorError> {
         if !divergence_multiplier.is_finite() || divergence_multiplier < 1.0 {
             return Err(OrchestratorError::NonFiniteInput {
@@ -2985,7 +2993,13 @@ mod core {
                 symbol_idx: Some(symbol_idx),
             });
         }
-        if side.position.size == 0.0 || minutes == 0.0 || divergence_multiplier == 1.0 {
+        if !add_minutes.is_finite() || add_minutes < 0.0 {
+            return Err(OrchestratorError::NonFiniteInput {
+                field: "divergence_delay_add_minutes",
+                symbol_idx: Some(symbol_idx),
+            });
+        }
+        if side.position.size == 0.0 || (divergence_multiplier == 1.0 && add_minutes == 0.0) {
             return Ok(minutes);
         }
         let ceiling = side
@@ -2993,7 +3007,7 @@ mod core {
             .entry_cooldown_max_duration_minutes
             .unwrap_or(1440.0)
             .max(minutes);
-        Ok((minutes * divergence_multiplier).min(ceiling))
+        Ok((minutes * divergence_multiplier + add_minutes).min(ceiling))
     }
 
     fn signed_unilateralness(
@@ -3133,7 +3147,7 @@ mod core {
         pside: PositionSide,
         cache: &mut [CachedSideDerived],
         runtime_budget: RuntimeBudgetState,
-        divergence_delay_multiplier: f64,
+        divergence_delay: (f64, f64),
         wants_entries: bool,
         wants_closes: bool,
     ) -> Result<(Vec<IdealOrder>, Vec<IdealOrder>), OrchestratorError> {
@@ -3201,7 +3215,8 @@ mod core {
                 effective_cooldown(symbol, pside, input.balance, runtime_budget)?,
                 side,
                 symbol.symbol_idx,
-                divergence_delay_multiplier,
+                divergence_delay.0,
+                divergence_delay.1,
             )?
         } else {
             0.0
@@ -3264,7 +3279,7 @@ mod core {
         pside: PositionSide,
         cache: &mut [CachedSideDerived],
         runtime_budget: RuntimeBudgetState,
-        divergence_delay_multiplier: f64,
+        divergence_delay: (f64, f64),
         wants_entries: bool,
         wants_closes: bool,
         diagnostics: &mut OrchestratorDiagnostics,
@@ -3300,7 +3315,7 @@ mod core {
                 pside,
                 cache,
                 runtime_budget,
-                divergence_delay_multiplier,
+                divergence_delay,
                 request_entries,
                 request_closes,
             ) {
@@ -3782,9 +3797,32 @@ mod core {
             let rocs: Vec<_> = input.symbols.iter().map(|s| s.divergence_roc_pct).collect();
             let long_params: Vec<_> = input.symbols.iter().map(|s| &s.long.bot_params).collect();
             let short_params: Vec<_> = input.symbols.iter().map(|s| &s.short.bot_params).collect();
+            let held = |raw: Vec<crate::divergence::DivergenceEffect>,
+                        params: &[&BotParams],
+                        side: usize| {
+                raw.into_iter()
+                    .zip(input.symbols.iter().zip(params.iter()))
+                    .map(|(effect, (symbol, p))| {
+                        let value = symbol.divergence_held_intensity[side];
+                        if value.is_finite() && value > 0.0 {
+                            crate::divergence::with_held_intensity(effect, value, p)
+                        } else {
+                            effect
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            };
             (
-                crate::divergence::detect(&rocs, &long_params, false),
-                crate::divergence::detect(&rocs, &short_params, true),
+                held(
+                    crate::divergence::detect(&rocs, &long_params, false),
+                    &long_params,
+                    0,
+                ),
+                held(
+                    crate::divergence::detect(&rocs, &short_params, true),
+                    &short_params,
+                    1,
+                ),
             )
         } else {
             (
@@ -4266,7 +4304,10 @@ mod core {
                                 PositionSide::Long,
                                 &mut workspace.derived_long,
                                 workspace.runtime_budget_long[s.symbol_idx],
-                                divergence_long[s.symbol_idx].delay_multiplier,
+                                (
+                                    divergence_long[s.symbol_idx].delay_multiplier,
+                                    divergence_long[s.symbol_idx].delay_add_minutes,
+                                ),
                                 wants_entries,
                                 wants_closes,
                                 &mut diagnostics,
@@ -4382,7 +4423,10 @@ mod core {
                                 PositionSide::Short,
                                 &mut workspace.derived_short,
                                 workspace.runtime_budget_short[s.symbol_idx],
-                                divergence_short[s.symbol_idx].delay_multiplier,
+                                (
+                                    divergence_short[s.symbol_idx].delay_multiplier,
+                                    divergence_short[s.symbol_idx].delay_add_minutes,
+                                ),
                                 wants_entries,
                                 wants_closes,
                                 &mut diagnostics,
@@ -5183,6 +5227,7 @@ mod core {
             SymbolInput {
                 symbol_idx: idx,
                 divergence_roc_pct: [None; 6],
+                divergence_held_intensity: [0.0; 2],
                 order_book: OrderBook {
                     bid: 100.0,
                     ask: 100.0,
@@ -9303,7 +9348,7 @@ mod core {
             let mut side = make_basic_symbol(0).long;
             // Flat positions keep the adaptive duration.
             assert_eq!(
-                divergence_scaled_cooldown(10.0, &side, 0, 4.0).unwrap(),
+                divergence_scaled_cooldown(10.0, &side, 0, 4.0, 0.0).unwrap(),
                 10.0
             );
             side.position = Position {
@@ -9311,26 +9356,49 @@ mod core {
                 price: 100.0,
             };
             assert_eq!(
-                divergence_scaled_cooldown(10.0, &side, 0, 4.0).unwrap(),
+                divergence_scaled_cooldown(10.0, &side, 0, 4.0, 0.0).unwrap(),
                 40.0
             );
-            assert_eq!(divergence_scaled_cooldown(0.0, &side, 0, 4.0).unwrap(), 0.0);
+            assert_eq!(
+                divergence_scaled_cooldown(0.0, &side, 0, 4.0, 0.0).unwrap(),
+                0.0
+            );
             // Without an explicit ceiling the extension stops at 24 hours.
             assert_eq!(
-                divergence_scaled_cooldown(600.0, &side, 0, 4.0).unwrap(),
+                divergence_scaled_cooldown(600.0, &side, 0, 4.0, 0.0).unwrap(),
                 1440.0
             );
             side.bot_params.entry_cooldown_max_duration_minutes = Some(30.0);
             assert_eq!(
-                divergence_scaled_cooldown(10.0, &side, 0, 4.0).unwrap(),
+                divergence_scaled_cooldown(10.0, &side, 0, 4.0, 0.0).unwrap(),
                 30.0
             );
             // The ceiling never shortens the adaptive duration itself.
             assert_eq!(
-                divergence_scaled_cooldown(45.0, &side, 0, 4.0).unwrap(),
+                divergence_scaled_cooldown(45.0, &side, 0, 4.0, 0.0).unwrap(),
                 45.0
             );
-            assert!(divergence_scaled_cooldown(10.0, &side, 0, 0.5).is_err());
+            assert!(divergence_scaled_cooldown(10.0, &side, 0, 0.5, 0.0).is_err());
+            // Additive minutes apply even to a zero cooldown, within the ceiling.
+            side.bot_params.entry_cooldown_max_duration_minutes = None;
+            assert_eq!(
+                divergence_scaled_cooldown(0.0, &side, 0, 4.0, 15.0).unwrap(),
+                15.0
+            );
+            assert_eq!(
+                divergence_scaled_cooldown(10.0, &side, 0, 1.0, 5.0).unwrap(),
+                15.0
+            );
+            assert_eq!(
+                divergence_scaled_cooldown(0.0, &side, 0, 1.0, 5000.0).unwrap(),
+                1440.0
+            );
+            assert!(divergence_scaled_cooldown(0.0, &side, 0, 1.0, -1.0).is_err());
+            side.position.size = 0.0;
+            assert_eq!(
+                divergence_scaled_cooldown(0.0, &side, 0, 4.0, 15.0).unwrap(),
+                0.0
+            );
         }
     }
 }

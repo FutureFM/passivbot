@@ -2577,6 +2577,75 @@ def test_divergence_caps_only_isolated_long_drop():
     assert protected_entry["qty"] < unprotected_entry["qty"]
 
 
+def test_divergence_held_intensity_caps_entries_without_instantaneous_flag():
+    import passivbot_rust as pbr
+
+    strategy = {"base_qty_pct": 0.1, "ema_span_0": 10.0, "ema_span_1": 20.0,
+                "offset": 0.0, "offset_psize_weight": 0.0}
+    protection = {
+        "divergence_filter_enabled": True,
+        "divergence_zscore_threshold": 1.0,
+        "divergence_breadth_threshold_pct": 40.0,
+        "divergence_breadth_drop_pct": 1.0,
+        "divergence_min_timeframes": 2,
+        "divergence_we_cap_pct": 0.5,
+        "divergence_hold_minutes": 720.0,
+    }
+
+    def entry_qty(held):
+        symbols = [
+            make_symbol(i, bid=100.0, ask=100.0,
+                        long_mode="normal" if i == 0 else "manual",
+                        long_bp=protection, long_strategy=strategy, short_strategy=strategy)
+            for i in range(3)
+        ]
+        # The instantaneous detector is quiet (no outlier); only the latch protects.
+        for symbol in symbols:
+            symbol["divergence_roc_pct"] = [0.0, 0.0, None, None, None, None]
+        symbols[0]["divergence_held_intensity"] = [held, 0.0]
+        out = compute(pbr, make_input(balance=1_000.0, strategy_kind="ema_anchor", symbols=symbols))
+        return next(o["qty"] for o in out["orders"] if o["symbol_idx"] == 0 and o["qty"] > 0)
+
+    assert entry_qty(1.0) < entry_qty(0.0)
+    assert entry_qty(0.0) == entry_qty(0.0)
+
+
+def test_divergence_held_intensity_json_replays_candle_history():
+    import json
+    import passivbot_rust as pbr
+
+    params = {
+        "divergence_filter_enabled": True,
+        "divergence_zscore_threshold": 1.0,
+        "divergence_breadth_threshold_pct": 40.0,
+        "divergence_breadth_drop_pct": 1.0,
+        "divergence_min_timeframes": 2,
+        "divergence_hold_minutes": 30.0,
+        "divergence_persistence_pct": 50.0,
+    }
+    params = bot_params_pair(long_overrides=params)["long"]
+    crash = [-50.0, -50.0, None, None, None, None]
+    flat = [0.0, 0.0, None, None, None, None]
+    # 40 crashed minutes then 20 quiet ones: persistent (>= 30 of the last 60) and latched.
+    history = [[crash if t < 40 else flat, flat, flat, flat] for t in range(60)]
+    out = json.loads(pbr.divergence_held_intensity_json(json.dumps(
+        {"history": history, "long": [params] * 4, "short": [params] * 4}
+    )))
+    assert out["long"][0] > 0.0
+    assert out["long"][1:] == [0.0, 0.0, 0.0]
+    assert out["short"] == [0.0] * 4
+    # Disabled hold returns zeros without replaying.
+    off = dict(params, divergence_hold_minutes=0.0)
+    out = json.loads(pbr.divergence_held_intensity_json(json.dumps(
+        {"history": history, "long": [off] * 4, "short": [off] * 4}
+    )))
+    assert out["long"] == [0.0] * 4
+    with pytest.raises(ValueError, match="must match"):
+        pbr.divergence_held_intensity_json(json.dumps(
+            {"history": [[flat] * 3], "long": [params] * 4, "short": [params] * 4}
+        ))
+
+
 def test_divergence_extended_horizons_keep_multi_day_collapse_protected():
     import passivbot_rust as pbr
 
@@ -2637,6 +2706,41 @@ def test_divergence_extends_reentry_cooldown_only_for_flagged_symbol():
     symbols[2]["divergence_roc_pct"] = [None] * 6
     clear = compute(pbr, inp)
     assert any(o["symbol_idx"] == 0 and o["qty"] > 0 for o in clear["orders"])
+
+
+def test_market_delay_adds_cooldown_to_zero_cooldown_held_position_in_broad_drop():
+    import passivbot_rust as pbr
+
+    def has_entry(market_add):
+        protection = {
+            "divergence_filter_enabled": True,
+            "divergence_zscore_threshold": 1.0,
+            "divergence_breadth_threshold_pct": 40.0,
+            "divergence_breadth_drop_pct": 1.0,
+            "divergence_min_timeframes": 2,
+            "divergence_we_cap_pct": 1.0,
+            "divergence_delay_multiplier": 30.0,
+            "divergence_market_delay_add_minutes": market_add,
+            "risk_entry_cooldown_minutes": 0.0,
+        }
+        symbols = [make_symbol(i, bid=100.0, ask=100.0,
+                               long_pos_size=1.0 if i == 0 else 0.0,
+                               long_pos_price=100.0 if i == 0 else 0.0,
+                               long_mode="normal" if i == 0 else "manual",
+                               long_bp=protection) for i in range(3)]
+        inp = make_input(balance=1_000.0, symbols=symbols)
+        inp["timestamp_ms"] = 180_000
+        symbols[0]["long"]["last_increase_fill_timestamp_ms"] = 60_000
+        # Every coin drops: no outlier, but every horizon shows a market-wide adverse move.
+        for symbol in symbols:
+            symbol["divergence_roc_pct"] = [-10.0, -10.0, -10.0, -10.0, None, None]
+        out = compute(pbr, inp)
+        return any(o["symbol_idx"] == 0 and o["qty"] > 0 for o in out["orders"])
+
+    # Multiplicative delay alone leaves a zero cooldown at zero.
+    assert has_entry(0.0)
+    # 15 extra minutes under full market stress block the re-entry 2 minutes after a fill.
+    assert not has_entry(15.0)
 
 
 def test_divergence_caps_isolated_short_pump_but_not_broad_pump():

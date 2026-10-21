@@ -6,6 +6,17 @@ since the latest release tag; these features may already be available when insta
 
 ## Unreleased
 
+- Add an optional latch to divergence protection (`bot.<side>.risk.divergence_hold_minutes`,
+  default `0` = off; `divergence_persistence_pct`, default `70`). A coin flagged on at least that
+  share of the last 60 minutes keeps its strongest severity for the hold period, so protection no
+  longer flickers off during brief rebounds or market-wide sell-offs. Live rebuilds the latch from
+  completed 1m candles each cycle (no local state); backtests update it every candle.
+
+- Add additive divergence cooldowns for held positions (`divergence_delay_add_minutes`,
+  `divergence_market_delay_add_minutes`, default `0`). They slow re-entries during a coin's
+  divergence or a market-wide sell-off even when the regular entry cooldown is zero, which the
+  multiplicative `divergence_delay_multiplier` cannot do.
+
 - Write `quantstats_report.html` after each backtest: a QuantStats tearsheet of daily
   strategy-equity returns benchmarked against BTC, using the backtest's own BTC prices (offline). Disable with `-dp quantstats`. Daily closes
   understate intraday drawdowns; the analysis metrics remain the risk reference.

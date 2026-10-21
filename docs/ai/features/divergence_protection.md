@@ -8,6 +8,8 @@
 - A coin is protected after at least `min_timeframes` horizons flag it. Severity is `clamp(abs(worst_z) / zscore_threshold - 1, 0, 1)`, or 1 when the configured threshold is zero.
 - The effective per-symbol WEL becomes `base_WEL * (1 + severity * (we_cap_pct - 1))`. The base is recomputed each decision; the cap does not accumulate. Only `0 < we_cap_pct < 1` changes WEL. The reduced WEL governs entries (including the `ema_anchor` per-position entry cap) and time-stop triggers, but not the time-stop reduction cap.
 - For an existing position, the adaptive entry cooldown (`bot.<side>.entry_cooldown`) is multiplied by `1 + severity * (delay_multiplier - 1)` and capped by `entry_cooldown.max_duration_minutes` (1440 when unset), never below the adaptive duration. A zero cooldown stays zero. The divergence multiplier does not extend initial-entry cooldown when the position is flat. Closes and independent risk reducers remain available. GPU screening does not model divergence: it warns, pins divergence bounds to the configured values, and exact CPU validation of accepted results applies it.
+- `divergence_hold_minutes` (default 0, off) latches persistent flags. Each decision candle, a coin's instantaneous protection counts as one flagged minute; when at least `divergence_persistence_pct` (default 70) of the trailing 60 minutes are flagged, the window's highest severity is latched. The held severity is the maximum latched value over the trailing `divergence_hold_minutes`, and the applied severity is `max(instantaneous, held)` — the latch only strengthens protection. The state depends only on detector history inside `60 + hold` minutes: the backtest updates it every candle (including warmup) and live replays that window from completed 1m candles each cycle through `divergence_held_intensity_json`, so restarts reproduce it without local state. Motivation: when a coin collapses during a market-wide sell-off, brief rebounds reset the short horizons and breadth suppresses the 1d/3d horizons, so the instantaneous flag flickers and entries refill the full WEL in the gaps.
+- Additive delays (defaults 0): a held position's cooldown becomes `adaptive * delay_multiplier_effect + divergence_delay_add_minutes * severity + divergence_market_delay_add_minutes * market_stress`, capped by `entry_cooldown.max_duration_minutes` (1440 when unset) and never below the adaptive duration. `market_stress` is the share of the coin's evaluated horizons suppressed by the breadth rule (a market-wide adverse move for that side); it applies to all held positions on the side, including non-outliers. Unlike the multiplier, the additive terms act when the adaptive cooldown is zero. Flat positions are unaffected. Live fill lookbacks extend to the cooldown ceiling whenever an additive term is configured.
 - Detection is disabled by default on both sides. A missing population never produces a protective signal, matching the PB7 backtest behavior. Live reports missing candle coverage. This does not predict a sudden crash or prevent orders already filled before the completed candle is available.
 
 ## Configuration
@@ -24,6 +26,10 @@ The fields live under `bot.<long|short>.risk`:
 | `divergence_extended_horizons` | `false` | Add the 1440 and 4320 minute horizons. Live then fetches three days of 1m candles per symbol. |
 | `divergence_delay_multiplier` | `1.0` | Full-severity entry-cooldown multiplier. |
 | `divergence_we_cap_pct` | `1.0` | Full-severity WEL fraction. |
+| `divergence_hold_minutes` | `0.0` | Minutes a persistent flag stays latched; 0 disables. |
+| `divergence_persistence_pct` | `70.0` | Share of the trailing 60 minutes that must be flagged to latch. |
+| `divergence_delay_add_minutes` | `0.0` | Held-position cooldown minutes added at full severity. |
+| `divergence_market_delay_add_minutes` | `0.0` | Held-position cooldown minutes added at full market-wide stress. |
 
 With only three coins, the largest possible absolute population z-score for one isolated outlier is `sqrt(2) ≈ 1.414`. A threshold of 2.0 therefore needs at least six valid coins to flag a lone outlier; use a lower threshold if operating with only three to five coins.
 
@@ -40,4 +46,4 @@ To tune the six numeric fields, add only the desired keys under `optimize.bounds
 - `passivbot-rust/src/divergence.rs`: shared detector and severity.
 - `passivbot-rust/src/orchestrator.rs`: WEL and cooldown effects.
 - `passivbot-rust/src/backtest.rs`: historical ROC preparation. Horizons are converted to backtest candles; a horizon that is not a whole number of candles (e.g. 5 minutes with 15 minute candles) yields no signal.
-- `src/divergence_inputs.py`: live completed-candle ROC preparation.
+- `src/divergence_inputs.py`: live completed-candle ROC preparation and hold-latch ROC history.

@@ -118,6 +118,10 @@ fn passivbot_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
         entry_cooldown::entry_cooldown_durations_json,
         m
     )?)?;
+    m.add_function(wrap_pyfunction!(
+        divergence::divergence_held_intensity_json,
+        m
+    )?)?;
     m.add_function(wrap_pyfunction!(runtime_build_info, m)?)?;
     m.add_function(wrap_pyfunction!(hsl::signal_py, m)?)?;
     m.add_function(wrap_pyfunction!(hsl_controller::hsl_controller, m)?)?;
