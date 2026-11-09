@@ -1353,8 +1353,8 @@ impl<'a> Backtest<'a> {
         if !long.divergence_filter_enabled && !short.divergence_filter_enabled {
             return [None; 6];
         }
-        let extended = (long.divergence_filter_enabled && long.divergence_extended_horizons)
-            || (short.divergence_filter_enabled && short.divergence_extended_horizons);
+        let extended = crate::divergence::uses_day_horizons(long)
+            || crate::divergence::uses_day_horizons(short);
         std::array::from_fn(|tf| {
             if tf >= crate::divergence::BASE_HORIZON_COUNT && !extended {
                 return None;

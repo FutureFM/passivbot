@@ -2418,6 +2418,21 @@ fn bot_params_from_dict(dict: &PyDict, hsl: bool) -> PyResult<BotParams> {
             "divergence_market_delay_add_minutes",
             0.0,
         )?,
+        divergence_long_horizon_minutes: extract_optional_f64_or(
+            dict,
+            "divergence_long_horizon_minutes",
+            0.0,
+        )?,
+        divergence_long_horizon_zscore: extract_optional_f64_or(
+            dict,
+            "divergence_long_horizon_zscore",
+            3.0,
+        )?,
+        divergence_cap_entries_only: extract_optional_bool(
+            dict,
+            "divergence_cap_entries_only",
+            false,
+        )?,
         n_positions,
         total_wallet_exposure_limit,
         wallet_exposure_limit,

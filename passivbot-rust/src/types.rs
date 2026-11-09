@@ -510,6 +510,9 @@ fn default_divergence_min_timeframes() -> usize {
 fn default_divergence_persistence_pct() -> f64 {
     70.0
 }
+fn default_divergence_long_horizon_zscore() -> f64 {
+    3.0
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -617,6 +620,17 @@ pub struct BotParams {
     /// market-wide adverse move (scaled by the suppressed share).
     #[serde(default)]
     pub divergence_market_delay_add_minutes: f64,
+    /// Robust market-relative horizon (minutes; 0 = off, else 1440 or 4320): the median/MAD
+    /// z of the coin's log return over this horizon, never muted by breadth, counts as one
+    /// more flagged timeframe when beyond `divergence_long_horizon_zscore`.
+    #[serde(default)]
+    pub divergence_long_horizon_minutes: f64,
+    #[serde(default = "default_divergence_long_horizon_zscore")]
+    pub divergence_long_horizon_zscore: f64,
+    /// Apply `divergence_we_cap_pct` to new entries only; held positions keep the base WEL
+    /// for closes, unstuck, time stops and the position-exposure enforcer.
+    #[serde(default)]
+    pub divergence_cap_entries_only: bool,
     #[serde(default)]
     pub entry_cooldown_min_duration_minutes: f64,
     #[serde(default)]
@@ -702,6 +716,9 @@ impl Default for BotParams {
             divergence_persistence_pct: default_divergence_persistence_pct(),
             divergence_delay_add_minutes: 0.0,
             divergence_market_delay_add_minutes: 0.0,
+            divergence_long_horizon_minutes: 0.0,
+            divergence_long_horizon_zscore: default_divergence_long_horizon_zscore(),
+            divergence_cap_entries_only: false,
             entry_cooldown_min_duration_minutes: 0.0,
             entry_cooldown_max_duration_minutes: None,
             entry_cooldown_weights_minutes: Default::default(),

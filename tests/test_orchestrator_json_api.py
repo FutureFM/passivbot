@@ -5662,3 +5662,93 @@ def test_next_candle_missing_fill_buffer_matches_zero():
     expected = compute(pbr, inp)
     symbol["next_candle"]["limit_order_fill_buffer_pct"] = 0.0
     assert compute(pbr, inp) == expected
+
+
+def _divergence_held_position_orders(cap_entries_only: bool) -> list[dict]:
+    import passivbot_rust as pbr
+
+    long_bp = {
+        "wallet_exposure_limit": 1.0,
+        "risk_wel_enforcer_threshold": 1.0,
+        "risk_twel_enforcer_enabled": False,
+        "total_wallet_exposure_limit": 1.0,
+        "n_positions": 1,
+        "divergence_filter_enabled": True,
+        "divergence_zscore_threshold": 1.0,
+        "divergence_breadth_threshold_pct": 40.0,
+        "divergence_breadth_drop_pct": 1.0,
+        "divergence_min_timeframes": 2,
+        "divergence_we_cap_pct": 0.5,
+        "divergence_cap_entries_only": cap_entries_only,
+    }
+    strategy = adaptive_strategy_params(
+        entry={"retracement_base_pct": 0.0},
+        close={"retracement_base_pct": 0.01},
+    )
+    symbols = [
+        make_symbol(
+            i,
+            bid=100.0,
+            ask=100.0,
+            long_mode="normal" if i == 0 else "manual",
+            long_pos_size=7.0 if i == 0 else 0.0,
+            long_pos_price=100.0 if i == 0 else 0.0,
+            long_bp=long_bp,
+            long_strategy=strategy,
+        )
+        for i in range(3)
+    ]
+    for symbol in symbols:
+        symbol["divergence_roc_pct"] = [0.0, 0.0, None, None, None, None]
+    # Full-severity latched protection on the held coin: capped WEL 0.5 < WE 0.7 < base WEL 1.
+    symbols[0]["divergence_held_intensity"] = [1.0, 0.0]
+    inp = make_input(
+        balance=1_000.0,
+        global_bp=bot_params_pair(long_overrides=long_bp),
+        symbols=symbols,
+    )
+    inp["global"]["hedge_mode"] = True
+    return [o for o in compute(pbr, inp)["orders"] if o["symbol_idx"] == 0]
+
+
+def test_divergence_cap_reduces_held_position_unless_entries_only():
+    capped = _divergence_held_position_orders(cap_entries_only=False)
+    assert any(o["order_type"] == "close_auto_reduce_wel_long" for o in capped)
+
+    entries_only = _divergence_held_position_orders(cap_entries_only=True)
+    assert not any(o["order_type"] == "close_auto_reduce_wel_long" for o in entries_only)
+    # Entries still respect the capped WEL: WE 0.7 is already above it, so no new entry.
+    assert not any(o["pside"] == "long" and o["qty"] > 0 for o in entries_only)
+
+
+def test_divergence_long_horizon_counts_as_a_flagged_timeframe():
+    import passivbot_rust as pbr
+
+    strategy = {"base_qty_pct": 0.1, "ema_span_0": 10.0, "ema_span_1": 20.0,
+                "offset": 0.0, "offset_psize_weight": 0.0}
+
+    def entry_qty(long_horizon_minutes):
+        protection = {
+            "divergence_filter_enabled": True,
+            "divergence_zscore_threshold": 1.0,
+            "divergence_breadth_threshold_pct": 40.0,
+            "divergence_breadth_drop_pct": 1.0,
+            "divergence_min_timeframes": 1,
+            "divergence_we_cap_pct": 0.5,
+            "divergence_long_horizon_minutes": long_horizon_minutes,
+            "divergence_long_horizon_zscore": 3.0,
+        }
+        symbols = [
+            make_symbol(i, bid=100.0, ask=100.0,
+                        long_mode="normal" if i == 0 else "manual",
+                        long_bp=protection, long_strategy=strategy, short_strategy=strategy)
+            for i in range(10)
+        ]
+        # Market down ~27% over 3d, one coin down 80%; short horizons quiet.
+        for i, symbol in enumerate(symbols):
+            symbol["divergence_roc_pct"] = [0.0, 0.0, None, None, None, -25.0 - (i % 5)]
+        symbols[0]["divergence_roc_pct"][5] = -80.0
+        out = compute(pbr, make_input(balance=1_000.0, strategy_kind="ema_anchor", symbols=symbols))
+        return next(o["qty"] for o in out["orders"] if o["symbol_idx"] == 0 and o["qty"] > 0)
+
+    assert entry_qty(4320.0) < entry_qty(0.0)

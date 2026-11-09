@@ -6,6 +6,14 @@ since the latest release tag; these features may already be available when insta
 
 ## Unreleased
 
+- Divergence protection gains two options ported from the PB7 fork: a robust market-relative
+  long horizon (`divergence_long_horizon_minutes` = `1440`/`4320`, `divergence_long_horizon_zscore`,
+  default off / `3.0`) that keeps a coin's multi-day collapse flagged while the whole market falls,
+  and `divergence_cap_entries_only` (default `false`), which applies the divergence WEL cap to new
+  entries only so held positions are not reduced at the bottom. Live keeps a symbol's last good
+  divergence input for up to 5 minutes when its latest candle is unavailable, instead of dropping
+  protection for that cycle.
+
 - Backtests can load perps the exchange no longer lists (for example LUNA, MATIC and EOS on
   Binance) from an optional `caches/<exchange>/synthetic_markets.json`. Entries are CCXT-style
   markets with `info.onboardDate` (ms) as the first candle; they are merged after every market

@@ -177,3 +177,46 @@ def test_live_cooldown_lookback_covers_additive_divergence_delay_with_zero_coold
     assert Passivbot._entry_cooldown_horizon(bot, "long") == 1440.0
     values["divergence_market_delay_add_minutes"] = 0.0
     assert Passivbot._entry_cooldown_horizon(bot, "long") == 0.0
+
+
+def test_uses_day_horizons_for_extended_or_long_horizon():
+    from divergence_inputs import uses_day_horizons
+
+    assert not uses_day_horizons({"divergence_filter_enabled": False, "divergence_extended_horizons": True})
+    assert uses_day_horizons({"divergence_filter_enabled": True, "divergence_extended_horizons": True})
+    assert uses_day_horizons({"divergence_filter_enabled": True, "divergence_long_horizon_minutes": 4320.0})
+    assert not uses_day_horizons({"divergence_filter_enabled": True, "divergence_long_horizon_minutes": 0.0})
+
+
+def test_keep_last_good_state_restores_missing_candles_within_ttl():
+    from divergence_inputs import LAST_GOOD_STATE_TTL_MS, keep_last_good_state
+
+    cache = {}
+    good = {"A": [-50.0, -40.0, None, None, None, None], "B": [0.0, 0.0, None, None, None, None]}
+    held = {"A": [0.8, 0.0], "B": [0.0, 0.0]}
+    assert keep_last_good_state(cache, good, held, 1_000_000) == []
+
+    # A's latest candle is missing next cycle: its last good row and latch are restored.
+    rocs = {"A": [None] * 6, "B": [1.0, 1.0, None, None, None, None]}
+    held = {"A": [0.0, 0.0], "B": [0.0, 0.0]}
+    assert keep_last_good_state(cache, rocs, held, 1_060_000) == ["A"]
+    assert rocs["A"] == [-50.0, -40.0, None, None, None, None]
+    assert held["A"] == [0.8, 0.0]
+
+    # Beyond the TTL the coin is left without signal (and the stale entry dropped).
+    rocs = {"A": [None] * 6, "B": [1.0, 1.0, None, None, None, None]}
+    held = {}
+    assert keep_last_good_state(cache, rocs, held, 1_000_000 + LAST_GOOD_STATE_TTL_MS + 1) == []
+    assert rocs["A"] == [None] * 6
+    assert "A" not in cache
+
+
+def test_keep_last_good_state_keeps_partial_rows_of_recent_listings():
+    from divergence_inputs import keep_last_good_state
+
+    cache = {"A": (0, [-50.0] * 6, [1.0, 0.0])}
+    # A recent listing has short horizons only: it is live data, not a failure.
+    rocs = {"A": [-1.0, None, None, None, None, None]}
+    held = {"A": [0.0, 0.0]}
+    assert keep_last_good_state(cache, rocs, held, 60_000) == []
+    assert rocs["A"][0] == -1.0

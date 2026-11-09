@@ -41,7 +41,12 @@ from candlestick_manager import (
     OhlcvTerminalEmptyPage,
     fetch_candles_with_resolution_ladder,
 )
-from divergence_inputs import collect_divergence_inputs, hold_history_minutes
+from divergence_inputs import (
+    collect_divergence_inputs,
+    hold_history_minutes,
+    keep_last_good_state,
+    uses_day_horizons,
+)
 from fill_events_manager import (
     FillEventCacheContractError,
     FillEventsManager,
@@ -14984,6 +14989,7 @@ class Passivbot:
         bool_keys = {
             "divergence_filter_enabled",
             "divergence_extended_horizons",
+            "divergence_cap_entries_only",
             "risk_wel_enforcer_enabled",
             "risk_twel_enforcer_enabled",
             "risk_twel_entry_gate_enabled",
@@ -15057,6 +15063,9 @@ class Passivbot:
             "divergence_persistence_pct",
             "divergence_delay_add_minutes",
             "divergence_market_delay_add_minutes",
+            "divergence_long_horizon_minutes",
+            "divergence_long_horizon_zscore",
+            "divergence_cap_entries_only",
             "entry_cooldown_min_duration_minutes",
             "entry_cooldown_max_duration_minutes",
             "entry_cooldown_weights_minutes",
@@ -18006,11 +18015,7 @@ class Passivbot:
                 self.cm,
                 symbols,
                 now_ms,
-                extended=any(
-                    global_bp[side]["divergence_filter_enabled"]
-                    and global_bp[side]["divergence_extended_horizons"]
-                    for side in ("long", "short")
-                ),
+                extended=any(uses_day_horizons(global_bp[side]) for side in ("long", "short")),
                 history_minutes=hold_history_minutes(hold_minutes),
             )
             if divergence_history:
@@ -18031,6 +18036,20 @@ class Passivbot:
                     symbol: [float(held["long"][i]), float(held["short"][i])]
                     for i, symbol in enumerate(symbols)
                 }
+            # Failure-only fallback: a symbol whose latest candle is unavailable (slow or
+            # failing API, typical during a crash) keeps its last good input for a few
+            # minutes instead of dropping protection for the cycle. Not persisted: after a
+            # restart the detector starts from candles only.
+            if not hasattr(self, "_divergence_last_good"):
+                self._divergence_last_good = {}
+            restored = keep_last_good_state(
+                self._divergence_last_good, divergence_rocs, divergence_held, now_ms
+            )
+            if restored:
+                logging.warning(
+                    "[divergence] latest candle unavailable; keeping last good state for %s",
+                    ", ".join(sorted(restored)),
+                )
         # Effective hedge_mode = config setting AND exchange capability.
         # If either is False, we block same-coin hedging in the orchestrator.
         effective_hedge_mode = self._config_hedge_mode and self.hedge_mode
