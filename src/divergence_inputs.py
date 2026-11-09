@@ -14,8 +14,56 @@ ONE_MINUTE_MS = 60_000
 PERSISTENCE_WINDOW_MINUTES = 60
 
 
+# A symbol whose latest completed candle is unavailable keeps its last good detector input
+# (ROC row and held intensity) for this long, so a slow or failing candle API during a crash
+# does not release the divergence protection for that cycle.
+LAST_GOOD_STATE_TTL_MS = 5 * ONE_MINUTE_MS
+# Supported `divergence_long_horizon_minutes` values map onto the 1d/3d ROC slots.
+LONG_HORIZON_MINUTES = (1440, 4320)
+
+
 def active_horizons(extended: bool) -> tuple[int, ...]:
     return HORIZONS_MINUTES if extended else HORIZONS_MINUTES[:BASE_HORIZON_COUNT]
+
+
+def uses_day_horizons(bot_params: dict) -> bool:
+    """True when 1d/3d ROCs are needed (mirrors `divergence::uses_day_horizons` in Rust)."""
+    if not bot_params.get("divergence_filter_enabled"):
+        return False
+    long_horizon = float(bot_params.get("divergence_long_horizon_minutes") or 0.0)
+    return bool(bot_params.get("divergence_extended_horizons")) or long_horizon in LONG_HORIZON_MINUTES
+
+
+def keep_last_good_state(
+    cache: dict,
+    rocs: dict[str, list[float | None]],
+    held: dict[str, list[float]],
+    now_ms: int,
+    *,
+    ttl_ms: int = LAST_GOOD_STATE_TTL_MS,
+) -> list[str]:
+    """Update `cache` with symbols whose latest completed candle is available and, in place,
+    restore the last good ROC row and held intensity of symbols whose candle is missing,
+    when that state is at most `ttl_ms` old. Returns the restored symbols.
+
+    A row with no ROC at all means no close at the decision minute (failed or stale fetch);
+    a recent listing still has its short horizons and is never treated as missing."""
+    restored = []
+    for symbol, row in rocs.items():
+        if any(value is not None for value in row):
+            cache[symbol] = (now_ms, list(row), list(held.get(symbol, [0.0, 0.0])))
+            continue
+        cached = cache.get(symbol)
+        if cached is None:
+            continue
+        cached_ms, cached_row, cached_held = cached
+        if now_ms - cached_ms > ttl_ms:
+            del cache[symbol]
+            continue
+        rocs[symbol] = list(cached_row)
+        held[symbol] = list(cached_held)
+        restored.append(symbol)
+    return restored
 
 
 def _closes_by_ts(candles) -> dict[int, float]:

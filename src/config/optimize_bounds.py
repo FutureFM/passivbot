@@ -59,6 +59,7 @@ SHARED_OPTIMIZE_LOCAL_TO_FLAT_KEY = {
         "divergence_persistence_pct": "divergence_persistence_pct",
         "divergence_delay_add_minutes": "divergence_delay_add_minutes",
         "divergence_market_delay_add_minutes": "divergence_market_delay_add_minutes",
+        "divergence_long_horizon_zscore": "divergence_long_horizon_zscore",
         "n_positions": "n_positions",
         "total_exposure_enforcer_threshold": "risk_twel_enforcer_threshold",
         "we_excess_allowance_pct": "risk_we_excess_allowance_pct",

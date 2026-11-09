@@ -17,6 +17,63 @@ const BREADTH_REFERENCE_MINUTES: f64 = 240.0;
 /// Trailing window over which a flag must persist before `divergence_hold_minutes` latches it.
 pub const PERSISTENCE_WINDOW_MINUTES: usize = 60;
 
+/// Horizon slot of `divergence_long_horizon_minutes` (1440 -> 1d, 4320 -> 3d), if enabled.
+pub fn long_horizon_slot(p: &BotParams) -> Option<usize> {
+    if !p.divergence_filter_enabled || !(p.divergence_long_horizon_minutes > 0.0) {
+        return None;
+    }
+    HORIZONS_MINUTES
+        .iter()
+        .enumerate()
+        .skip(BASE_HORIZON_COUNT)
+        .find(|(_, &h)| h as f64 == p.divergence_long_horizon_minutes)
+        .map(|(slot, _)| slot)
+}
+
+/// True when the 1d/3d ROC slots must be supplied (extended horizons or the long horizon).
+pub fn uses_day_horizons(p: &BotParams) -> bool {
+    p.divergence_filter_enabled
+        && (p.divergence_extended_horizons || long_horizon_slot(p).is_some())
+}
+
+fn median(values: &mut [f64]) -> f64 {
+    values.sort_by(|a, b| a.total_cmp(b));
+    let n = values.len();
+    if n % 2 == 1 {
+        values[n / 2]
+    } else {
+        0.5 * (values[n / 2 - 1] + values[n / 2])
+    }
+}
+
+/// Robust cross-sectional z of the log return in `slot`: `(ln r_i - median) / (1.4826 * MAD)`.
+/// The outlier cannot inflate its own denominator and a market-wide move cancels out, so a
+/// multi-day idiosyncratic slide stays visible while the whole market falls. None for coins
+/// without a valid ROC, or when fewer than three coins have one.
+fn robust_long_horizon_z(roc_by_coin: &[DivergenceRocs], slot: usize) -> Vec<Option<f64>> {
+    let mut z = vec![None; roc_by_coin.len()];
+    let rets: Vec<(usize, f64)> = roc_by_coin
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, row)| {
+            row[slot]
+                .filter(|roc| roc.is_finite() && *roc > -100.0)
+                .map(|roc| (idx, (1.0 + roc / 100.0).ln()))
+        })
+        .collect();
+    if rets.len() < 3 {
+        return z;
+    }
+    let mut values: Vec<f64> = rets.iter().map(|&(_, r)| r).collect();
+    let center = median(&mut values);
+    let mut deviations: Vec<f64> = rets.iter().map(|&(_, r)| (r - center).abs()).collect();
+    let scale = (1.4826 * median(&mut deviations)).max(1e-9);
+    for (idx, r) in rets {
+        z[idx] = Some((r - center) / scale);
+    }
+    z
+}
+
 fn breadth_drop_scale(horizon_minutes: usize) -> f64 {
     (horizon_minutes as f64 / BREADTH_REFERENCE_MINUTES)
         .sqrt()
@@ -170,6 +227,25 @@ pub fn detect(
                 counts[idx] += 1;
                 worst_z[idx] = worst_z[idx].max(z.abs());
             }
+        }
+    }
+    // Long horizon: one more flagged timeframe, evaluated once per distinct slot.
+    let mut robust_z: Vec<(usize, Vec<Option<f64>>)> = Vec::new();
+    for (idx, p) in params.iter().enumerate() {
+        let Some(slot) = long_horizon_slot(p) else {
+            continue;
+        };
+        if !robust_z.iter().any(|(s, _)| *s == slot) {
+            robust_z.push((slot, robust_long_horizon_z(roc_by_coin, slot)));
+        }
+        let zs = &robust_z.iter().find(|(s, _)| *s == slot).unwrap().1;
+        let Some(z) = zs[idx] else {
+            continue;
+        };
+        let threshold = p.divergence_long_horizon_zscore;
+        if threshold > 0.0 && ((short && z > threshold) || (!short && z < -threshold)) {
+            counts[idx] += 1;
+            worst_z[idx] = worst_z[idx].max(z.abs());
         }
     }
     for (idx, effect) in effects.iter_mut().enumerate() {
@@ -595,6 +671,63 @@ mod tests {
             [None, None, None, None, Some(0.0), None],
         ];
         assert_eq!(detect(&one_day_only, &refs, false)[0].flagged_timeframes, 0);
+    }
+
+    #[test]
+    fn long_horizon_flags_a_lone_slide_inside_a_falling_market() {
+        // LUNA-like: the whole market fell ~27% over 3d (breadth mutes the mean/std test),
+        // one coin fell 80%. Short horizons are quiet.
+        let mut rocs = vec![[Some(0.0), Some(0.0), None, None, None, Some(-20.0)]; 20];
+        for (i, row) in rocs.iter_mut().enumerate() {
+            row[5] = Some(-25.0 - (i % 5) as f64);
+        }
+        rocs[0][5] = Some(-80.0);
+        let mut p = params();
+        p.divergence_min_timeframes = 1;
+        p.divergence_zscore_threshold = 2.0;
+        p.divergence_breadth_drop_pct = 5.0;
+        p.divergence_extended_horizons = true;
+        let refs = vec![&p; 20];
+        // Mean/std 3d test is muted by breadth (everyone fell past the scaled threshold).
+        assert_unprotected(detect(&rocs, &refs, false)[0]);
+
+        p.divergence_long_horizon_minutes = 4320.0;
+        p.divergence_long_horizon_zscore = 3.0;
+        let refs = vec![&p; 20];
+        let effects = detect(&rocs, &refs, false);
+        assert_eq!(effects[0].flagged_timeframes, 1);
+        assert!(effects[0].wallet_exposure_factor < 1.0);
+        assert!(effects[1..].iter().all(|e| e.flagged_timeframes == 0));
+        // Directional: the short side does not flag a collapse.
+        assert_eq!(detect(&rocs, &refs, true)[0].flagged_timeframes, 0);
+        // A pump is flagged for shorts.
+        let pumps: Vec<_> = rocs.iter().map(|row| row.map(|v| v.map(|x| -x))).collect();
+        assert_eq!(detect(&pumps, &refs, true)[0].flagged_timeframes, 1);
+    }
+
+    #[test]
+    fn long_horizon_needs_a_supported_slot_and_three_coins() {
+        let mut p = params();
+        p.divergence_min_timeframes = 1;
+        p.divergence_long_horizon_minutes = 4320.0;
+        assert_eq!(long_horizon_slot(&p), Some(5));
+        assert!(uses_day_horizons(&p));
+        p.divergence_long_horizon_minutes = 1440.0;
+        assert_eq!(long_horizon_slot(&p), Some(4));
+        p.divergence_long_horizon_minutes = 2000.0;
+        assert_eq!(long_horizon_slot(&p), None);
+        assert!(!uses_day_horizons(&p));
+        p.divergence_long_horizon_minutes = 1440.0;
+        p.divergence_filter_enabled = false;
+        assert_eq!(long_horizon_slot(&p), None);
+        p.divergence_filter_enabled = true;
+        let refs = vec![&p; 3];
+        let two_valid = [
+            [None, None, None, None, Some(-90.0), None],
+            [None, None, None, None, Some(0.0), None],
+            [None; 6],
+        ];
+        assert_unprotected(detect(&two_valid, &refs, false)[0]);
     }
 
     #[test]

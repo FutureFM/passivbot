@@ -3279,6 +3279,7 @@ mod core {
         pside: PositionSide,
         cache: &mut [CachedSideDerived],
         runtime_budget: RuntimeBudgetState,
+        close_budget: RuntimeBudgetState,
         divergence_delay: (f64, f64),
         wants_entries: bool,
         wants_closes: bool,
@@ -3293,15 +3294,19 @@ mod core {
                     .unilateralness_unavailable
                     .current
                     .contains(&side.bot_params.unilateralness_ema_span_1m));
-        let requests =
-            if (symbol.allow_missing_strategy_inputs || !side.trailing_available || rms_warming)
-                && wants_entries
-                && wants_closes
-            {
-                [(true, false), (false, true)]
-            } else {
-                [(wants_entries, wants_closes), (false, false)]
-            };
+        // `divergence_cap_entries_only`: entries are sized on the capped budget while closes
+        // keep the held position's base budget, so they are generated as separate requests.
+        let requests = if (symbol.allow_missing_strategy_inputs
+            || !side.trailing_available
+            || rms_warming
+            || close_budget != runtime_budget)
+            && wants_entries
+            && wants_closes
+        {
+            [(true, false), (false, true)]
+        } else {
+            [(wants_entries, wants_closes), (false, false)]
+        };
         let mut entries = Vec::new();
         let mut closes = Vec::new();
         let mut close_inputs_unavailable = false;
@@ -3314,7 +3319,11 @@ mod core {
                 symbol,
                 pside,
                 cache,
-                runtime_budget,
+                if request_entries {
+                    runtime_budget
+                } else {
+                    close_budget
+                },
                 divergence_delay,
                 request_entries,
                 request_closes,
@@ -3848,6 +3857,47 @@ mod core {
             workspace.runtime_budget_short[idx].effective_wallet_exposure_limit *=
                 divergence_short[idx].wallet_exposure_factor;
         }
+        // Budget of the held position (closes, unstuck, time stops, WEL enforcer): the
+        // divergence-capped one, or the base one with `divergence_cap_entries_only`.
+        let hold_budget = |budgets: &[RuntimeBudgetState],
+                           base_wel: &[f64],
+                           params: &dyn Fn(usize) -> bool|
+         -> Vec<RuntimeBudgetState> {
+            budgets
+                .iter()
+                .enumerate()
+                .map(|(idx, budget)| {
+                    if params(idx) {
+                        RuntimeBudgetState {
+                            effective_wallet_exposure_limit: base_wel[idx],
+                            ..*budget
+                        }
+                    } else {
+                        *budget
+                    }
+                })
+                .collect()
+        };
+        let hold_budget_long = hold_budget(
+            &workspace.runtime_budget_long,
+            &time_stop_cap_wel_long,
+            &|idx| {
+                input.symbols[idx]
+                    .long
+                    .bot_params
+                    .divergence_cap_entries_only
+            },
+        );
+        let hold_budget_short = hold_budget(
+            &workspace.runtime_budget_short,
+            &time_stop_cap_wel_short,
+            &|idx| {
+                input.symbols[idx]
+                    .short
+                    .bot_params
+                    .divergence_cap_entries_only
+            },
+        );
         workspace
             .derived_long
             .resize_with(n_symbols, CachedSideDerived::default);
@@ -4279,7 +4329,7 @@ mod core {
                         input,
                         s,
                         PositionSide::Long,
-                        workspace.runtime_budget_long[s.symbol_idx],
+                        hold_budget_long[s.symbol_idx],
                         time_stop_cap_wel_long[s.symbol_idx],
                     )?
                 } else {
@@ -4304,6 +4354,7 @@ mod core {
                                 PositionSide::Long,
                                 &mut workspace.derived_long,
                                 workspace.runtime_budget_long[s.symbol_idx],
+                                hold_budget_long[s.symbol_idx],
                                 (
                                     divergence_long[s.symbol_idx].delay_multiplier,
                                     divergence_long[s.symbol_idx].delay_add_minutes,
@@ -4318,7 +4369,7 @@ mod core {
                                 input,
                                 s,
                                 PositionSide::Long,
-                                workspace.runtime_budget_long[s.symbol_idx],
+                                hold_budget_long[s.symbol_idx],
                             ) {
                                 closes.push(order);
                             }
@@ -4398,7 +4449,7 @@ mod core {
                         input,
                         s,
                         PositionSide::Short,
-                        workspace.runtime_budget_short[s.symbol_idx],
+                        hold_budget_short[s.symbol_idx],
                         time_stop_cap_wel_short[s.symbol_idx],
                     )?
                 } else {
@@ -4423,6 +4474,7 @@ mod core {
                                 PositionSide::Short,
                                 &mut workspace.derived_short,
                                 workspace.runtime_budget_short[s.symbol_idx],
+                                hold_budget_short[s.symbol_idx],
                                 (
                                     divergence_short[s.symbol_idx].delay_multiplier,
                                     divergence_short[s.symbol_idx].delay_add_minutes,
@@ -4437,7 +4489,7 @@ mod core {
                                 input,
                                 s,
                                 PositionSide::Short,
-                                workspace.runtime_budget_short[s.symbol_idx],
+                                hold_budget_short[s.symbol_idx],
                             ) {
                                 closes.push(order);
                             }
@@ -4463,7 +4515,7 @@ mod core {
             }
             let sym = &input.symbols[s.symbol_idx];
             let bot = &sym.long.bot_params;
-            let runtime_budget = workspace.runtime_budget_long[s.symbol_idx];
+            let runtime_budget = hold_budget_long[s.symbol_idx];
             let enabled = bot.unstuck_enabled
                 && bot.unstuck_loss_allowance_pct > 0.0
                 && bot.unstuck_close_pct > 0.0
@@ -4526,7 +4578,7 @@ mod core {
             }
             let sym = &input.symbols[s.symbol_idx];
             let bot = &sym.short.bot_params;
-            let runtime_budget = workspace.runtime_budget_short[s.symbol_idx];
+            let runtime_budget = hold_budget_short[s.symbol_idx];
             let enabled = bot.unstuck_enabled
                 && bot.unstuck_loss_allowance_pct > 0.0
                 && bot.unstuck_close_pct > 0.0

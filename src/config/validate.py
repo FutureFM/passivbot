@@ -19,6 +19,8 @@ from .strategy import (
 )
 
 _STARTUP_BUDGET_KEYS = frozenset({"elapsed_ms", "since_previous_ms"})
+# Supported `divergence_long_horizon_minutes` (0 = off): the detector's 1d/3d horizons.
+DIVERGENCE_LONG_HORIZON_MINUTES = frozenset({0.0, 1440.0, 4320.0})
 
 
 def _validate_fixed_runtime_overrides(config: dict) -> None:
@@ -204,7 +206,20 @@ def validate_config(
         extended_horizons = get_grouped_bot_value(bot_side, "divergence_extended_horizons")
         if not isinstance(extended_horizons, bool):
             raise ValueError(f"bot.{pside}.risk.divergence_extended_horizons must be a boolean")
-        max_timeframes = 6 if extended_horizons else 4
+        cap_entries_only = get_grouped_bot_value(bot_side, "divergence_cap_entries_only")
+        if not isinstance(cap_entries_only, bool):
+            raise ValueError(f"bot.{pside}.risk.divergence_cap_entries_only must be a boolean")
+        long_horizon = get_grouped_bot_value(bot_side, "divergence_long_horizon_minutes")
+        if (
+            isinstance(long_horizon, bool)
+            or not isinstance(long_horizon, (int, float))
+            or float(long_horizon) not in DIVERGENCE_LONG_HORIZON_MINUTES
+        ):
+            raise ValueError(
+                f"bot.{pside}.risk.divergence_long_horizon_minutes must be one of "
+                f"{sorted(int(v) for v in DIVERGENCE_LONG_HORIZON_MINUTES)}"
+            )
+        max_timeframes = (6 if extended_horizons else 4) + (1 if long_horizon > 0 else 0)
         divergence_ranges = {
             "divergence_zscore_threshold": (0.0, None),
             "divergence_breadth_threshold_pct": (0.0, 100.0),
@@ -215,6 +230,7 @@ def validate_config(
             "divergence_persistence_pct": (0.0, 100.0),
             "divergence_delay_add_minutes": (0.0, None),
             "divergence_market_delay_add_minutes": (0.0, None),
+            "divergence_long_horizon_zscore": (0.0, None),
         }
         for name, (minimum, maximum) in divergence_ranges.items():
             value = get_grouped_bot_value(bot_side, name)
