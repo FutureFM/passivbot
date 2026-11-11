@@ -619,6 +619,13 @@ pub struct Backtest<'a> {
     last_increase_fill_timestamp_short: Vec<Option<u64>>,
     time_stop_long: Vec<Option<orchestrator::TimeStopState>>,
     time_stop_short: Vec<Option<orchestrator::TimeStopState>>,
+    /// Timestamp of the fill that opened each current position `[long, short]` (TP decay).
+    position_opened_ms: [Vec<Option<u64>>; 2],
+    /// Market-crash cooldown state and severity in force `[long, short]`.
+    market_crash_states: [crate::market_crash::CrashState; 2],
+    market_crash_severity: [f64; 2],
+    /// Per-coin cache of the daily SMA20 keyed by UTC day index.
+    daily_sma20_cache: Vec<Option<(u64, Option<f64>)>>,
     pub total_wallet_exposures: Vec<f64>,
     // removed rolling_volume_sum & buffer — replaced by per-coin EMAs in `emas`
     equity_tracking_active: bool,
@@ -1347,10 +1354,98 @@ impl<'a> Backtest<'a> {
         }
     }
 
+    /// Advance the market-crash severity (breadth test plus cooldown) at candle `k`.
+    /// Runs every candle (including warmup) so the cooldown matches live's candle replay.
+    fn update_market_crash(&mut self, k: usize) {
+        let enabled = [
+            crate::market_crash::enabled(&self.bot_params_master.long),
+            crate::market_crash::enabled(&self.bot_params_master.short),
+        ];
+        if !enabled[0] && !enabled[1] {
+            return;
+        }
+        let rocs: Vec<_> = (0..self.n_coins)
+            .map(|idx| self.divergence_roc_at(k, idx))
+            .collect();
+        let interval_minutes = self.interval_ms as f64 / 60_000.0;
+        for side in 0..2 {
+            if !enabled[side] {
+                continue;
+            }
+            let params = if side == 0 {
+                &self.bot_params_master.long
+            } else {
+                &self.bot_params_master.short
+            };
+            self.market_crash_severity[side] = self.market_crash_states[side].update(
+                crate::market_crash::raw_severity(&rocs, params, side == 1),
+                params.market_crash_cooldown_minutes,
+                interval_minutes,
+            );
+        }
+    }
+
+    /// Opening timestamp of the current position, if any (TP-decay clock).
+    fn position_opened_at(&self, idx: usize, pside: usize, size: f64) -> Option<u64> {
+        if size == 0.0 {
+            None
+        } else {
+            self.position_opened_ms[pside][idx]
+        }
+    }
+
+    /// Average of the last 20 completed UTC daily closes for `idx` at candle `k`, or None
+    /// when the SMA20 is not consumed or any of those closes is missing. The day close is
+    /// the close of the last candle before midnight, located by timestamp, so the result is
+    /// the same for every candle interval that divides a day.
+    fn daily_sma20_at(&mut self, k: usize, idx: usize) -> Option<f64> {
+        const DAY_MS: u64 = 86_400_000;
+        let consumed = [&self.bot_params[idx].long, &self.bot_params[idx].short]
+            .iter()
+            .any(|bp| bp.tp_decay_gate_sma20 || bp.tp_sma20_above_boost > 0.0);
+        if !consumed || self.interval_ms == 0 || DAY_MS % self.interval_ms != 0 {
+            return None;
+        }
+        let now_ms = self.first_timestamp_ms + k as u64 * self.interval_ms;
+        let day = now_ms / DAY_MS;
+        if let Some((cached_day, value)) = self.daily_sma20_cache[idx] {
+            if cached_day == day {
+                return value;
+            }
+        }
+        let value = (|| {
+            let mut sum = 0.0;
+            for days_back in 0..20u64 {
+                let close_ms = (day * DAY_MS)
+                    .checked_sub(days_back * DAY_MS)?
+                    .checked_sub(self.interval_ms)?;
+                if close_ms < self.first_timestamp_ms {
+                    return None;
+                }
+                let j = ((close_ms - self.first_timestamp_ms) / self.interval_ms) as usize;
+                if j >= k || !self.coin_is_valid_at(idx, j) {
+                    return None;
+                }
+                let close = self.hlcvs_value(j, idx, CLOSE);
+                if !(close.is_finite() && close > 0.0) {
+                    return None;
+                }
+                sum += close;
+            }
+            Some(sum / 20.0)
+        })();
+        self.daily_sma20_cache[idx] = Some((day, value));
+        value
+    }
+
     fn divergence_roc_at(&self, k: usize, idx: usize) -> crate::divergence::DivergenceRocs {
         let long = &self.bot_params_master.long;
         let short = &self.bot_params_master.short;
-        if !long.divergence_filter_enabled && !short.divergence_filter_enabled {
+        if !long.divergence_filter_enabled
+            && !short.divergence_filter_enabled
+            && !crate::market_crash::enabled(long)
+            && !crate::market_crash::enabled(short)
+        {
             return [None; 6];
         }
         let extended = crate::divergence::uses_day_horizons(long)
@@ -1637,6 +1732,7 @@ impl<'a> Backtest<'a> {
                         strategy_params: None,
                         parsed_strategy_params: Some(self.strategy_params[idx].long),
                         runtime_budget: Some(self.runtime_budget[idx].long.clone()),
+                        position_opened_timestamp_ms: None,
                     },
                     short: orchestrator::SymbolSideInput {
                         mode: mode_short,
@@ -1650,12 +1746,14 @@ impl<'a> Backtest<'a> {
                         strategy_params: None,
                         parsed_strategy_params: Some(self.strategy_params[idx].short),
                         runtime_budget: Some(self.runtime_budget[idx].short.clone()),
+                        position_opened_timestamp_ms: None,
                     },
+                    daily_sma20: None,
                 }
             })
             .collect();
 
-        orchestrator::OrchestratorInput {
+        let mut input = orchestrator::OrchestratorInput {
             timestamp_ms: self.first_timestamp_ms + (k as u64) * self.interval_ms,
             balance,
             balance_raw,
@@ -1681,7 +1779,17 @@ impl<'a> Backtest<'a> {
             symbols,
             peek_hints,
             forager_hysteresis,
+            market_crash_severity: self.market_crash_severity,
+        };
+        for sym in input.symbols.iter_mut() {
+            let idx = sym.symbol_idx;
+            sym.daily_sma20 = self.daily_sma20_at(k, idx);
+            sym.long.position_opened_timestamp_ms =
+                self.position_opened_at(idx, LONG, sym.long.position.size);
+            sym.short.position_opened_timestamp_ms =
+                self.position_opened_at(idx, SHORT, sym.short.position.size);
         }
+        input
     }
 
     fn get_orchestrator_input_cached(
@@ -1733,12 +1841,14 @@ impl<'a> Backtest<'a> {
 
         input.peek_hints = peek_hints;
         input.forager_hysteresis = forager_hysteresis;
+        input.market_crash_severity = self.market_crash_severity;
 
         for sym in input.symbols.iter_mut() {
             let idx = sym.symbol_idx;
             sym.divergence_roc_pct = self.divergence_roc_at(k, idx);
             sym.divergence_held_intensity =
                 [self.divergence_held[0][idx], self.divergence_held[1][idx]];
+            sym.daily_sma20 = self.daily_sma20_at(k, idx);
             let (start, end) = self.coin_valid_range(idx).unwrap_or((0, 0));
             let price_idx = k.clamp(start, end);
             let close_price = self.hlcvs_value(price_idx, idx, CLOSE).max(f64::EPSILON);
@@ -1778,6 +1888,10 @@ impl<'a> Backtest<'a> {
             sym.short.trailing = self.trailing_prices.short[idx].clone();
             sym.long.last_increase_fill_timestamp_ms = self.last_increase_fill_timestamp_long[idx];
             sym.long.time_stop = self.time_stop_long[idx].clone();
+            sym.long.position_opened_timestamp_ms =
+                self.position_opened_at(idx, LONG, pos_long.size);
+            sym.short.position_opened_timestamp_ms =
+                self.position_opened_at(idx, SHORT, pos_short.size);
             sym.short.last_increase_fill_timestamp_ms =
                 self.last_increase_fill_timestamp_short[idx];
             sym.short.time_stop = self.time_stop_short[idx].clone();
@@ -2355,6 +2469,10 @@ impl<'a> Backtest<'a> {
             last_increase_fill_timestamp_short: vec![None; n_coins],
             time_stop_long: vec![None; n_coins],
             time_stop_short: vec![None; n_coins],
+            position_opened_ms: [vec![None; n_coins], vec![None; n_coins]],
+            market_crash_states: Default::default(),
+            market_crash_severity: [0.0; 2],
+            daily_sma20_cache: vec![None; n_coins],
             total_wallet_exposures: Vec::with_capacity(n_timesteps),
             equity_tracking_active: false,
             debug_writer: if DEBUG_DUMP_ORDERS {
@@ -2492,6 +2610,7 @@ impl<'a> Backtest<'a> {
             self.update_rounded_balance(k);
             self.update_trailing_prices(k);
             self.update_divergence_hold(k);
+            self.update_market_crash(k);
             if self.equity_tracking_active
                 && self.balance.usd_total_balance.is_finite()
                 && (self.balance.usd_total_balance <= 0.0
@@ -3506,6 +3625,8 @@ impl<'a> Backtest<'a> {
             self.exchange_params_list[idx].qty_step,
         );
         if self.positions.long[idx].size == 0.0 {
+            self.position_opened_ms[LONG][idx] =
+                Some(self.first_timestamp_ms + k as u64 * self.interval_ms);
             self.time_stop_long[idx] = Some(orchestrator::TimeStopState {
                 anchor_timestamp_ms: self.first_timestamp_ms + k as u64 * self.interval_ms,
                 pending_target_size: None,
@@ -3589,6 +3710,8 @@ impl<'a> Backtest<'a> {
             self.exchange_params_list[idx].qty_step,
         );
         if self.positions.short[idx].size == 0.0 {
+            self.position_opened_ms[SHORT][idx] =
+                Some(self.first_timestamp_ms + k as u64 * self.interval_ms);
             self.time_stop_short[idx] = Some(orchestrator::TimeStopState {
                 anchor_timestamp_ms: self.first_timestamp_ms + k as u64 * self.interval_ms,
                 pending_target_size: None,

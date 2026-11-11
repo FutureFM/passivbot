@@ -299,10 +299,220 @@ fn calc_close_threshold_pct(
     } else {
         0.0
     };
-    close_params.threshold_base_pct
+    let threshold_pct = close_params.threshold_base_pct
         + wallet_exposure_ratio * close_params.threshold_we_weight
         + state_params.volatility_ema_1m * close_params.threshold_volatility_1m_weight
-        + state_params.volatility_ema_1h * close_params.threshold_volatility_1h_weight
+        + state_params.volatility_ema_1h * close_params.threshold_volatility_1h_weight;
+    if !tp_adjustment_configured(bot_params) {
+        return threshold_pct;
+    }
+    let wallet_exposure = calc_wallet_exposure(
+        exchange_params.c_mult,
+        state_params.balance,
+        position.size.abs(),
+        position.price,
+    );
+    adjust_close_threshold_pct(
+        threshold_pct,
+        bot_params,
+        &runtime_context.close_decay,
+        wallet_exposure,
+        wallet_exposure_limit,
+    )
+}
+
+/// Linear progress in `[0, 1]` of `x` between `start` (0) and `full` (1).
+/// `full <= 0` disables the trigger (always 0). NaN input counts as 0.
+pub fn tp_decay_linear_progress(x: f64, start: f64, full: f64) -> f64 {
+    if full <= 0.0 || x.is_nan() {
+        return 0.0;
+    }
+    if full <= start {
+        // degenerate ramp: a step at `start`
+        return if x >= start { 1.0 } else { 0.0 };
+    }
+    ((x - start) / (full - start)).clamp(0.0, 1.0)
+}
+
+/// Nominal per-position exposure for the TP-decay exposure trigger:
+/// `total_wallet_exposure_limit / n_positions`. Unlike the runtime WEL it does not move with
+/// the divergence cap, so the trigger stays fixed across regimes. Falls back to the
+/// runtime limit when the nominal base is not configured.
+pub fn tp_decay_we_base(bot_params: &BotParams, runtime_wallet_exposure_limit: f64) -> f64 {
+    if bot_params.total_wallet_exposure_limit > 0.0 && bot_params.n_positions > 0 {
+        bot_params.total_wallet_exposure_limit / bot_params.n_positions as f64
+    } else {
+        runtime_wallet_exposure_limit
+    }
+}
+
+/// Strongest of the two TP-decay triggers (time in position, wallet-exposure ratio).
+/// An unknown position age contributes nothing: the time trigger never fires on a guess.
+pub fn tp_decay_factor(
+    bot_params: &BotParams,
+    position_age_minutes: Option<f64>,
+    wallet_exposure_ratio: f64,
+) -> f64 {
+    let f_time = position_age_minutes.map_or(0.0, |minutes| {
+        tp_decay_linear_progress(
+            minutes / 60.0,
+            bot_params.tp_decay_time_start_hours,
+            bot_params.tp_decay_time_full_hours,
+        )
+    });
+    let f_we = tp_decay_linear_progress(
+        wallet_exposure_ratio,
+        bot_params.tp_decay_we_start_ratio,
+        bot_params.tp_decay_we_full_ratio,
+    );
+    f_time.max(f_we)
+}
+
+/// Moves a close threshold toward `floor_pct` by `factor` (0..1).
+/// Never raises it: a threshold already below the floor is left alone.
+pub fn apply_tp_decay(threshold_pct: f64, factor: f64, floor_pct: f64) -> f64 {
+    if !(factor > 0.0) {
+        return threshold_pct;
+    }
+    let target = threshold_pct.min(floor_pct);
+    threshold_pct + factor * (target - threshold_pct)
+}
+
+/// True when the close threshold depends on wallet exposure through the TP decay, so a
+/// close ladder must be recomputed rung by rung.
+pub fn tp_decay_uses_wallet_exposure(bot_params: &BotParams) -> bool {
+    bot_params.tp_decay_we_full_ratio > 0.0
+}
+
+fn tp_adjustment_configured(bot_params: &BotParams) -> bool {
+    bot_params.tp_decay_time_full_hours > 0.0
+        || bot_params.tp_decay_we_full_ratio > 0.0
+        || bot_params.tp_sma20_above_boost > 0.0
+}
+
+/// SMA20 boost first (positive thresholds only, while price is above the SMA20), then the
+/// decay toward the floor (gated on price below the SMA20 when `tp_decay_gate_sma20`).
+pub fn adjust_close_threshold_pct(
+    threshold_pct: f64,
+    bot_params: &BotParams,
+    decay: &crate::types::CloseDecayInputs,
+    wallet_exposure: f64,
+    runtime_wallet_exposure_limit: f64,
+) -> f64 {
+    let boosted = if threshold_pct > 0.0
+        && bot_params.tp_sma20_above_boost > 0.0
+        && decay.price_above_sma20 == Some(true)
+    {
+        threshold_pct * (1.0 + bot_params.tp_sma20_above_boost)
+    } else {
+        threshold_pct
+    };
+    if bot_params.tp_decay_gate_sma20 && decay.price_above_sma20 != Some(false) {
+        return boosted;
+    }
+    let we_base = tp_decay_we_base(bot_params, runtime_wallet_exposure_limit);
+    let wallet_exposure_ratio = if we_base > 0.0 {
+        wallet_exposure / we_base
+    } else {
+        0.0
+    };
+    let factor = tp_decay_factor(
+        bot_params,
+        decay.position_age_minutes,
+        wallet_exposure_ratio,
+    );
+    apply_tp_decay(boosted, factor, bot_params.tp_decay_floor_pct)
+}
+
+/// Extra reduce-only limit close that offloads part of an over-exposed position at a
+/// fraction of the strategy's take-profit distance. `None` when disabled, when exposure is
+/// at or below the trigger, when the take-profit distance is not positive (the ordinary
+/// close already rests at or through break-even), or when the slice is below the
+/// executable minimum (skipped, not enlarged).
+pub fn calc_risky_offload_close(
+    side: StrategySide,
+    exchange_params: &ExchangeParams,
+    state_params: &StateParams,
+    bot_params: &BotParams,
+    runtime_context: &RuntimeOrderContext,
+    close_params: &TrailingMartingaleCloseParams,
+    position: &Position,
+) -> Option<Order> {
+    let position_size_abs = position.size.abs();
+    let close_pct = bot_params.risky_offload_close_pct;
+    if !(bot_params.risky_offload_we_threshold > 0.0)
+        || !(close_pct > 0.0)
+        || position_size_abs == 0.0
+    {
+        return None;
+    }
+    let wallet_exposure_limit = runtime_context.effective_wallet_exposure_limit;
+    if !(wallet_exposure_limit > 0.0) {
+        return None;
+    }
+    let wallet_exposure = calc_wallet_exposure(
+        exchange_params.c_mult,
+        state_params.balance,
+        position_size_abs,
+        position.price,
+    );
+    if !(wallet_exposure / wallet_exposure_limit > bot_params.risky_offload_we_threshold) {
+        return None;
+    }
+    let threshold_pct = calc_close_threshold_pct(
+        exchange_params,
+        state_params,
+        bot_params,
+        runtime_context,
+        close_params,
+        position,
+    );
+    if !(threshold_pct > 0.0) {
+        return None;
+    }
+    let distance = threshold_pct * bot_params.risky_offload_markup_pct.max(0.0);
+    let (price, order_type, sign) = match side {
+        StrategySide::Long => (
+            f64::max(
+                state_params.order_book.ask,
+                round_up(
+                    position.price * (1.0 + distance),
+                    exchange_params.price_step,
+                ),
+            ),
+            OrderType::CloseRiskyOffloadLong,
+            -1.0,
+        ),
+        StrategySide::Short => (
+            f64::min(
+                state_params.order_book.bid,
+                round_dn(
+                    position.price * (1.0 - distance),
+                    exchange_params.price_step,
+                ),
+            ),
+            OrderType::CloseRiskyOffloadShort,
+            1.0,
+        ),
+    };
+    let qty = f64::min(
+        round_(position_size_abs, exchange_params.qty_step),
+        round_(
+            position_size_abs * close_pct.min(1.0),
+            exchange_params.qty_step,
+        ),
+    );
+    if !(qty > 0.0) || qty < calc_min_entry_qty(price, exchange_params) {
+        return None;
+    }
+    Some(quantize_close_price(
+        Order {
+            qty: sign * qty,
+            price,
+            order_type,
+        },
+        exchange_params,
+    ))
 }
 
 pub fn calc_grid_close_long(
@@ -331,11 +541,12 @@ pub fn calc_grid_close_long(
             exchange_params.price_step,
         ),
     );
-    let qty_pct = if close_params.threshold_we_weight == 0.0 {
-        1.0
-    } else {
-        close_params.qty_pct
-    };
+    let qty_pct =
+        if close_params.threshold_we_weight == 0.0 && !tp_decay_uses_wallet_exposure(bot_params) {
+            1.0
+        } else {
+            close_params.qty_pct
+        };
     let close_qty = -calc_close_qty(
         &exchange_params,
         &bot_params,
@@ -554,11 +765,12 @@ pub fn calc_grid_close_short(
             exchange_params.price_step,
         ),
     );
-    let qty_pct = if close_params.threshold_we_weight == 0.0 {
-        1.0
-    } else {
-        close_params.qty_pct
-    };
+    let qty_pct =
+        if close_params.threshold_we_weight == 0.0 && !tp_decay_uses_wallet_exposure(bot_params) {
+            1.0
+        } else {
+            close_params.qty_pct
+        };
     let close_qty = calc_close_qty(
         &exchange_params,
         &bot_params,
@@ -871,6 +1083,7 @@ mod tests {
         RuntimeOrderContext {
             entry_reference_price: None,
             effective_wallet_exposure_limit: 1.0,
+            ..Default::default()
         }
     }
 
@@ -1510,4 +1723,318 @@ pub fn calc_closes_short(
     }
     sort_closes_by_price(&mut closes, true, "calc_closes_short");
     closes
+}
+
+#[cfg(test)]
+mod tp_adjustment_tests {
+    use super::*;
+    use crate::types::{CloseDecayInputs, OrderBook};
+
+    fn exchange() -> ExchangeParams {
+        ExchangeParams {
+            qty_step: 0.001,
+            price_step: 0.01,
+            min_qty: 0.0,
+            min_cost: 0.0,
+            c_mult: 1.0,
+            ..Default::default()
+        }
+    }
+
+    fn state(ask: f64, bid: f64) -> StateParams {
+        StateParams {
+            balance: 1000.0,
+            order_book: OrderBook {
+                ask,
+                bid,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// 5% take profit, full-position close, WEL 1.0 (no TWEL/n_positions -> runtime base).
+    fn close_params() -> TrailingMartingaleCloseParams {
+        TrailingMartingaleCloseParams {
+            qty_pct: 1.0,
+            threshold_base_pct: 0.05,
+            ..Default::default()
+        }
+    }
+
+    fn bot() -> BotParams {
+        BotParams {
+            wallet_exposure_limit: 1.0,
+            risk_we_excess_allowance_pct: 0.0,
+            risk_wel_enforcer_enabled: false,
+            ..Default::default()
+        }
+    }
+
+    fn ctx(age_minutes: Option<f64>, above_sma20: Option<bool>) -> RuntimeOrderContext {
+        RuntimeOrderContext {
+            effective_wallet_exposure_limit: 1.0,
+            entry_reference_price: None,
+            close_decay: CloseDecayInputs {
+                position_age_minutes: age_minutes,
+                price_above_sma20: above_sma20,
+            },
+        }
+    }
+
+    fn long_tp(b: &BotParams, c: &RuntimeOrderContext, size: f64, ask: f64) -> f64 {
+        calc_next_close_long(
+            &exchange(),
+            &state(ask, ask),
+            b,
+            c,
+            &close_params(),
+            &Position { size, price: 100.0 },
+            &TrailingPriceBundle::default(),
+        )
+        .price
+    }
+
+    #[test]
+    fn linear_progress_bounds_and_disable() {
+        assert_eq!(tp_decay_linear_progress(0.5, 1.0, 2.0), 0.0);
+        assert_eq!(tp_decay_linear_progress(3.0, 1.0, 2.0), 1.0);
+        assert!((tp_decay_linear_progress(1.5, 1.0, 2.0) - 0.5).abs() < 1e-12);
+        assert_eq!(tp_decay_linear_progress(100.0, 0.0, 0.0), 0.0);
+        assert_eq!(tp_decay_linear_progress(2.0, 2.0, 1.0), 1.0);
+        assert_eq!(tp_decay_linear_progress(1.9, 2.0, 1.0), 0.0);
+        assert_eq!(tp_decay_linear_progress(f64::NAN, 1.0, 2.0), 0.0);
+    }
+
+    #[test]
+    fn apply_tp_decay_moves_toward_floor_and_never_raises() {
+        assert_eq!(apply_tp_decay(0.05, 0.0, -0.005), 0.05);
+        assert!((apply_tp_decay(0.05, 1.0, -0.005) + 0.005).abs() < 1e-12);
+        assert!((apply_tp_decay(0.05, 0.5, -0.005) - 0.0225).abs() < 1e-12);
+        assert_eq!(apply_tp_decay(-0.01, 1.0, -0.005), -0.01);
+        assert_eq!(apply_tp_decay(0.05, f64::NAN, -0.005), 0.05);
+    }
+
+    #[test]
+    fn default_params_leave_tp_unchanged() {
+        let price = long_tp(&bot(), &ctx(Some(100_000.0), Some(true)), 1.0, 50.0);
+        assert!((price - 105.0).abs() < 0.011, "price={price}");
+    }
+
+    #[test]
+    fn time_decay_takes_long_tp_below_entry_at_floor() {
+        let mut b = bot();
+        b.tp_decay_floor_pct = -0.005;
+        b.tp_decay_time_full_hours = 10.0;
+        let half = long_tp(&b, &ctx(Some(300.0), None), 1.0, 50.0);
+        assert!((half - 102.25).abs() < 0.011, "half={half}");
+        let full = long_tp(&b, &ctx(Some(600.0), None), 1.0, 50.0);
+        assert!((full - 99.5).abs() < 0.011, "full={full}");
+    }
+
+    #[test]
+    fn unknown_age_never_decays() {
+        let mut b = bot();
+        b.tp_decay_floor_pct = -0.005;
+        b.tp_decay_time_full_hours = 10.0;
+        let price = long_tp(&b, &ctx(None, None), 1.0, 50.0);
+        assert!((price - 105.0).abs() < 0.011, "price={price}");
+    }
+
+    #[test]
+    fn exposure_decay_uses_nominal_twel_over_n_positions() {
+        let mut b = bot();
+        b.total_wallet_exposure_limit = 2.0;
+        b.n_positions = 2;
+        b.tp_decay_floor_pct = -0.005;
+        b.tp_decay_we_start_ratio = 0.5;
+        b.tp_decay_we_full_ratio = 1.0;
+        // WE 0.8 over nominal base 1.0 -> factor 0.6 -> 0.05 + 0.6*(-0.055) = 0.017
+        let price = long_tp(&b, &ctx(None, None), 8.0, 50.0);
+        assert!((price - 101.7).abs() < 0.011, "price={price}");
+        // a divergence-capped runtime WEL does not move the trigger
+        let mut capped = ctx(None, None);
+        capped.effective_wallet_exposure_limit = 0.2;
+        let threshold = calc_close_threshold_pct(
+            &exchange(),
+            &state(50.0, 50.0),
+            &b,
+            &capped,
+            &close_params(),
+            &Position {
+                size: 8.0,
+                price: 100.0,
+            },
+        );
+        assert!((threshold - 0.017).abs() < 1e-9, "threshold={threshold}");
+    }
+
+    #[test]
+    fn decayed_tp_never_goes_below_the_ask() {
+        let mut b = bot();
+        b.tp_decay_floor_pct = -0.5;
+        b.tp_decay_time_full_hours = 1.0;
+        let price = long_tp(&b, &ctx(Some(600.0), None), 1.0, 99.9);
+        assert!((price - 99.9).abs() < 0.011, "price={price}");
+    }
+
+    #[test]
+    fn short_tp_decays_above_entry() {
+        let mut b = bot();
+        b.tp_decay_floor_pct = -0.005;
+        b.tp_decay_time_full_hours = 10.0;
+        let order = calc_next_close_short(
+            &exchange(),
+            &state(200.0, 200.0),
+            &b,
+            &ctx(Some(600.0), None),
+            &close_params(),
+            &Position {
+                size: -1.0,
+                price: 100.0,
+            },
+            &TrailingPriceBundle::default(),
+        );
+        assert!((order.price - 100.5).abs() < 0.011, "price={}", order.price);
+    }
+
+    #[test]
+    fn sma20_gate_decays_only_below_and_unknown_stays_closed() {
+        let mut b = bot();
+        b.tp_decay_floor_pct = -0.005;
+        b.tp_decay_time_full_hours = 1.0;
+        b.tp_decay_gate_sma20 = true;
+        assert!((long_tp(&b, &ctx(Some(600.0), Some(false)), 1.0, 50.0) - 99.5).abs() < 0.011);
+        assert!((long_tp(&b, &ctx(Some(600.0), Some(true)), 1.0, 50.0) - 105.0).abs() < 0.011);
+        assert!((long_tp(&b, &ctx(Some(600.0), None), 1.0, 50.0) - 105.0).abs() < 0.011);
+    }
+
+    #[test]
+    fn sma20_boost_scales_positive_tp_only_above() {
+        let mut b = bot();
+        b.tp_sma20_above_boost = 0.33;
+        let above = long_tp(&b, &ctx(None, Some(true)), 1.0, 50.0);
+        assert!(above > 106.6 && above < 106.7, "above={above}");
+        assert!((long_tp(&b, &ctx(None, Some(false)), 1.0, 50.0) - 105.0).abs() < 0.011);
+        assert!((long_tp(&b, &ctx(None, None), 1.0, 50.0) - 105.0).abs() < 0.011);
+        assert_eq!(
+            adjust_close_threshold_pct(-0.01, &b, &ctx(None, Some(true)).close_decay, 0.0, 1.0),
+            -0.01
+        );
+    }
+
+    #[test]
+    fn exposure_decay_turns_the_close_into_a_ladder() {
+        // With a WE-driven decay the threshold changes as the position shrinks, so the
+        // full-position shortcut must not apply.
+        let mut b = bot();
+        b.tp_decay_floor_pct = 0.0;
+        b.tp_decay_we_start_ratio = 0.0;
+        b.tp_decay_we_full_ratio = 1.0;
+        let mut params = close_params();
+        params.qty_pct = 0.25;
+        let closes = calc_closes_long(
+            &exchange(),
+            &state(50.0, 50.0),
+            &b,
+            &ctx(None, None),
+            &params,
+            &Position {
+                size: 8.0,
+                price: 100.0,
+            },
+            &TrailingPriceBundle::default(),
+        );
+        assert!(closes.len() > 1, "closes={closes:?}");
+        assert!(closes.windows(2).all(|w| w[0].price <= w[1].price));
+        let total: f64 = closes.iter().map(|o| -o.qty).sum();
+        assert!((total - 8.0).abs() < 1e-9, "total={total}");
+    }
+
+    fn offload_bot() -> BotParams {
+        let mut b = bot();
+        b.risky_offload_we_threshold = 0.5;
+        b.risky_offload_close_pct = 0.3;
+        b.risky_offload_markup_pct = 0.4;
+        b
+    }
+
+    fn offload(b: &BotParams, size: f64, ask: f64) -> Option<Order> {
+        calc_risky_offload_close(
+            StrategySide::Long,
+            &exchange(),
+            &state(ask, ask),
+            b,
+            &ctx(None, None),
+            &close_params(),
+            &Position { size, price: 100.0 },
+        )
+    }
+
+    #[test]
+    fn offload_needs_exposure_above_the_trigger() {
+        assert!(offload(&offload_bot(), 5.0, 50.0).is_none()); // WE ratio 0.5, not above
+        assert!(offload(&bot(), 8.0, 50.0).is_none()); // disabled
+        let order = offload(&offload_bot(), 8.0, 50.0).unwrap();
+        assert_eq!(order.order_type, OrderType::CloseRiskyOffloadLong);
+        assert!((order.qty + 2.4).abs() < 1e-9, "qty={}", order.qty);
+        // 40% of the 5% take-profit distance
+        assert!((order.price - 102.0).abs() < 0.011, "price={}", order.price);
+    }
+
+    #[test]
+    fn offload_never_below_ask_and_short_mirrors() {
+        let order = offload(&offload_bot(), 8.0, 103.0).unwrap();
+        assert!((order.price - 103.0).abs() < 1e-9);
+        let short = calc_risky_offload_close(
+            StrategySide::Short,
+            &exchange(),
+            &state(200.0, 200.0),
+            &offload_bot(),
+            &ctx(None, None),
+            &close_params(),
+            &Position {
+                size: -8.0,
+                price: 100.0,
+            },
+        )
+        .unwrap();
+        assert_eq!(short.order_type, OrderType::CloseRiskyOffloadShort);
+        assert!((short.qty - 2.4).abs() < 1e-9 && (short.price - 98.0).abs() < 0.011);
+    }
+
+    #[test]
+    fn offload_skips_non_positive_tp_and_sub_minimum_slices() {
+        let mut b = offload_bot();
+        b.tp_decay_floor_pct = -0.01;
+        b.tp_decay_time_full_hours = 1.0;
+        let decayed = calc_risky_offload_close(
+            StrategySide::Long,
+            &exchange(),
+            &state(50.0, 50.0),
+            &b,
+            &ctx(Some(600.0), None),
+            &close_params(),
+            &Position {
+                size: 8.0,
+                price: 100.0,
+            },
+        );
+        assert!(decayed.is_none());
+        let mut ex = exchange();
+        ex.min_cost = 1_000.0;
+        let small = calc_risky_offload_close(
+            StrategySide::Long,
+            &ex,
+            &state(50.0, 50.0),
+            &offload_bot(),
+            &ctx(None, None),
+            &close_params(),
+            &Position {
+                size: 8.0,
+                price: 100.0,
+            },
+        );
+        assert!(small.is_none());
+    }
 }

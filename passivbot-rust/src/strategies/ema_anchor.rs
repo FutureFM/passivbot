@@ -568,6 +568,7 @@ mod tests {
             trailing: &trailing,
             next_candle: None,
             peek: None,
+            close_decay: Default::default(),
         };
 
         let generated = generate_orders(StrategySide::Long, request);
@@ -744,6 +745,7 @@ mod tests {
             trailing: &trailing,
             next_candle: None,
             peek: None,
+            close_decay: Default::default(),
         };
 
         let generated = generate_orders(StrategySide::Long, request);
@@ -897,6 +899,7 @@ mod tests {
             trailing: &trailing,
             next_candle: None,
             peek: None,
+            close_decay: Default::default(),
         };
         let long_request = StrategyRequest {
             entry_reference_price: None,
@@ -911,6 +914,7 @@ mod tests {
             trailing: &trailing,
             next_candle: None,
             peek: None,
+            close_decay: Default::default(),
         };
         let opposite_request = StrategyRequest {
             entry_reference_price: None,
@@ -925,6 +929,7 @@ mod tests {
             trailing: &trailing,
             next_candle: None,
             peek: None,
+            close_decay: Default::default(),
         };
 
         let flat_qty = generate_orders(StrategySide::Long, flat_request).entries[0].qty;

@@ -19,6 +19,7 @@ mod hsl_snapshot;
 mod hsl_sum;
 mod hsl_trace;
 mod limit_fills;
+mod market_crash;
 mod orchestrator;
 mod python;
 mod risk;
@@ -120,6 +121,10 @@ fn passivbot_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     m.add_function(wrap_pyfunction!(
         divergence::divergence_held_intensity_json,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        market_crash::market_crash_severity_json,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(runtime_build_info, m)?)?;

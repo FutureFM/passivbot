@@ -2433,6 +2433,42 @@ fn bot_params_from_dict(dict: &PyDict, hsl: bool) -> PyResult<BotParams> {
             "divergence_cap_entries_only",
             false,
         )?,
+        market_crash_timeframe_minutes: extract_optional_f64_or(
+            dict,
+            "market_crash_timeframe_minutes",
+            0.0,
+        )?,
+        market_crash_min_drop_pct: extract_optional_f64_or(dict, "market_crash_min_drop_pct", 0.0)?,
+        market_crash_breadth_threshold_pct: extract_optional_f64_or(
+            dict,
+            "market_crash_breadth_threshold_pct",
+            50.0,
+        )?,
+        market_crash_cooldown_minutes: extract_optional_f64_or(
+            dict,
+            "market_crash_cooldown_minutes",
+            0.0,
+        )?,
+        market_crash_freeze_initial_entries: extract_optional_bool(
+            dict,
+            "market_crash_freeze_initial_entries",
+            false,
+        )?,
+        market_crash_we_cap_pct: extract_optional_f64_or(dict, "market_crash_we_cap_pct", 1.0)?,
+        risky_offload_we_threshold: extract_optional_f64_or(
+            dict,
+            "risky_offload_we_threshold",
+            0.0,
+        )?,
+        risky_offload_close_pct: extract_optional_f64_or(dict, "risky_offload_close_pct", 0.0)?,
+        risky_offload_markup_pct: extract_optional_f64_or(dict, "risky_offload_markup_pct", 1.0)?,
+        tp_decay_floor_pct: extract_optional_f64_or(dict, "tp_decay_floor_pct", 0.0)?,
+        tp_decay_time_start_hours: extract_optional_f64_or(dict, "tp_decay_time_start_hours", 0.0)?,
+        tp_decay_time_full_hours: extract_optional_f64_or(dict, "tp_decay_time_full_hours", 0.0)?,
+        tp_decay_we_start_ratio: extract_optional_f64_or(dict, "tp_decay_we_start_ratio", 0.0)?,
+        tp_decay_we_full_ratio: extract_optional_f64_or(dict, "tp_decay_we_full_ratio", 0.0)?,
+        tp_decay_gate_sma20: extract_optional_bool(dict, "tp_decay_gate_sma20", false)?,
+        tp_sma20_above_boost: extract_optional_f64_or(dict, "tp_sma20_above_boost", 0.0)?,
         n_positions,
         total_wallet_exposure_limit,
         wallet_exposure_limit,
@@ -2816,6 +2852,7 @@ fn make_runtime_order_context(wallet_exposure_limit: f64) -> RuntimeOrderContext
     RuntimeOrderContext {
         entry_reference_price: None,
         effective_wallet_exposure_limit: wallet_exposure_limit,
+        ..Default::default()
     }
 }
 
@@ -2907,6 +2944,7 @@ pub fn calc_trailing_grid_v7_diagnostic_py(input_json: &str) -> PyResult<String>
             .and_then(|runtime| runtime.get("effective_wallet_exposure_limit"))
             .and_then(Value::as_f64)
             .unwrap_or(bot.wallet_exposure_limit),
+        ..Default::default()
     };
     let out = calc_trailing_grid_v7_diagnostics(
         side, &exchange, &state, &bot, &runtime, &params, &position, &trailing,
@@ -2978,6 +3016,7 @@ pub fn calc_trailing_martingale_close_diagnostic_py(input_json: &str) -> PyResul
             .and_then(|runtime| runtime.get("effective_wallet_exposure_limit"))
             .and_then(Value::as_f64)
             .unwrap_or(bot.wallet_exposure_limit),
+        ..Default::default()
     };
     let out = calc_trailing_martingale_close_diagnostic(
         side,

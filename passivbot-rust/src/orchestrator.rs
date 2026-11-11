@@ -417,6 +417,10 @@ mod core {
         /// Exchange/fill-proven clock and unfinished reduction; None is unavailable.
         #[serde(default)]
         pub time_stop: Option<TimeStopState>,
+        /// Fill-proven timestamp of the fill that opened the current position episode;
+        /// None is unavailable. Consumed by the TP-decay time trigger only.
+        #[serde(default)]
+        pub position_opened_timestamp_ms: Option<u64>,
         /// Per-symbol/per-pside params after applying coin_overrides.
         pub bot_params: BotParams,
         #[serde(default)]
@@ -459,6 +463,10 @@ mod core {
         /// (0 = none). The caller rebuilds it from completed-candle history.
         #[serde(default)]
         pub divergence_held_intensity: [f64; 2],
+        /// Simple average of the last 20 completed UTC daily closes; None is unavailable.
+        /// Consumed by the TP-decay SMA20 gate and boost only.
+        #[serde(default)]
+        pub daily_sma20: Option<f64>,
         pub order_book: OrderBook, // must have bid>0 and ask>0
         pub exchange: ExchangeParams,
         pub tradable: bool,
@@ -506,6 +514,10 @@ mod core {
         /// Optional forager hysteresis input reconstructed from current open entry orders.
         #[serde(default)]
         pub forager_hysteresis: Option<super::ForagerHysteresisState>,
+        /// Market-crash severity `[long, short]` in `[0, 1]` (0 = none), including the
+        /// cooldown. The caller rebuilds it from completed-candle history.
+        #[serde(default)]
+        pub market_crash_severity: [f64; 2],
     }
 
     fn default_balance_raw() -> f64 {
@@ -539,6 +551,16 @@ mod core {
         {
             return Err(OrchestratorError::NonFiniteInput {
                 field: "global.max_realized_loss_pct",
+                symbol_idx: None,
+            });
+        }
+        if input
+            .market_crash_severity
+            .iter()
+            .any(|severity| !(severity.is_finite() && (0.0..=1.0).contains(severity)))
+        {
+            return Err(OrchestratorError::NonFiniteInput {
+                field: "market_crash_severity",
                 symbol_idx: None,
             });
         }
@@ -639,6 +661,8 @@ mod core {
                 | CloseEmaAnchorShort
                 | CloseTimeStopLong
                 | CloseTimeStopShort
+                | CloseRiskyOffloadLong
+                | CloseRiskyOffloadShort
         )
     }
 
@@ -2863,6 +2887,7 @@ mod core {
                             entry_reference_price: None,
                             effective_wallet_exposure_limit: runtime_budget
                                 .effective_wallet_exposure_limit,
+                            ..Default::default()
                         };
                         let initial_qty = calc_initial_entry_qty(
                             exchange,
@@ -2940,6 +2965,7 @@ mod core {
         let runtime_context = RuntimeOrderContext {
             entry_reference_price: None,
             effective_wallet_exposure_limit: runtime_budget.effective_wallet_exposure_limit,
+            ..Default::default()
         };
         let wallet_exposure = calc_wallet_exposure(
             symbol.exchange.c_mult,
@@ -3141,6 +3167,35 @@ mod core {
         serde_json::to_string(&result).map_err(|e| e.to_string())
     }
 
+    /// Facts for the TP-decay close adjustment. A missing or future opening timestamp and a
+    /// missing SMA20 stay unavailable; neither is replaced by a neutral guess.
+    fn close_decay_inputs(
+        input: &OrchestratorInput,
+        symbol: &SymbolInput,
+        side: &SymbolSideInput,
+    ) -> crate::types::CloseDecayInputs {
+        let price = 0.5 * (symbol.order_book.bid + symbol.order_book.ask);
+        crate::types::CloseDecayInputs {
+            position_age_minutes: side
+                .position_opened_timestamp_ms
+                .filter(|_| side.position.size != 0.0)
+                .and_then(|opened| input.timestamp_ms.checked_sub(opened))
+                .map(|elapsed_ms| elapsed_ms as f64 / 60_000.0),
+            price_above_sma20: symbol
+                .daily_sma20
+                .filter(|sma| sma.is_finite() && *sma > 0.0)
+                .and_then(|sma| {
+                    if price > sma {
+                        Some(true)
+                    } else if price < sma {
+                        Some(false)
+                    } else {
+                        None
+                    }
+                }),
+        }
+    }
+
     fn generate_strategy_ideal_orders(
         input: &OrchestratorInput,
         symbol: &SymbolInput,
@@ -3256,6 +3311,7 @@ mod core {
                         }
                     },
                 }),
+                close_decay: close_decay_inputs(input, symbol, side),
             },
         );
         let mut entries = Vec::new();
@@ -3898,6 +3954,37 @@ mod core {
                     .divergence_cap_entries_only
             },
         );
+        // Market crash: thresholds and effects come from the global side params. The WEL cap
+        // shrinks the entry budget only, after the held-position budget was fixed above, so
+        // it can never force exits at the bottom.
+        let crash_params_long = &input.global.global_bot_params.long;
+        let crash_params_short = &input.global.global_bot_params.short;
+        let crash_freeze_initial_long = crate::market_crash::freezes_initial_entries(
+            crash_params_long,
+            input.market_crash_severity[0],
+        );
+        let crash_freeze_initial_short = crate::market_crash::freezes_initial_entries(
+            crash_params_short,
+            input.market_crash_severity[1],
+        );
+        let crash_entry_factor_long = crate::market_crash::entry_wel_factor(
+            crash_params_long,
+            input.market_crash_severity[0],
+        );
+        let crash_entry_factor_short = crate::market_crash::entry_wel_factor(
+            crash_params_short,
+            input.market_crash_severity[1],
+        );
+        if crash_entry_factor_long != 1.0 {
+            for budget in workspace.runtime_budget_long.iter_mut() {
+                budget.effective_wallet_exposure_limit *= crash_entry_factor_long;
+            }
+        }
+        if crash_entry_factor_short != 1.0 {
+            for budget in workspace.runtime_budget_short.iter_mut() {
+                budget.effective_wallet_exposure_limit *= crash_entry_factor_short;
+            }
+        }
         workspace
             .derived_long
             .resize_with(n_symbols, CachedSideDerived::default);
@@ -4302,6 +4389,7 @@ mod core {
                 let allow_initial = symbol_side_eligible(s, PositionSide::Long)
                     && actives_long[s.symbol_idx]
                     && !workspace.one_way_block_initial_long[s.symbol_idx]
+                    && !crash_freeze_initial_long
                     && effective_min_cost_is_low_enough(
                         input.balance,
                         input.global.filter_by_min_effective_cost,
@@ -4422,6 +4510,7 @@ mod core {
                 let allow_initial = symbol_side_eligible(s, PositionSide::Short)
                     && actives_short[s.symbol_idx]
                     && !workspace.one_way_block_initial_short[s.symbol_idx]
+                    && !crash_freeze_initial_short
                     && effective_min_cost_is_low_enough(
                         input.balance,
                         input.global.filter_by_min_effective_cost,
@@ -5311,6 +5400,7 @@ mod core {
                     last_increase_fill_timestamp_ms: None,
                     time_stop: None,
                     runtime_budget: None,
+                    position_opened_timestamp_ms: None,
                 },
                 short: SymbolSideInput {
                     mode: None,
@@ -5323,7 +5413,9 @@ mod core {
                     last_increase_fill_timestamp_ms: None,
                     time_stop: None,
                     runtime_budget: None,
+                    position_opened_timestamp_ms: None,
                 },
+                daily_sma20: None,
             }
         }
 
@@ -5521,6 +5613,7 @@ mod core {
                 symbols: vec![symbol],
                 peek_hints: None,
                 forager_hysteresis: None,
+                market_crash_severity: [0.0; 2],
             };
             let order = calc_time_stop_close(
                 &input,
@@ -5556,6 +5649,7 @@ mod core {
                 symbols: vec![symbol],
                 peek_hints: None,
                 forager_hysteresis: None,
+                market_crash_severity: [0.0; 2],
             };
             assert!(calc_time_stop_close(
                 &input,
@@ -6048,6 +6142,7 @@ mod core {
                 symbols: vec![sym],
                 peek_hints: None,
                 forager_hysteresis: None,
+                market_crash_severity: [0.0; 2],
             };
 
             let out = compute_ideal_orders_for_test(&input).unwrap();
@@ -6088,6 +6183,7 @@ mod core {
                 symbols: vec![symbol],
                 peek_hints: None,
                 forager_hysteresis: None,
+                market_crash_severity: [0.0; 2],
             };
 
             let out = compute_ideal_orders_for_test(&input).unwrap();
@@ -6516,6 +6612,7 @@ mod core {
                 symbols: vec![sym.clone()],
                 peek_hints: None,
                 forager_hysteresis: None,
+                market_crash_severity: [0.0; 2],
             };
 
             // Typed Rust callers must reject invalid hints too, including non-finite
@@ -6585,6 +6682,7 @@ mod core {
                 symbols: vec![sym],
                 peek_hints: None,
                 forager_hysteresis: None,
+                market_crash_severity: [0.0; 2],
             };
 
             let out = compute_ideal_orders_for_test(&input).unwrap();
@@ -6654,6 +6752,7 @@ mod core {
                 symbols: vec![sym],
                 peek_hints: None,
                 forager_hysteresis: None,
+                market_crash_severity: [0.0; 2],
             };
 
             let out = compute_ideal_orders_for_test(&input).unwrap();
@@ -6717,6 +6816,7 @@ mod core {
                 peek_hints: Some(EntryPeekHints::default()),
                 forager_hysteresis: None,
                 timestamp_ms: 0,
+                market_crash_severity: [0.0; 2],
             };
             let out_flat = compute_ideal_orders_for_test(&input_flat).unwrap();
             let n_entries_flat = out_flat
@@ -6772,6 +6872,7 @@ mod core {
                 peek_hints: None,
                 forager_hysteresis: None,
                 timestamp_ms: 0,
+                market_crash_severity: [0.0; 2],
             };
 
             let out = compute_ideal_orders_for_test(&input).unwrap();
@@ -6844,6 +6945,7 @@ mod core {
                 symbols: vec![sym],
                 peek_hints: None,
                 forager_hysteresis: None,
+                market_crash_severity: [0.0; 2],
             };
             let out = compute_ideal_orders_for_test(&input).unwrap();
             // With no position and GracefulStop, we should not emit any entries.
@@ -6884,6 +6986,7 @@ mod core {
                 symbols: vec![sym],
                 peek_hints: None,
                 forager_hysteresis: None,
+                market_crash_severity: [0.0; 2],
             };
 
             let out = compute_ideal_orders_for_test(&input).unwrap();
@@ -6933,6 +7036,7 @@ mod core {
                 symbols: vec![sym],
                 peek_hints: None,
                 forager_hysteresis: None,
+                market_crash_severity: [0.0; 2],
             };
 
             let out = compute_ideal_orders_for_test(&input).unwrap();
@@ -6994,6 +7098,7 @@ mod core {
                 symbols: vec![sym0, sym1],
                 peek_hints: None,
                 forager_hysteresis: None,
+                market_crash_severity: [0.0; 2],
             };
 
             let out = compute_ideal_orders_for_test(&input).unwrap();
@@ -7052,6 +7157,7 @@ mod core {
                 symbols: vec![sym0, sym1],
                 peek_hints: None,
                 forager_hysteresis: None,
+                market_crash_severity: [0.0; 2],
             };
 
             let out = compute_ideal_orders_for_test(&input).unwrap();
@@ -7109,6 +7215,7 @@ mod core {
                 symbols: vec![sym0, sym1],
                 peek_hints: None,
                 forager_hysteresis: None,
+                market_crash_severity: [0.0; 2],
             };
 
             let out = compute_ideal_orders_for_test(&input).unwrap();
@@ -7160,6 +7267,7 @@ mod core {
                 symbols: vec![sym0, sym1],
                 peek_hints: None,
                 forager_hysteresis: None,
+                market_crash_severity: [0.0; 2],
             };
 
             let out = compute_ideal_orders_for_test(&input).unwrap();
@@ -7211,6 +7319,7 @@ mod core {
                 symbols: vec![sym0, sym1],
                 peek_hints: None,
                 forager_hysteresis: None,
+                market_crash_severity: [0.0; 2],
             };
 
             let err = compute_ideal_orders_for_test(&input).unwrap_err();
@@ -7430,6 +7539,7 @@ mod core {
                 symbols: vec![sym0, sym1],
                 peek_hints: None,
                 forager_hysteresis: None,
+                market_crash_severity: [0.0; 2],
             };
 
             let out = compute_ideal_orders_for_test(&input).unwrap();
@@ -7500,6 +7610,7 @@ mod core {
                 symbols: syms,
                 peek_hints: None,
                 forager_hysteresis: None,
+                market_crash_severity: [0.0; 2],
             };
 
             let out = compute_ideal_orders_for_test(&input).unwrap();
@@ -7553,6 +7664,7 @@ mod core {
                 symbols: syms,
                 peek_hints: None,
                 forager_hysteresis: None,
+                market_crash_severity: [0.0; 2],
             };
 
             let out = compute_ideal_orders_for_test(&input).unwrap();
@@ -8248,6 +8360,7 @@ mod core {
                 symbols: vec![sym.clone()],
                 peek_hints: None,
                 forager_hysteresis: None,
+                market_crash_severity: [0.0; 2],
             };
             let out_open = compute_ideal_orders_for_test(&input_open).unwrap();
             assert!(
@@ -8324,6 +8437,7 @@ mod core {
                 symbols: vec![sym],
                 peek_hints: None,
                 forager_hysteresis: None,
+                market_crash_severity: [0.0; 2],
             };
 
             let out = compute_ideal_orders_for_test(&input).unwrap();
@@ -8388,6 +8502,7 @@ mod core {
                 symbols: vec![sym0.clone(), sym1.clone()],
                 peek_hints: None,
                 forager_hysteresis: None,
+                market_crash_severity: [0.0; 2],
             };
             let mut per_long = vec![
                 Some(PerSymbolOrders {
@@ -8479,6 +8594,7 @@ mod core {
                 symbols: vec![sym0.clone(), sym1.clone()],
                 peek_hints: None,
                 forager_hysteresis: None,
+                market_crash_severity: [0.0; 2],
             };
             let mut per_long = vec![
                 Some(PerSymbolOrders {
@@ -8557,6 +8673,7 @@ mod core {
                 symbols: vec![sym.clone()],
                 peek_hints: None,
                 forager_hysteresis: None,
+                market_crash_severity: [0.0; 2],
             };
             let mut per_long = vec![Some(PerSymbolOrders {
                 symbol_idx: 0,
@@ -8628,6 +8745,7 @@ mod core {
                 symbols: vec![sym.clone()],
                 peek_hints: None,
                 forager_hysteresis: None,
+                market_crash_severity: [0.0; 2],
             };
             let mut per_long = vec![Some(PerSymbolOrders {
                 symbol_idx: 0,
@@ -8689,6 +8807,7 @@ mod core {
                     symbols: vec![sym.clone()],
                     peek_hints: None,
                     forager_hysteresis: None,
+                    market_crash_severity: [0.0; 2],
                 };
                 let mut per_long = vec![Some(PerSymbolOrders {
                     symbol_idx: 0,
@@ -8763,6 +8882,7 @@ mod core {
                 symbols: vec![sym0.clone(), sym1.clone()],
                 peek_hints: None,
                 forager_hysteresis: None,
+                market_crash_severity: [0.0; 2],
             };
             let mut per_long = vec![
                 Some(PerSymbolOrders {
@@ -8907,6 +9027,7 @@ mod core {
                 symbols: vec![sym],
                 peek_hints: None,
                 forager_hysteresis: None,
+                market_crash_severity: [0.0; 2],
             };
             let out = compute_ideal_orders_for_test(&input).unwrap();
             assert!(
@@ -8970,6 +9091,7 @@ mod core {
                     symbols: vec![sym],
                     peek_hints: None,
                     forager_hysteresis: None,
+                    market_crash_severity: [0.0; 2],
                 };
                 assert_eq!(
                     compute_ideal_orders_for_test(&input).unwrap_err(),
@@ -8991,6 +9113,7 @@ mod core {
                 symbols: vec![make_basic_symbol(0)],
                 peek_hints: None,
                 forager_hysteresis: None,
+                market_crash_severity: [0.0; 2],
             };
             input.global.realized_pnl_cumsum_max = 5.0;
             input.global.realized_pnl_cumsum_last = 10.0;
@@ -9054,6 +9177,7 @@ mod core {
                 symbols: vec![sym],
                 peek_hints: None,
                 forager_hysteresis: None,
+                market_crash_severity: [0.0; 2],
             };
             let out = compute_ideal_orders_for_test(&input).unwrap();
             assert!(
@@ -9126,6 +9250,7 @@ mod core {
                 symbols: vec![sym0, sym1],
                 peek_hints: None,
                 forager_hysteresis: None,
+                market_crash_severity: [0.0; 2],
             };
             let out = compute_ideal_orders_for_test(&input).unwrap();
             let twel_closes = out
@@ -9205,6 +9330,7 @@ mod core {
                 symbols: vec![sym0, sym1],
                 peek_hints: None,
                 forager_hysteresis: None,
+                market_crash_severity: [0.0; 2],
             };
             let out = compute_ideal_orders_for_test(&input).unwrap();
             let twel_closes = out
@@ -9266,6 +9392,7 @@ mod core {
                 symbols: vec![sym],
                 peek_hints: None,
                 forager_hysteresis: None,
+                market_crash_severity: [0.0; 2],
             };
             let out = compute_ideal_orders_for_test(&input).unwrap();
             let entry_orders: Vec<_> = out
@@ -9338,6 +9465,7 @@ mod core {
                 symbols: vec![sym],
                 peek_hints: None,
                 forager_hysteresis: None,
+                market_crash_severity: [0.0; 2],
             };
             let out = compute_ideal_orders_for_test(&input).unwrap();
             assert_eq!(out.orders.len(), 1);
@@ -9389,6 +9517,7 @@ mod core {
                 symbols: vec![sym],
                 peek_hints: None,
                 forager_hysteresis: None,
+                market_crash_severity: [0.0; 2],
             };
             let out = compute_ideal_orders_for_test(&input).unwrap();
             assert_eq!(out.orders.len(), 1);

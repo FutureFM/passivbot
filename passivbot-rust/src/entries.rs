@@ -1258,6 +1258,7 @@ mod tests {
         RuntimeOrderContext {
             entry_reference_price: None,
             effective_wallet_exposure_limit: 1.0,
+            ..Default::default()
         }
     }
 

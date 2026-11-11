@@ -2181,6 +2181,7 @@ pub fn generate_orders(side: StrategySide, request: StrategyRequest<'_>) -> Gene
     let runtime_context = RuntimeOrderContext {
         entry_reference_price: request.entry_reference_price,
         effective_wallet_exposure_limit: request.runtime_budget.effective_wallet_exposure_limit,
+        ..Default::default()
     };
     let TrailingGridV7Params { entry, close, .. } = *params;
     match side {
@@ -2550,6 +2551,7 @@ mod tests {
         RuntimeOrderContext {
             entry_reference_price: None,
             effective_wallet_exposure_limit: 1.0,
+            ..Default::default()
         }
     }
 

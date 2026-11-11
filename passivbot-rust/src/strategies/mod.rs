@@ -216,6 +216,8 @@ pub struct StrategyRequest<'a> {
     pub trailing: &'a TrailingPriceBundle,
     pub next_candle: Option<NextStepHint>,
     pub peek: Option<PeekBehavior>,
+    /// Facts for the TP-decay close adjustment (trailing_martingale closes only).
+    pub close_decay: crate::types::CloseDecayInputs,
 }
 
 pub fn parse_strategy_params(

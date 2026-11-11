@@ -1,6 +1,7 @@
 use super::{GeneratedOrders, StrategyParams, StrategyRequest, StrategySide};
 use crate::closes::{
     calc_closes_long, calc_closes_short, calc_next_close_long, calc_next_close_short,
+    calc_risky_offload_close,
 };
 use crate::entries::{
     calc_entries_long, calc_entries_short, calc_next_entry_long, calc_next_entry_short,
@@ -40,6 +41,7 @@ pub fn generate_orders(side: StrategySide, request: StrategyRequest<'_>) -> Gene
     let runtime_context = RuntimeOrderContext {
         entry_reference_price: request.entry_reference_price,
         effective_wallet_exposure_limit: request.runtime_budget.effective_wallet_exposure_limit,
+        close_decay: request.close_decay,
     };
     let entry_params = params.entry_params();
     let close_params = params.close_params();
@@ -126,6 +128,17 @@ pub fn generate_orders(side: StrategySide, request: StrategyRequest<'_>) -> Gene
             }
 
             if request.wants_closes {
+                // Offload of an over-exposed position: rests alongside the ordinary closes
+                // in every path, so live and backtest see the same order.
+                let offload = calc_risky_offload_close(
+                    StrategySide::Long,
+                    request.exchange,
+                    request.state,
+                    request.bot_params,
+                    &runtime_context,
+                    &close_params,
+                    request.position,
+                );
                 if let Some(peek) = request.peek {
                     if peek.expand_closes {
                         extend_nonzero(
@@ -179,7 +192,15 @@ pub fn generate_orders(side: StrategySide, request: StrategyRequest<'_>) -> Gene
                             next.high,
                             &closes,
                             next.limit_order_fill_buffer_pct,
-                        ) {
+                        ) || offload.as_ref().is_some_and(|order| {
+                            would_fill_next_candle(
+                                next.low,
+                                next.high,
+                                order.qty,
+                                order.price,
+                                next.limit_order_fill_buffer_pct,
+                            )
+                        }) {
                             extend_nonzero(&mut generated.closes, closes);
                         } else {
                             push_if_nonzero(&mut generated.closes, next_close);
@@ -200,6 +221,9 @@ pub fn generate_orders(side: StrategySide, request: StrategyRequest<'_>) -> Gene
                             request.trailing,
                         ),
                     );
+                }
+                if let Some(order) = offload {
+                    push_if_nonzero(&mut generated.closes, order);
                 }
             }
         }
@@ -284,6 +308,17 @@ pub fn generate_orders(side: StrategySide, request: StrategyRequest<'_>) -> Gene
             }
 
             if request.wants_closes {
+                // Offload of an over-exposed position: rests alongside the ordinary closes
+                // in every path, so live and backtest see the same order.
+                let offload = calc_risky_offload_close(
+                    StrategySide::Short,
+                    request.exchange,
+                    request.state,
+                    request.bot_params,
+                    &runtime_context,
+                    &close_params,
+                    request.position,
+                );
                 if let Some(peek) = request.peek {
                     if peek.expand_closes {
                         extend_nonzero(
@@ -337,7 +372,15 @@ pub fn generate_orders(side: StrategySide, request: StrategyRequest<'_>) -> Gene
                             next.high,
                             &closes,
                             next.limit_order_fill_buffer_pct,
-                        ) {
+                        ) || offload.as_ref().is_some_and(|order| {
+                            would_fill_next_candle(
+                                next.low,
+                                next.high,
+                                order.qty,
+                                order.price,
+                                next.limit_order_fill_buffer_pct,
+                            )
+                        }) {
                             extend_nonzero(&mut generated.closes, closes);
                         } else {
                             push_if_nonzero(&mut generated.closes, next_close);
@@ -358,6 +401,9 @@ pub fn generate_orders(side: StrategySide, request: StrategyRequest<'_>) -> Gene
                             request.trailing,
                         ),
                     );
+                }
+                if let Some(order) = offload {
+                    push_if_nonzero(&mut generated.closes, order);
                 }
             }
         }
@@ -409,6 +455,7 @@ mod tests {
                 tradable: true,
             }),
             peek: None,
+            close_decay: Default::default(),
         }
     }
 

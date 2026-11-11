@@ -513,6 +513,9 @@ fn default_divergence_persistence_pct() -> f64 {
 fn default_divergence_long_horizon_zscore() -> f64 {
     3.0
 }
+fn default_market_crash_breadth_threshold_pct() -> f64 {
+    50.0
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -631,6 +634,54 @@ pub struct BotParams {
     /// for closes, unstuck, time stops and the position-exposure enforcer.
     #[serde(default)]
     pub divergence_cap_entries_only: bool,
+    /// Market-wide adverse move ("crash" for longs, squeeze for shorts): active while at
+    /// least `market_crash_breadth_threshold_pct` percent of the coins with a valid ROC over
+    /// `market_crash_timeframe_minutes` (0 = off; else 5, 15, 60 or 240) moved against this
+    /// side by more than `market_crash_min_drop_pct` percent. Read from the global params.
+    #[serde(default)]
+    pub market_crash_timeframe_minutes: f64,
+    #[serde(default)]
+    pub market_crash_min_drop_pct: f64,
+    #[serde(default = "default_market_crash_breadth_threshold_pct")]
+    pub market_crash_breadth_threshold_pct: f64,
+    /// Minutes over which the last active severity decays linearly to zero.
+    #[serde(default)]
+    pub market_crash_cooldown_minutes: f64,
+    /// While severity > 0, flat coins on this side get no initial entry.
+    #[serde(default)]
+    pub market_crash_freeze_initial_entries: bool,
+    /// Entry-only WEL factor at full severity (`0 < cap < 1`; 1 = off). Never shrinks the
+    /// budget of a held position, so it cannot force exits at the bottom.
+    #[serde(default = "default_time_stop_one")]
+    pub market_crash_we_cap_pct: f64,
+    /// Offload: while WE / WEL exceeds `risky_offload_we_threshold` (0 = off), one extra
+    /// reduce-only limit close of `risky_offload_close_pct` of the position rests at
+    /// `risky_offload_markup_pct` of the strategy's take-profit distance.
+    #[serde(default)]
+    pub risky_offload_we_threshold: f64,
+    #[serde(default)]
+    pub risky_offload_close_pct: f64,
+    #[serde(default = "default_time_stop_one")]
+    pub risky_offload_markup_pct: f64,
+    /// TP decay (trailing_martingale closes): the close threshold slides toward
+    /// `tp_decay_floor_pct` (may be negative) as the position ages or grows. A `full` value
+    /// of 0 disables that trigger.
+    #[serde(default)]
+    pub tp_decay_floor_pct: f64,
+    #[serde(default)]
+    pub tp_decay_time_start_hours: f64,
+    #[serde(default)]
+    pub tp_decay_time_full_hours: f64,
+    #[serde(default)]
+    pub tp_decay_we_start_ratio: f64,
+    #[serde(default)]
+    pub tp_decay_we_full_ratio: f64,
+    /// Decay only while price is below the SMA of the last 20 completed daily closes.
+    #[serde(default)]
+    pub tp_decay_gate_sma20: bool,
+    /// Positive close thresholds grow by this fraction while price is above that SMA20.
+    #[serde(default)]
+    pub tp_sma20_above_boost: f64,
     #[serde(default)]
     pub entry_cooldown_min_duration_minutes: f64,
     #[serde(default)]
@@ -719,6 +770,22 @@ impl Default for BotParams {
             divergence_long_horizon_minutes: 0.0,
             divergence_long_horizon_zscore: default_divergence_long_horizon_zscore(),
             divergence_cap_entries_only: false,
+            market_crash_timeframe_minutes: 0.0,
+            market_crash_min_drop_pct: 0.0,
+            market_crash_breadth_threshold_pct: default_market_crash_breadth_threshold_pct(),
+            market_crash_cooldown_minutes: 0.0,
+            market_crash_freeze_initial_entries: false,
+            market_crash_we_cap_pct: 1.0,
+            risky_offload_we_threshold: 0.0,
+            risky_offload_close_pct: 0.0,
+            risky_offload_markup_pct: 1.0,
+            tp_decay_floor_pct: 0.0,
+            tp_decay_time_start_hours: 0.0,
+            tp_decay_time_full_hours: 0.0,
+            tp_decay_we_start_ratio: 0.0,
+            tp_decay_we_full_ratio: 0.0,
+            tp_decay_gate_sma20: false,
+            tp_sma20_above_boost: 0.0,
             entry_cooldown_min_duration_minutes: 0.0,
             entry_cooldown_max_duration_minutes: None,
             entry_cooldown_weights_minutes: Default::default(),
@@ -749,6 +816,18 @@ impl Default for BotParams {
 pub struct RuntimeOrderContext {
     pub effective_wallet_exposure_limit: f64,
     pub entry_reference_price: Option<f64>,
+    pub close_decay: CloseDecayInputs,
+}
+
+/// Facts the TP-decay close adjustment consumes. Absent facts never fabricate a decay:
+/// an unknown age leaves the time trigger at zero, an unknown SMA20 keeps the gate closed
+/// and the boost off.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct CloseDecayInputs {
+    /// Minutes since the fill that opened the current position episode.
+    pub position_age_minutes: Option<f64>,
+    /// Current price relative to the SMA of the last 20 completed daily closes.
+    pub price_above_sma20: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -824,6 +903,8 @@ pub enum OrderType {
     CloseEmaAnchorShort = 29,
     CloseTimeStopLong = 30,
     CloseTimeStopShort = 31,
+    CloseRiskyOffloadLong = 32,
+    CloseRiskyOffloadShort = 33,
 
     Empty = 65535,
 }
@@ -861,6 +942,7 @@ impl OrderType {
                 | EntryEmaAnchorLong
                 | CloseEmaAnchorLong
                 | CloseTimeStopLong
+                | CloseRiskyOffloadLong
         )
     }
 
@@ -909,6 +991,8 @@ impl OrderType {
                 | CloseTimeStopLong
                 | CloseEmaAnchorShort
                 | CloseTimeStopShort
+                | CloseRiskyOffloadLong
+                | CloseRiskyOffloadShort
         )
     }
 }
