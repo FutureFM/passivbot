@@ -19,6 +19,7 @@ Open only the contract for the subsystem being changed.
 | Strategy schema and Rust runtime | `strategy_runtime.md` |
 | Time-based position reductions | `time_stop.md` |
 | Cross-asset divergence protection | `divergence_protection.md` |
+| Market crash protection, risky offload, TP decay | `market_crash_offload_tp_decay.md` |
 
 Feature contracts contain current invariants, failure semantics, non-obvious edge cases,
 validation, and code/test locations. They do not carry progress ledgers or generic coding advice.

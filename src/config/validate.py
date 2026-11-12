@@ -95,6 +95,52 @@ def _validate_time_stop(side: dict, path: str, *, partial=False):
             raise ValueError(f"{path}.risk.{name} is outside its finite valid range")
 
 
+MARKET_CRASH_TIMEFRAMES_MINUTES = (5.0, 15.0, 60.0, 240.0)
+
+
+def _validate_crash_offload_decay(side: dict, path: str) -> None:
+    """Range checks for market-crash, risky-offload and TP-decay risk fields."""
+
+    def number(name, minimum, maximum=None, *, exclusive_zero=False):
+        value = get_grouped_bot_value(side, name)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{path}.risk.{name} must be numeric")
+        if (
+            not math.isfinite(value)
+            or value < minimum
+            or (maximum is not None and value > maximum)
+            or (exclusive_zero and value == 0.0)
+        ):
+            raise ValueError(f"{path}.risk.{name} is outside its allowed range")
+        return float(value)
+
+    for name in ("market_crash_freeze_initial_entries", "tp_decay_gate_sma20"):
+        if not isinstance(get_grouped_bot_value(side, name), bool):
+            raise ValueError(f"{path}.risk.{name} must be a boolean")
+    timeframe = number("market_crash_timeframe_minutes", 0.0)
+    if timeframe != 0.0 and timeframe not in MARKET_CRASH_TIMEFRAMES_MINUTES:
+        raise ValueError(
+            f"{path}.risk.market_crash_timeframe_minutes must be 0 or one of "
+            f"{[int(v) for v in MARKET_CRASH_TIMEFRAMES_MINUTES]}"
+        )
+    number("market_crash_min_drop_pct", 0.0)
+    number("market_crash_breadth_threshold_pct", 0.0, 100.0)
+    number("market_crash_cooldown_minutes", 0.0)
+    number("market_crash_we_cap_pct", 0.0, 1.0, exclusive_zero=True)
+    number("risky_offload_we_threshold", 0.0)
+    number("risky_offload_close_pct", 0.0, 1.0)
+    number("risky_offload_markup_pct", 0.0)
+    floor = get_grouped_bot_value(side, "tp_decay_floor_pct")
+    if isinstance(floor, bool) or not isinstance(floor, (int, float)) or not math.isfinite(floor):
+        raise ValueError(f"{path}.risk.tp_decay_floor_pct must be finite")
+    # `full <= start` is a valid step ramp in Rust, so only the ranges are checked here.
+    number("tp_decay_time_start_hours", 0.0)
+    number("tp_decay_time_full_hours", 0.0)
+    number("tp_decay_we_start_ratio", 0.0)
+    number("tp_decay_we_full_ratio", 0.0)
+    number("tp_sma20_above_boost", 0.0)
+
+
 def validate_limit_order_fill_buffer_pct(value) -> float:
     if (
         isinstance(value, bool)
@@ -251,6 +297,7 @@ def validate_config(
             raise ValueError(
                 f"bot.{pside}.risk.divergence_min_timeframes must be 1..{max_timeframes}"
             )
+        _validate_crash_offload_decay(bot_side, f"bot.{pside}")
         normalize_twel_enforcer_policy(
             get_grouped_bot_value(bot_side, "risk_twel_enforcer_policy"),
             path=f"bot.{pside}.risk.total_exposure_enforcer_policy",

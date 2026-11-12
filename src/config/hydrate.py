@@ -12,7 +12,11 @@ from optimization.random_seed import normalize_optional_seed
 
 from .limits import _resolve_optimize_limits_for_load
 from .log_output import log_config_message
-from .optimize_bounds import SHARED_OPTIMIZE_LOCAL_TO_FLAT_KEY, sort_optimize_bounds_in_place
+from .optimize_bounds import (
+    OPTIONAL_RISK_BOUND_PREFIXES,
+    SHARED_OPTIMIZE_LOCAL_TO_FLAT_KEY,
+    sort_optimize_bounds_in_place,
+)
 from .scoring import extract_objective_specs
 from .schema import get_template_config
 from .tree_ops import add_missing_keys_recursively, remove_unused_keys_recursively
@@ -46,7 +50,7 @@ _OPTIONAL_OPTIMIZE_BOUND_PATHS: tuple[Path, ...] = tuple(
     (pside, "risk", key)
     for pside in ("long", "short")
     for key in SHARED_OPTIMIZE_LOCAL_TO_FLAT_KEY["risk"]
-    if key.startswith("divergence_")
+    if key.startswith(OPTIONAL_RISK_BOUND_PREFIXES)
 )
 
 

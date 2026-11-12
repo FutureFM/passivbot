@@ -41,6 +41,12 @@ from candlestick_manager import (
     OhlcvTerminalEmptyPage,
     fetch_candles_with_resolution_ladder,
 )
+from close_decay_inputs import (
+    DailySma20Cache,
+    age_consumed,
+    crash_history_minutes,
+    sma20_consumed,
+)
 from divergence_inputs import (
     collect_divergence_inputs,
     hold_history_minutes,
@@ -13100,6 +13106,46 @@ class Passivbot:
                 break
         return out
 
+    def _get_position_open_timestamps(self, symbols):
+        """Opening-fill timestamps of current positions for the TP-decay time trigger.
+
+        Rebuilt from the canonical fill stream (no local clock). Unproven episodes map to
+        None, which Rust treats as "age unknown": no time decay, never a guessed age.
+        """
+        out = {symbol: {"long": None, "short": None} for symbol in symbols}
+        needed = {
+            (symbol, pside)
+            for symbol in symbols
+            for pside in ("long", "short")
+            if abs(float(self.positions.get(symbol, {}).get(pside, {}).get("size", 0))) > 0
+            and age_consumed(
+                {"tp_decay_time_full_hours": self.bp(pside, "tp_decay_time_full_hours", symbol)}
+            )
+        }
+        if not needed:
+            return out
+        if self._pnls_manager is None:
+            logging.warning("[tp_decay] fill history unavailable; position age unknown")
+            return out
+        facts = reconstruct_episodes(
+            self._pnls_manager.get_events(), self.positions, self.qty_steps, self.c_mults,
+            self._fill_history_coverage_status, needed,
+        )
+        unproven = []
+        for symbol, pside in needed:
+            fact = facts.get((symbol, pside))
+            if fact is None:
+                unproven.append(f"{symbol}:{pside}")
+                continue
+            out[symbol][pside] = int(fact["opened_timestamp_ms"])
+        signature = tuple(sorted(unproven))
+        if signature and signature != getattr(self, "_tp_decay_age_unproven_signature", ()):
+            logging.warning(
+                "[tp_decay] position age unproven (no decay applied) for %s", ", ".join(signature)
+            )
+        self._tp_decay_age_unproven_signature = signature
+        return out
+
     def _get_time_stop_states(self, symbols):
         out = {symbol: {"long": None, "short": None} for symbol in symbols}
         needed = {
@@ -14990,6 +15036,8 @@ class Passivbot:
             "divergence_filter_enabled",
             "divergence_extended_horizons",
             "divergence_cap_entries_only",
+            "market_crash_freeze_initial_entries",
+            "tp_decay_gate_sma20",
             "risk_wel_enforcer_enabled",
             "risk_twel_enforcer_enabled",
             "risk_twel_entry_gate_enabled",
@@ -15066,6 +15114,22 @@ class Passivbot:
             "divergence_long_horizon_minutes",
             "divergence_long_horizon_zscore",
             "divergence_cap_entries_only",
+            "market_crash_timeframe_minutes",
+            "market_crash_min_drop_pct",
+            "market_crash_breadth_threshold_pct",
+            "market_crash_cooldown_minutes",
+            "market_crash_freeze_initial_entries",
+            "market_crash_we_cap_pct",
+            "risky_offload_we_threshold",
+            "risky_offload_close_pct",
+            "risky_offload_markup_pct",
+            "tp_decay_floor_pct",
+            "tp_decay_time_start_hours",
+            "tp_decay_time_full_hours",
+            "tp_decay_we_start_ratio",
+            "tp_decay_we_full_ratio",
+            "tp_decay_gate_sma20",
+            "tp_sma20_above_boost",
             "entry_cooldown_min_duration_minutes",
             "entry_cooldown_max_duration_minutes",
             "entry_cooldown_weights_minutes",
@@ -17985,6 +18049,26 @@ class Passivbot:
             fill_increase_timestamps, delta_increase_timestamps
         )
         time_stop_states = self._get_time_stop_states(symbols)
+        position_open_timestamps = self._get_position_open_timestamps(symbols)
+        sma20_symbols = [
+            symbol
+            for symbol in symbols
+            if any(
+                sma20_consumed(
+                    {
+                        "tp_decay_gate_sma20": self.bp(pside, "tp_decay_gate_sma20", symbol),
+                        "tp_sma20_above_boost": self.bp(pside, "tp_sma20_above_boost", symbol),
+                    }
+                )
+                and self.has_position(pside=pside, symbol=symbol)
+                for pside in ("long", "short")
+            )
+        ]
+        daily_sma20: dict = {}
+        if sma20_symbols:
+            if not hasattr(self, "_daily_sma20_cache"):
+                self._daily_sma20_cache = DailySma20Cache()
+            daily_sma20 = await self._daily_sma20_cache.collect(self.cm, sma20_symbols, now_ms)
         repair_counts: dict[str, dict[str, Optional[int]]] = {}
         for symbol, pside in getattr(self, "_time_stop_missing_evidence_signature", ()):
             repair_counts.setdefault(symbol, {"long": 0, "short": 0})[pside] = None
@@ -17997,7 +18081,18 @@ class Passivbot:
         }
         divergence_rocs: dict = {}
         divergence_held: dict = {}
-        if any(global_bp[side]["divergence_filter_enabled"] for side in ("long", "short")):
+        market_crash_severity = [0.0, 0.0]
+        crash_history_len = max(
+            (
+                crash_history_minutes(global_bp[side]["market_crash_cooldown_minutes"])
+                for side in ("long", "short")
+                if global_bp[side]["market_crash_timeframe_minutes"] > 0.0
+            ),
+            default=0,
+        )
+        if crash_history_len or any(
+            global_bp[side]["divergence_filter_enabled"] for side in ("long", "short")
+        ):
             symbol_bp = {
                 side: [self._bot_params_to_rust_dict(side, symbol) for symbol in symbols]
                 for side in ("long", "short")
@@ -18011,13 +18106,37 @@ class Passivbot:
                 ),
                 default=0.0,
             )
+            hold_history_len = hold_history_minutes(hold_minutes)
             divergence_rocs, divergence_history = await collect_divergence_inputs(
                 self.cm,
                 symbols,
                 now_ms,
                 extended=any(uses_day_horizons(global_bp[side]) for side in ("long", "short")),
-                history_minutes=hold_history_minutes(hold_minutes),
+                history_minutes=max(hold_history_len, crash_history_len),
             )
+            if crash_history_len and divergence_history:
+                # Severity (including its cooldown) is replayed from completed candles each
+                # cycle, like the divergence latch: no local state, same as the backtest.
+                severity = json.loads(
+                    pbr.market_crash_severity_json(
+                        json.dumps(
+                            {
+                                "history": divergence_history[-crash_history_len:],
+                                "long": global_bp["long"],
+                                "short": global_bp["short"],
+                            }
+                        )
+                    )
+                )
+                market_crash_severity = [float(severity["long"]), float(severity["short"])]
+            elif crash_history_len:
+                logging.warning(
+                    "[market_crash] candle history unavailable; severity treated as 0 this cycle"
+                )
+            if hold_history_len and divergence_history:
+                divergence_history = divergence_history[-hold_history_len:]
+            else:
+                divergence_history = []
             if divergence_history:
                 # The latch is rebuilt from completed candles every cycle (no local state),
                 # matching the backtest's incremental state over the same window.
@@ -18087,6 +18206,7 @@ class Passivbot:
                 "strategy_kind": strategy_kind,
             },
             "symbols": [],
+            "market_crash_severity": market_crash_severity,
         }
 
         symbol_to_idx: dict[str, int] = {s: i for i, s in enumerate(symbols)}
@@ -18145,6 +18265,9 @@ class Passivbot:
                         pside
                     ),
                     "time_stop": time_stop_states.get(symbol, {}).get(pside),
+                    "position_opened_timestamp_ms": position_open_timestamps.get(
+                        symbol, {}
+                    ).get(pside),
                     "bot_params": self._bot_params_to_rust_dict(pside, symbol),
                     "strategy_params": self._strategy_params_to_rust_dict(
                         pside, symbol
@@ -18175,6 +18298,7 @@ class Passivbot:
                 {
                     "symbol_idx": int(idx),
                     "divergence_roc_pct": divergence_rocs.get(symbol, [None] * 6),
+                    "daily_sma20": daily_sma20.get(symbol),
                     "divergence_held_intensity": divergence_held.get(symbol, [0.0, 0.0]),
                     "order_book": {"bid": bid, "ask": ask},
                     "exchange": Passivbot._orchestrator_exchange_params(self, symbol),

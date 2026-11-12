@@ -181,6 +181,55 @@ def test_optional_divergence_bounds_survive_config_roundtrip():
     )
 
 
+def test_optional_crash_offload_decay_bounds_survive_config_roundtrip():
+    config = get_template_config()
+    bounds = {
+        "market_crash_min_drop_pct": [1.0, 6.0, 0.5],
+        "market_crash_breadth_threshold_pct": [30.0, 80.0, 5.0],
+        "market_crash_cooldown_minutes": [0.0, 720.0, 10.0],
+        "market_crash_we_cap_pct": [0.2, 1.0, 0.05],
+        "risky_offload_we_threshold": [0.5, 1.5, 0.05],
+        "risky_offload_close_pct": [0.1, 0.9, 0.05],
+        "risky_offload_markup_pct": [0.5, 3.0, 0.1],
+        "tp_decay_floor_pct": [-0.02, 0.0, 0.001],
+        "tp_decay_time_start_hours": [0.0, 72.0, 1.0],
+        "tp_decay_time_full_hours": [24.0, 480.0, 1.0],
+        "tp_decay_we_start_ratio": [0.0, 1.0, 0.05],
+        "tp_decay_we_full_ratio": [0.5, 2.0, 0.05],
+        "tp_sma20_above_boost": [0.0, 1.0, 0.05],
+    }
+    config["optimize"]["bounds"]["long"]["risk"].update(bounds)
+
+    formatted = format_config(config, verbose=False)
+
+    assert {
+        key: formatted["optimize"]["bounds"]["long"]["risk"][key] for key in bounds
+    } == bounds
+    key_paths = dict(get_optimization_key_paths(formatted))
+    for key in bounds:
+        assert key_paths[f"long_{key}"] == ("bot", "long", "risk", key)
+
+
+def test_unbounded_crash_offload_decay_settings_remain_fixed_during_optimization():
+    config = get_template_config()
+    config["bot"]["long"]["risk"].update(
+        market_crash_timeframe_minutes=60.0,
+        risky_offload_we_threshold=0.8,
+        tp_decay_time_full_hours=168.0,
+        tp_decay_gate_sma20=True,
+    )
+
+    formatted = format_config(config, verbose=False)
+    optimizer_config = build_optimizer_max_config(formatted)
+
+    prefixes = ("market_crash_", "risky_offload_", "tp_decay_", "tp_sma20_")
+    assert not any(prefix in key for key, _ in get_optimization_key_paths(formatted) for prefix in prefixes)
+    risk = optimizer_config["bot"]["long"]["risk"]
+    assert risk["market_crash_timeframe_minutes"] == 60.0
+    assert risk["risky_offload_we_threshold"] == 0.8
+    assert risk["tp_decay_time_full_hours"] == 168.0 and risk["tp_decay_gate_sma20"] is True
+
+
 def test_unbounded_divergence_settings_remain_fixed_during_optimization():
     config = get_template_config()
     config["bot"]["long"]["risk"].update(

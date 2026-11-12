@@ -60,6 +60,19 @@ SHARED_OPTIMIZE_LOCAL_TO_FLAT_KEY = {
         "divergence_delay_add_minutes": "divergence_delay_add_minutes",
         "divergence_market_delay_add_minutes": "divergence_market_delay_add_minutes",
         "divergence_long_horizon_zscore": "divergence_long_horizon_zscore",
+        "market_crash_min_drop_pct": "market_crash_min_drop_pct",
+        "market_crash_breadth_threshold_pct": "market_crash_breadth_threshold_pct",
+        "market_crash_cooldown_minutes": "market_crash_cooldown_minutes",
+        "market_crash_we_cap_pct": "market_crash_we_cap_pct",
+        "risky_offload_we_threshold": "risky_offload_we_threshold",
+        "risky_offload_close_pct": "risky_offload_close_pct",
+        "risky_offload_markup_pct": "risky_offload_markup_pct",
+        "tp_decay_floor_pct": "tp_decay_floor_pct",
+        "tp_decay_time_start_hours": "tp_decay_time_start_hours",
+        "tp_decay_time_full_hours": "tp_decay_time_full_hours",
+        "tp_decay_we_start_ratio": "tp_decay_we_start_ratio",
+        "tp_decay_we_full_ratio": "tp_decay_we_full_ratio",
+        "tp_sma20_above_boost": "tp_sma20_above_boost",
         "n_positions": "n_positions",
         "total_exposure_enforcer_threshold": "risk_twel_enforcer_threshold",
         "we_excess_allowance_pct": "risk_we_excess_allowance_pct",
@@ -84,6 +97,16 @@ BOT_BOUND_GROUP_BY_KEY = {
     for group_name, field_map in SHARED_OPTIMIZE_FLAT_TO_LOCAL_KEY.items()
     for flat_key in field_map
 }
+
+# Risk bounds of these features have no template defaults and are optional: present bounds are
+# tuned, absent ones leave the bot value fixed.
+OPTIONAL_RISK_BOUND_PREFIXES = (
+    "divergence_",
+    "market_crash_",
+    "risky_offload_",
+    "tp_decay_",
+    "tp_sma20_",
+)
 
 SHARED_OPTIMIZE_BOUNDS_DEFAULTS = {
     "long": {
@@ -295,7 +318,7 @@ def preserve_optional_adaptive_bounds(template: dict, source: dict) -> None:
         *(
             flat_key
             for flat_key in SHARED_OPTIMIZE_LOCAL_TO_FLAT_KEY["risk"].values()
-            if flat_key.startswith("divergence_")
+            if flat_key.startswith(OPTIONAL_RISK_BOUND_PREFIXES)
         ),
     }
     target = template["optimize"]["bounds"]

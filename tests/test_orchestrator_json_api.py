@@ -5752,3 +5752,39 @@ def test_divergence_long_horizon_counts_as_a_flagged_timeframe():
         return next(o["qty"] for o in out["orders"] if o["symbol_idx"] == 0 and o["qty"] > 0)
 
     assert entry_qty(4320.0) < entry_qty(0.0)
+
+
+def test_market_crash_severity_json_matches_live_payload_and_decays_through_cooldown():
+    import json
+
+    import passivbot_rust as pbr
+
+    crash = {
+        "market_crash_timeframe_minutes": 5.0,
+        "market_crash_min_drop_pct": 3.0,
+        "market_crash_breadth_threshold_pct": 50.0,
+        "market_crash_cooldown_minutes": 10.0,
+    }
+    long_bp = bot_params(**crash)
+    short_bp = bot_params(**crash)
+
+    def step(roc):  # four coins, only the 5-minute slot filled
+        return [[roc, None, None, None, None, None]] * 4
+
+    def severity(history):
+        out = json.loads(
+            pbr.market_crash_severity_json(
+                json.dumps({"history": history, "long": long_bp, "short": short_bp})
+            )
+        )
+        return out["long"], out["short"]
+
+    calm = [step(0.0)] * 4
+    assert severity(calm) == (0.0, 0.0)
+    # Every coin falls 5%: full breadth, severity 1 for longs only.
+    assert severity(calm + [step(-5.0)]) == (1.0, 0.0)
+    # Five minutes later the cooldown (10 min) has decayed it by half.
+    long_sev, _ = severity(calm + [step(-5.0)] + [step(0.0)] * 5)
+    assert 0.0 < long_sev < 1.0
+    # Missing history never fabricates severity.
+    assert severity([]) == (0.0, 0.0)

@@ -6,6 +6,18 @@ since the latest release tag; these features may already be available when insta
 
 ## Unreleased
 
+- Add three opt-in risk features ported from the PB7 fork, all under `bot.<side>.risk` and off by
+  default. Market crash (`market_crash_*`) measures the share of the universe falling more than a
+  threshold over 5/15/60/240 minutes, then freezes initial entries and/or caps the entry-only WEL
+  with a linearly decaying cooldown; it never shrinks a held position's budget. Risky offload
+  (`risky_offload_we_threshold`, `risky_offload_close_pct`, `risky_offload_markup_pct`) keeps one
+  extra reduce-only limit close resting while a position is over-exposed, identically in live and
+  backtest. TP decay (`tp_decay_*`, `tp_sma20_above_boost`) slides the `trailing_martingale` close
+  threshold toward a floor (may be negative) with position age or exposure, optionally gated on the
+  daily SMA20. Live rebuilds all state from candles and fills; unknown age or SMA20 applies no
+  decay. GPU screening does not model them and pins their bounds. See
+  `docs/ai/features/market_crash_offload_tp_decay.md`.
+
 - Divergence protection gains two options ported from the PB7 fork: a robust market-relative
   long horizon (`divergence_long_horizon_minutes` = `1440`/`4320`, `divergence_long_horizon_zscore`,
   default off / `3.0`) that keeps a coin's multi-day collapse flagged while the whole market falls,

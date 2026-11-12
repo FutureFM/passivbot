@@ -7387,6 +7387,65 @@ mod core {
         }
 
         #[test]
+        fn trim_closes_never_sums_offload_and_take_profit_above_the_position() {
+            let ob = OrderBook {
+                bid: 100.0,
+                ask: 100.0,
+            };
+            let exchange = ExchangeParams {
+                qty_step: 0.1,
+                price_step: 0.1,
+                min_qty: 0.0,
+                min_cost: 0.0,
+                c_mult: 1.0,
+                ..Default::default()
+            };
+            for (pside, sign) in [(PositionSide::Long, -1.0), (PositionSide::Short, 1.0)] {
+                let (grid, offload) = match pside {
+                    PositionSide::Long => {
+                        (OrderType::CloseGridLong, OrderType::CloseRiskyOffloadLong)
+                    }
+                    PositionSide::Short => {
+                        (OrderType::CloseGridShort, OrderType::CloseRiskyOffloadShort)
+                    }
+                };
+                let (near, far) = match pside {
+                    PositionSide::Long => (101.0, 102.0),
+                    PositionSide::Short => (99.0, 98.0),
+                };
+                // The take-profit already closes the whole position; the offload rests on top.
+                let mut closes = vec![
+                    IdealOrder {
+                        symbol_idx: 0,
+                        pside,
+                        qty: sign * 1.0,
+                        price: near,
+                        order_type: grid,
+                    },
+                    IdealOrder {
+                        symbol_idx: 0,
+                        pside,
+                        qty: sign * 0.5,
+                        price: far,
+                        order_type: offload,
+                    },
+                ];
+                trim_closes_to_position(pside, &mut closes, 1.0, &ob, &exchange, None, None);
+                let total: f64 = closes.iter().map(|o| o.qty.abs()).sum();
+                assert!(
+                    total <= 1.0 + 1e-9,
+                    "{pside:?}: closes sum {total} > position"
+                );
+                let tp = closes.iter().find(|o| o.order_type == grid).unwrap();
+                assert!(
+                    (tp.qty.abs() - 1.0).abs() < 1e-9,
+                    "the nearer take-profit is kept whole"
+                );
+                assert!(closes.iter().all(|o| o.order_type != offload));
+            }
+        }
+
+        #[test]
         fn trim_closes_caps_tiny_aggregate_without_absolute_slack() {
             let ob = OrderBook {
                 bid: 100.0,

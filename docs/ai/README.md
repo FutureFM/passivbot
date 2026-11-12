@@ -32,6 +32,7 @@ current task.
 | Crash discovery and stress-suite generation | `runbooks/crash_discovery.md` |
 | Structured live events | `features/live_events.md`, `generated/live_event_registry.md` |
 | Monitor persistence, recovery, rotation, retention | `features/monitor_persistence.md` |
+| Market crash, risky offload, TP decay | `error_contract.md`, `features/market_crash_offload_tp_decay.md`, `features/time_stop.md` |
 | Feature-specific change | `features/README.md` and the relevant feature contract |
 | Historical incident rationale | relevant file under `case_studies/` |
 

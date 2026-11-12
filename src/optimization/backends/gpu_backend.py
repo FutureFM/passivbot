@@ -481,7 +481,14 @@ GPU_SUPPORTED_SUITE_NON_BOT_OVERRIDE_PATHS = {
 }
 
 
-CPU_ONLY_RISK_BOUND_PREFIXES = ("divergence_", "time_stop_")
+CPU_ONLY_RISK_BOUND_PREFIXES = (
+    "divergence_",
+    "time_stop_",
+    "market_crash_",
+    "risky_offload_",
+    "tp_decay_",
+    "tp_sma20_",
+)
 _WARNED_CPU_ONLY_FEATURES: set[str] = set()
 
 
@@ -529,6 +536,15 @@ def _warn_cpu_only_features(config: dict, strategy_kind: str) -> None:
             unmodeled.append(f"bot.{side}.risk divergence protection")
         if float(risk.get("time_stop_max_age_days", 0.0) or 0.0) > 0.0:
             unmodeled.append(f"bot.{side}.risk time-based stops")
+        if float(risk.get("market_crash_timeframe_minutes", 0.0) or 0.0) > 0.0:
+            unmodeled.append(f"bot.{side}.risk market crash protection")
+        if float(risk.get("risky_offload_we_threshold", 0.0) or 0.0) > 0.0:
+            unmodeled.append(f"bot.{side}.risk risky offload")
+        if any(
+            float(risk.get(key, 0.0) or 0.0) != 0.0
+            for key in ("tp_decay_time_full_hours", "tp_decay_we_full_ratio", "tp_sma20_above_boost")
+        ):
+            unmodeled.append(f"bot.{side}.risk TP decay")
     if any(
         float(
             (((override or {}).get("bot") or {}).get(side) or {}).get("risk", {}).get(
