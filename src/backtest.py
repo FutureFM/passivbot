@@ -72,6 +72,9 @@ from config.access import (
 from config.pnl_lookback import parse_pnls_max_lookback_days
 from metrics_schema import attach_result_metrics, build_standalone_metrics
 from config.metrics import ANALYSIS_SHARED_KEYS
+
+# A trailing run of zero-volume candles at least this long marks a delisted market.
+DEAD_TAIL_MINUTES = 7 * 1440
 from config.coerce import normalize_hsl_signal_mode
 from config.overrides import parse_overrides
 from config.shared_bot import flatten_shared_bot_side
@@ -1163,6 +1166,21 @@ def build_backtest_payload(
         if last_idx < 0:
             first_idx = total_steps
             last_idx = 0
+        # Dead tail: the market was delisted but the candle store forward-filled flat
+        # zero-volume candles up to the present. Treat the last traded bar as the delist
+        # point so the engine force-closes held positions there instead of freezing them.
+        if 0 <= first_idx < last_idx < total_steps:
+            traded = np.flatnonzero(np.asarray(hlcvs[first_idx : last_idx + 1, idx, 3]) > 0)
+            min_dead_bars = int(math.ceil(DEAD_TAIL_MINUTES / max(1, candle_interval)))
+            if traded.size and last_idx - (first_idx + int(traded[-1])) >= min_dead_bars:
+                new_last = first_idx + int(traded[-1])
+                logging.info(
+                    "[backtest] %s: %d zero-volume bars after last trade; treating as delisted at bar %d",
+                    coin,
+                    last_idx - new_last,
+                    new_last,
+                )
+                last_idx = new_last
         first_valid_indices.append(first_idx)
         last_valid_indices.append(last_idx)
         # Only producer-tagged history budgets may be replaced with a local

@@ -1290,8 +1290,14 @@ impl<'a> Backtest<'a> {
             // Orders computed from candle k's close can fill in candle k+1.
             // Use the selection effective at that execution boundary (00:00 UTC).
             let row = rows[(k + 1).min(rows.len() - 1)];
-            if row < 0 || mask[[row as usize, self.col(idx)]] == 0 {
+            if row < 0 {
                 return Some(orchestrator::TradingMode::GracefulStop);
+            }
+            match mask[[row as usize, self.col(idx)]] {
+                0 => return Some(orchestrator::TradingMode::GracefulStop),
+                // 2 = blacklisted: no new entries and no reentries/DCA; closes stay managed.
+                2 => return Some(orchestrator::TradingMode::TpOnly),
+                _ => {}
             }
         }
         self.configured_mode(idx, pside)

@@ -192,7 +192,7 @@ impl HlcvsBundle {
                         "Organillo eligibility dimensions do not match HLCV",
                     ));
                 }
-                if mask.iter().any(|v| *v > 1)
+                if mask.iter().any(|v| *v > 2)
                     || rows
                         .as_array()
                         .iter()

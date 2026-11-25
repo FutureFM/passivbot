@@ -104,8 +104,8 @@ def _load(path, mtime_ns, size):
     if len(set(coins)) != len(coins):
         raise ValueError("Organillo columns must resolve to distinct market identities")
     values = frame.to_numpy()
-    if not np.isin(values, (0, 1)).all():
-        raise ValueError("Organillo values must be 0 or 1")
+    if not np.isin(values, (0, 1, 2)).all():
+        raise ValueError("Organillo values must be 0, 1 or 2 (2 = blacklisted: tp_only, no entries/DCA)")
     eligible = np.ascontiguousarray(values, dtype=np.uint8)
     timestamps.flags.writeable = eligible.flags.writeable = False
     digest = hashlib.sha256(raw).hexdigest()
