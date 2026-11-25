@@ -90,6 +90,8 @@ def test_consumption_flags_and_history_length():
         ("market_crash_cooldown_minutes", -1.0),
         ("market_crash_we_cap_pct", 0.0),
         ("market_crash_we_cap_pct", 1.5),
+        ("market_crash_full_breadth_pct", -1.0),
+        ("market_crash_full_breadth_pct", 101.0),
         ("market_crash_freeze_initial_entries", 1),
         ("risky_offload_we_threshold", -0.1),
         ("risky_offload_close_pct", 1.5),
@@ -116,6 +118,7 @@ def test_valid_crash_offload_decay_configuration_passes():
         tp_decay_time_full_hours=10.0,  # step ramp
         tp_decay_floor_pct=-0.01,
         market_crash_timeframe_minutes=60.0,
+        market_crash_full_breadth_pct=0.0,  # binary severity
         risky_offload_we_threshold=0.8,
     )
     validate_config(config)

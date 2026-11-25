@@ -127,6 +127,7 @@ def _validate_crash_offload_decay(side: dict, path: str) -> None:
     number("market_crash_breadth_threshold_pct", 0.0, 100.0)
     number("market_crash_cooldown_minutes", 0.0)
     number("market_crash_we_cap_pct", 0.0, 1.0, exclusive_zero=True)
+    number("market_crash_full_breadth_pct", 0.0, 100.0)
     number("risky_offload_we_threshold", 0.0)
     number("risky_offload_close_pct", 0.0, 1.0)
     number("risky_offload_markup_pct", 0.0)

@@ -2455,6 +2455,11 @@ fn bot_params_from_dict(dict: &PyDict, hsl: bool) -> PyResult<BotParams> {
             false,
         )?,
         market_crash_we_cap_pct: extract_optional_f64_or(dict, "market_crash_we_cap_pct", 1.0)?,
+        market_crash_full_breadth_pct: extract_optional_f64_or(
+            dict,
+            "market_crash_full_breadth_pct",
+            100.0,
+        )?,
         risky_offload_we_threshold: extract_optional_f64_or(
             dict,
             "risky_offload_we_threshold",

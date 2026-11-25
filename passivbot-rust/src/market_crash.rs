@@ -30,7 +30,10 @@ pub fn enabled(p: &BotParams) -> bool {
 /// Instantaneous breadth test. `None` when it cannot be evaluated (disabled, or fewer than
 /// three coins with a valid ROC). Otherwise `(active, severity)`: active when the adverse
 /// share reaches the breadth threshold; severity rescales the share between the threshold
-/// and 100% to `[0, 1]`, so a share exactly at the threshold is active with severity 0.
+/// and `market_crash_full_breadth_pct` (default 100%) to `[0, 1]`, so with the default a
+/// share exactly at the threshold is active with severity 0. A full-breadth value at or
+/// below the threshold makes the detector binary: severity 1 whenever active, so the
+/// cooldown always decays from full severity.
 pub fn raw_severity(rocs: &[DivergenceRocs], p: &BotParams, short: bool) -> Option<(bool, f64)> {
     let slot = timeframe_slot(p)?;
     let values: Vec<f64> = rocs
@@ -56,7 +59,11 @@ pub fn raw_severity(rocs: &[DivergenceRocs], p: &BotParams, short: bool) -> Opti
     if adverse_pct < threshold {
         return Some((false, 0.0));
     }
-    let severity = (adverse_pct - threshold) / (100.0 - threshold).max(1e-10);
+    let full = p.market_crash_full_breadth_pct;
+    if full <= threshold {
+        return Some((true, 1.0));
+    }
+    let severity = (adverse_pct - threshold) / (full - threshold);
     Some((true, severity.clamp(0.0, 1.0)))
 }
 
@@ -229,6 +236,54 @@ mod tests {
         assert_eq!(
             raw_severity(&step(&[-5.0, -5.0, -5.0, -5.0]), &p, false),
             Some((true, 1.0))
+        );
+    }
+
+    #[test]
+    fn full_breadth_below_hundred_reaches_full_severity_earlier() {
+        let mut p = params();
+        p.market_crash_full_breadth_pct = 75.0;
+        let (active, severity) = raw_severity(&step(&[-5.0, -5.0, -5.0, 0.0]), &p, false).unwrap();
+        assert!(active && (severity - 1.0).abs() < 1e-12);
+        let six = step(&[-5.0, -5.0, -5.0, -5.0, 0.0, 0.0, 0.0, 0.0]);
+        p.market_crash_full_breadth_pct = 62.5;
+        assert_eq!(raw_severity(&six, &p, false), Some((true, 0.0)));
+    }
+
+    #[test]
+    fn full_breadth_at_or_below_threshold_is_binary() {
+        let mut p = params();
+        p.market_crash_full_breadth_pct = 50.0;
+        // exactly at the threshold: full severity instead of 0
+        assert_eq!(
+            raw_severity(&step(&[-5.0, -5.0, 0.0, 0.0]), &p, false),
+            Some((true, 1.0))
+        );
+        assert_eq!(
+            raw_severity(&step(&[-5.0, 0.0, 0.0, 0.0]), &p, false),
+            Some((false, 0.0))
+        );
+        p.market_crash_full_breadth_pct = 0.0;
+        assert_eq!(
+            raw_severity(&step(&[-5.0, -5.0, -5.0, 0.0]), &p, false),
+            Some((true, 1.0))
+        );
+        // the cooldown then always decays from full severity
+        let mut history = vec![step(&[-5.0, -5.0, 0.0, 0.0])];
+        history.push(step(&[0.0, 0.0, 0.0, 0.0]));
+        history.push(step(&[0.0, 0.0, 0.0, 0.0]));
+        let severity = severity_from_history(&history, &p, false);
+        assert!((severity - 0.9).abs() < 1e-12);
+        assert!(
+            (entry_wel_factor(
+                &BotParams {
+                    market_crash_we_cap_pct: 0.1,
+                    ..p.clone()
+                },
+                severity
+            ) - 0.19)
+                .abs()
+                < 1e-12
         );
     }
 

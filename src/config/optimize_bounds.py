@@ -64,6 +64,7 @@ SHARED_OPTIMIZE_LOCAL_TO_FLAT_KEY = {
         "market_crash_breadth_threshold_pct": "market_crash_breadth_threshold_pct",
         "market_crash_cooldown_minutes": "market_crash_cooldown_minutes",
         "market_crash_we_cap_pct": "market_crash_we_cap_pct",
+        "market_crash_full_breadth_pct": "market_crash_full_breadth_pct",
         "risky_offload_we_threshold": "risky_offload_we_threshold",
         "risky_offload_close_pct": "risky_offload_close_pct",
         "risky_offload_markup_pct": "risky_offload_markup_pct",

@@ -517,6 +517,10 @@ fn default_market_crash_breadth_threshold_pct() -> f64 {
     50.0
 }
 
+fn default_market_crash_full_breadth_pct() -> f64 {
+    100.0
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BotParams {
@@ -654,6 +658,11 @@ pub struct BotParams {
     /// budget of a held position, so it cannot force exits at the bottom.
     #[serde(default = "default_time_stop_one")]
     pub market_crash_we_cap_pct: f64,
+    /// Share of adverse coins at which severity reaches 1. Severity scales linearly from
+    /// the breadth threshold (0) to this share (1); a value at or below the threshold makes
+    /// the detector binary (severity 1 whenever active). Default 100 keeps the linear scale.
+    #[serde(default = "default_market_crash_full_breadth_pct")]
+    pub market_crash_full_breadth_pct: f64,
     /// Offload: while WE / WEL exceeds `risky_offload_we_threshold` (0 = off), one extra
     /// reduce-only limit close of `risky_offload_close_pct` of the position rests at
     /// `risky_offload_markup_pct` of the strategy's take-profit distance.
@@ -776,6 +785,7 @@ impl Default for BotParams {
             market_crash_cooldown_minutes: 0.0,
             market_crash_freeze_initial_entries: false,
             market_crash_we_cap_pct: 1.0,
+            market_crash_full_breadth_pct: default_market_crash_full_breadth_pct(),
             risky_offload_we_threshold: 0.0,
             risky_offload_close_pct: 0.0,
             risky_offload_markup_pct: 1.0,
